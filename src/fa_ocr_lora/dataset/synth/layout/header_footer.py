@@ -1,0 +1,568 @@
+"""Letterhead and footer: logo placement, company identity, contact fields.
+
+The header and footer are where one letter stops looking like another. Both
+are assembled here as specs first and HTML second, so the composer decides
+*what* appears and this module owns *how* it is tagged for annotation.
+
+Three decisions are worth stating up front:
+
+* **The logo is embedded as an ``<img>`` data URI, not inlined markup.** 171
+  of the 4888 logo files carry their own ``<style>`` block and some carry
+  ``id`` attributes; pasting that into the page would leak CSS rules and
+  collide ids with whatever else the sample renders. A replaced element is a
+  sealed rendering context, so no logo can restyle the letter around it.
+* **Monochrome logos get recoloured when the bar would swallow them.** 2901
+  files set a single ``fill`` on the root ``<svg>``, so a brand-coloured logo
+  on a solid brand-coloured bar renders as a silhouette of nothing. When the
+  bar is solid, the root fill is rewritten to the bar's text colour.
+  Multi-colour logos keep their own palette - there is no single fill to
+  rewrite - which is why the solid bar is not the most common treatment.
+* **The page number is a template, not a value.** It reads ``صفحه ۱ از ۳``,
+  and neither number is known until pagination has run. The node ships with
+  ``data-page-template`` holding ``{page}`` and ``{total}`` placeholders for
+  ``paginate.js`` to fill per sheet, and renders a sane single-page string in
+  the meantime so a screenshot taken without the script still looks like a
+  letter.
+"""
+
+from __future__ import annotations
+
+import base64
+import html
+import random
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Final, Sequence
+
+from ...common.io_utils import to_persian_digits, weighted_choice
+
+__all__ = [
+    "HeaderSpec",
+    "FooterSpec",
+    "logo_data_uri",
+    "build_header",
+    "build_footer",
+    "header_to_html",
+    "footer_to_html",
+    "opener_to_html",
+    "header_to_markdown",
+    "footer_to_markdown",
+]
+
+#: Where the logo sits, with relative weights. Right dominates because that is
+#: the head of the line in an RTL page, and so where Iranian letterhead puts
+#: the mark.
+_LOGO_SIDES: Final[tuple[tuple[str, float], ...]] = (
+    ("right", 52.0),
+    ("center", 26.0),
+    ("left", 22.0),
+)
+
+#: Logo height range in millimetres. Below ~9mm a 24x24 mark stops being
+#: legible at 300 DPI; above ~22mm it starts competing with the company name.
+_LOGO_MM_RANGE: Final[tuple[float, float]] = (9.0, 22.0)
+
+#: Persian organisational prefixes for the company name. The empty entry is
+#: weighted heavily because many Iranian firms print the bare brand name.
+_NAME_PREFIXES: Final[tuple[tuple[str, float], ...]] = (
+    ("", 34.0),
+    ("شرکت", 30.0),
+    ("گروه", 10.0),
+    ("شرکت فناوری", 8.0),
+    ("مؤسسه", 6.0),
+    ("شرکت مهندسی", 6.0),
+    ("هلدینگ", 6.0),
+)
+
+#: Religious openers printed above the letter body, by relative weight.
+_OPENERS: Final[tuple[tuple[str, float], ...]] = (
+    ("بسمه تعالی", 46.0),
+    ("به نام خدا", 24.0),
+    ("بنام خداوند بخشنده مهربان", 12.0),
+    ("هو الحق", 10.0),
+    ("به نام خداوند جان و خرد", 8.0),
+)
+
+#: Generic Persian corporate slogans for the line under the company name.
+_SLOGANS: Final[tuple[str, ...]] = (
+    "کیفیت، تعهد، نوآوری",
+    "همراه همیشگی شما",
+    "پیشرو در ارائه خدمات تخصصی",
+    "با تکیه بر دانش و تجربه",
+    "اعتماد شما، سرمایه ما",
+    "نوآوری در خدمت مشتری",
+    "راهکارهای هوشمند کسب‌وکار",
+    "تعهد به تعالی سازمانی",
+)
+
+#: Persian labels for the contact fields, keyed as ``ContactInfo`` reports
+#: them. Several wordings exist for each; the first is the most common.
+_CONTACT_LABELS: Final[dict[str, tuple[str, ...]]] = {
+    "address": ("نشانی", "آدرس"),
+    "phone": ("تلفن", "تلفن تماس", "شماره تماس"),
+    "email": ("رایانامه", "ایمیل", "پست الکترونیک"),
+    "website": ("وبگاه", "وب‌سایت", "نشانی اینترنتی"),
+}
+
+#: Field orders for the footer. Address first is the postal convention; the
+#: short forms exist because a one-line footer is very common.
+_CONTACT_ORDERS: Final[tuple[tuple[str, ...], ...]] = (
+    ("address", "phone", "email", "website"),
+    ("address", "phone", "website"),
+    ("phone", "email", "website"),
+    ("address", "phone"),
+    ("phone", "website"),
+    ("address", "phone", "email"),
+)
+
+#: Page-number wordings. ``{page}`` and ``{total}`` are filled by
+#: ``paginate.js`` once the sheet count is known.
+_PAGE_TEMPLATES: Final[tuple[str, ...]] = (
+    "صفحه {page} از {total}",
+    "{page} از {total}",
+    "- {page} -",
+    "صفحه {page}",
+)
+
+#: How footer fields are laid out, by relative weight.
+_FOOTER_LAYOUTS: Final[tuple[tuple[str, float], ...]] = (
+    ("inline", 62.0),
+    ("stacked", 26.0),
+    ("split", 12.0),
+)
+
+#: Root-tag ``fill="..."`` on an ``<svg>`` element.
+_ROOT_FILL: Final[re.Pattern[str]] = re.compile(
+    r"(<svg\b[^>]*?)\bfill\s*=\s*(['\"])(.*?)\2", re.IGNORECASE | re.DOTALL
+)
+
+#: Opening ``<svg`` tag, for injecting a fill when the root has none.
+_SVG_OPEN: Final[re.Pattern[str]] = re.compile(r"<svg\b", re.IGNORECASE)
+
+
+def _set_root_fill(svg_text: str, colour: str) -> str:
+    """Force the root ``<svg>`` fill, so a monochrome mark can be recoloured.
+
+    Only the root attribute is touched. A logo that colours its own paths
+    keeps them, which is deliberate: rewriting every ``fill`` in the file
+    would flatten a multi-colour mark into a blob.
+
+    Args:
+        svg_text: The SVG source.
+        colour: CSS colour to apply.
+
+    Returns:
+        The SVG with its root fill set.
+    """
+    replaced, count = _ROOT_FILL.subn(
+        lambda match: f'{match.group(1)}fill="{colour}"', svg_text, count=1
+    )
+    if count:
+        return replaced
+    return _SVG_OPEN.sub(f'<svg fill="{colour}"', svg_text, count=1)
+
+
+@lru_cache(maxsize=256)
+def logo_data_uri(path: Path, colour: str | None = None) -> str:
+    """Read one logo SVG and encode it as a ``data:`` URI.
+
+    Cached because a batch reuses the same few hundred marks, and because the
+    same logo recoloured for a solid bar is a distinct cache key.
+
+    Args:
+        path: The SVG file on disk.
+        colour: Root fill override, or ``None`` to keep the file's own colour.
+
+    Returns:
+        A base64 ``data:image/svg+xml`` URI, or an empty string when the file
+        cannot be read.
+    """
+    try:
+        svg_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    if colour:
+        svg_text = _set_root_fill(svg_text, colour)
+    encoded = base64.b64encode(svg_text.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderSpec:
+    """The letterhead for one document.
+
+    Attributes:
+        enabled: Whether a header is drawn at all.
+        company_name: The organisation line, prefix included.
+        slogan: Sub-line under the name, empty when the sample has none.
+        opener: Religious opener such as ``بسمه تعالی``, empty when absent.
+        logo_path: The mark to draw, or ``None`` when the row has no usable
+            logo or the sample draws none.
+        logo_side: ``right``, ``center`` or ``left``.
+        logo_height_mm: Rendered height of the mark, in millimetres.
+        bar_style: Treatment from :class:`~..layout.theme.BarStyle`.
+        show_category: Whether the company's category line is printed.
+        category: The category text, already formatted for display.
+    """
+
+    enabled: bool = True
+    company_name: str = ""
+    slogan: str = ""
+    opener: str = ""
+    logo_path: Path | None = None
+    logo_side: str = "right"
+    logo_height_mm: float = 14.0
+    bar_style: str = "rule"
+    show_category: bool = False
+    category: str = ""
+
+    @property
+    def has_logo(self) -> bool:
+        """Whether a logo image is drawn in the header."""
+        return self.logo_path is not None
+
+    @property
+    def text(self) -> str:
+        """The header as reading text, one line per rendered element."""
+        lines = [
+            self.company_name,
+            self.category if self.show_category else "",
+            self.slogan,
+        ]
+        return "\n".join(line for line in lines if line.strip())
+
+    def as_content(self) -> dict[str, object]:
+        """Return the header's structured payload for the annotation."""
+        return {
+            "company_name": self.company_name,
+            "slogan": self.slogan,
+            "category": self.category if self.show_category else "",
+            "logo_side": self.logo_side,
+            "logo_height_mm": self.logo_height_mm,
+            "bar_style": self.bar_style,
+            "logo": self.logo_path.name if self.logo_path else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FooterSpec:
+    """The footer for one document.
+
+    Attributes:
+        enabled: Whether a footer is drawn at all.
+        fields: ``(key, label, value)`` per contact row, in render order. The
+            label is empty when the sample prints bare values.
+        layout: ``inline``, ``stacked`` or ``split``.
+        bar_style: Treatment from :class:`~..layout.theme.BarStyle`.
+        page_number_template: Format string with ``{page}`` and ``{total}``,
+            or empty when the sample prints no page number.
+    """
+
+    enabled: bool = True
+    fields: tuple[tuple[str, str, str], ...] = ()
+    layout: str = "inline"
+    bar_style: str = "rule"
+    page_number_template: str = ""
+
+    @property
+    def has_page_number(self) -> bool:
+        """Whether a page number is printed."""
+        return bool(self.page_number_template)
+
+    @property
+    def text(self) -> str:
+        """The footer as reading text, one line per field."""
+        return "\n".join(
+            f"{label}: {value}" if label else value for _, label, value in self.fields
+        )
+
+    def as_content(self) -> dict[str, object]:
+        """Return the footer's structured payload for the annotation."""
+        return {
+            "layout": self.layout,
+            "bar_style": self.bar_style,
+            "fields": [
+                {"key": key, "label": label, "value": value}
+                for key, label, value in self.fields
+            ],
+            "page_number_template": self.page_number_template,
+        }
+
+
+def build_header(
+    company_name: str,
+    category: str,
+    logo_path: Path | None,
+    bar_style: str,
+    rng: random.Random,
+    header_probability: float = 0.92,
+    slogan_probability: float = 0.3,
+    opener_probability: float = 0.45,
+) -> HeaderSpec:
+    """Assemble the letterhead for one document.
+
+    Args:
+        company_name: The brand name from the letter record.
+        category: The company category, used as an optional sub-line.
+        logo_path: Resolved logo SVG, or ``None`` when the row has none.
+        bar_style: Header bar treatment chosen by the theme.
+        rng: The sample's seeded RNG, conventionally ``purpose="header"``.
+        header_probability: Chance the letter has a header at all.
+        slogan_probability: Chance a slogan line is printed.
+        opener_probability: Chance a religious opener is printed. Drawn even
+            when the header is disabled, because the opener sits above the
+            body and survives a bare page.
+
+    Returns:
+        The header spec; ``enabled`` is ``False`` for a headerless letter.
+    """
+    enabled = rng.random() < header_probability
+    opener = (
+        weighted_choice(_OPENERS, rng) if rng.random() < opener_probability else ""
+    )
+    prefix = weighted_choice(_NAME_PREFIXES, rng)
+    name = f"{prefix} {company_name}".strip() if company_name else prefix
+    slogan = rng.choice(_SLOGANS) if rng.random() < slogan_probability else ""
+    side = weighted_choice(_LOGO_SIDES, rng)
+    height = round(rng.uniform(*_LOGO_MM_RANGE), 1)
+    show_category = bool(category) and rng.random() < 0.28
+    return HeaderSpec(
+        enabled=enabled,
+        company_name=name,
+        slogan=slogan,
+        opener=opener,
+        logo_path=logo_path if enabled else None,
+        logo_side=side,
+        logo_height_mm=height,
+        bar_style=bar_style,
+        show_category=show_category,
+        category=category,
+    )
+
+
+def build_footer(
+    contact_fields: Sequence[tuple[str, str, str]],
+    bar_style: str,
+    rng: random.Random,
+    footer_probability: float = 0.78,
+    page_number_probability: float = 0.6,
+) -> FooterSpec:
+    """Assemble the footer for one document.
+
+    Args:
+        contact_fields: ``(key, label, value)`` from
+            :attr:`~..letter_source.ContactInfo.labelled_fields`; only
+            populated fields arrive here.
+        bar_style: Footer bar treatment chosen by the theme.
+        rng: The sample's seeded RNG, conventionally ``purpose="footer"``.
+        footer_probability: Chance the letter has a footer at all.
+        page_number_probability: Chance a page number is printed.
+
+    Returns:
+        The footer spec. A letter whose record carries no contact details at
+        all still gets a page number if one was drawn, which is what a real
+        continuation sheet looks like.
+    """
+    enabled = rng.random() < footer_probability
+    available = {key: (label, value) for key, label, value in contact_fields}
+    order = rng.choice(_CONTACT_ORDERS)
+    show_labels = rng.random() < 0.72
+    fields = tuple(
+        (
+            key,
+            available[key][0] if show_labels else "",
+            to_persian_digits(available[key][1]),
+        )
+        for key in order
+        if key in available
+    )
+    # Label wording varies per sample, but only when labels are shown at all.
+    if show_labels:
+        fields = tuple(
+            (key, rng.choice(_CONTACT_LABELS.get(key, (label,))), value)
+            for key, label, value in fields
+        )
+    template = (
+        rng.choice(_PAGE_TEMPLATES) if rng.random() < page_number_probability else ""
+    )
+    return FooterSpec(
+        enabled=enabled,
+        fields=fields,
+        layout=weighted_choice(_FOOTER_LAYOUTS, rng),
+        bar_style=bar_style,
+        page_number_template=template,
+    )
+
+
+def _logo_html(spec: HeaderSpec, bar_text: str) -> str:
+    """Render the logo image, recoloured when it sits on a solid bar.
+
+    Args:
+        spec: The header being rendered.
+        bar_text: Text colour of a solid bar, used as the recolour target.
+
+    Returns:
+        An ``<img>`` element, or an empty string when there is no logo.
+    """
+    if spec.logo_path is None:
+        return ""
+    colour = bar_text if spec.bar_style == "solid" else None
+    uri = logo_data_uri(spec.logo_path, colour)
+    if not uri:
+        return ""
+    return (
+        f'<img class="header-logo" data-ann-type="logo" data-ann-id="header.logo" '
+        f'src="{uri}" alt="" style="height:{spec.logo_height_mm}mm">'
+    )
+
+
+def header_to_html(spec: HeaderSpec, bar_text: str = "#FFFFFF") -> str:
+    """Render the letterhead to annotated HTML.
+
+    Args:
+        spec: The header to render.
+        bar_text: Text colour on a solid bar, for logo recolouring.
+
+    Returns:
+        An HTML fragment, empty when the sample has no header. The religious
+        opener is *not* included: it belongs above the body, and the composer
+        places it there via :func:`opener_to_html`.
+    """
+    if not spec.enabled:
+        return ""
+    classes = (
+        f"letter-header header-{html.escape(spec.bar_style, quote=True)} "
+        f"logo-{html.escape(spec.logo_side, quote=True)}"
+    )
+    parts: list[str] = [
+        f'<header class="{classes}" data-ann-type="header_bar" '
+        f'data-ann-id="header">'
+    ]
+    parts.append(_logo_html(spec, bar_text))
+    parts.append('<div class="header-identity">')
+    if spec.company_name:
+        parts.append(
+            f'<div class="header-company" data-ann-type="header_company_name" '
+            f'data-ann-id="header.company">{html.escape(spec.company_name)}</div>'
+        )
+    if spec.show_category and spec.category:
+        parts.append(
+            f'<div class="header-category" data-ann-type="header_slogan" '
+            f'data-ann-id="header.category">{html.escape(spec.category)}</div>'
+        )
+    if spec.slogan:
+        parts.append(
+            f'<div class="header-slogan" data-ann-type="header_slogan" '
+            f'data-ann-id="header.slogan">{html.escape(spec.slogan)}</div>'
+        )
+    parts.append("</div></header>")
+    return "".join(parts)
+
+
+def opener_to_html(spec: HeaderSpec) -> str:
+    """Render the religious opener, which sits above the letter body.
+
+    Args:
+        spec: The header carrying the opener text.
+
+    Returns:
+        An HTML fragment, empty when the sample has no opener.
+    """
+    if not spec.opener:
+        return ""
+    return (
+        f'<div class="religious-opener" data-ann-type="religious_opener" '
+        f'data-ann-id="opener">{html.escape(spec.opener)}</div>'
+    )
+
+
+def footer_to_html(spec: FooterSpec) -> str:
+    """Render the footer to annotated HTML.
+
+    The page-number node carries ``data-page-template`` for ``paginate.js`` to
+    fill once the sheet count is known, and meanwhile renders the single-page
+    string so the fragment is never blank.
+
+    Args:
+        spec: The footer to render.
+
+    Returns:
+        An HTML fragment, empty when the sample has no footer.
+    """
+    if not spec.enabled or (not spec.fields and not spec.has_page_number):
+        return ""
+    classes = (
+        f"letter-footer footer-{html.escape(spec.bar_style, quote=True)} "
+        f"footer-{html.escape(spec.layout, quote=True)}"
+    )
+    parts: list[str] = [
+        f'<footer class="{classes}" data-ann-type="footer_bar" '
+        f'data-ann-id="footer">'
+    ]
+    if spec.fields:
+        parts.append('<div class="footer-fields">')
+        for key, label, value in spec.fields:
+            field_id = html.escape(f"footer.{key}", quote=True)
+            safe_key = html.escape(key, quote=True)
+            parts.append(
+                f'<span class="footer-field" data-ann-type="footer_field" '
+                f'data-ann-id="{field_id}" data-ann-key="{safe_key}">'
+            )
+            if label:
+                parts.append(
+                    f'<span class="footer-label">{html.escape(label)}:</span> '
+                )
+            parts.append(f"{html.escape(value)}</span>")
+        parts.append("</div>")
+    if spec.has_page_number:
+        one_page = spec.page_number_template.format(
+            page=to_persian_digits(1), total=to_persian_digits(1)
+        )
+        parts.append(
+            f'<div class="page-number" data-ann-type="page_number" '
+            f'data-ann-id="footer.page_number" '
+            f'data-page-template="{html.escape(spec.page_number_template, quote=True)}">'
+            f"{html.escape(one_page)}</div>"
+        )
+    parts.append("</footer>")
+    return "".join(parts)
+
+
+def header_to_markdown(spec: HeaderSpec) -> str:
+    """Render the letterhead for the ``.md`` artifact.
+
+    Args:
+        spec: The header to render.
+
+    Returns:
+        The opener, company name and slogan as Markdown, empty when absent.
+    """
+    lines: list[str] = []
+    if spec.opener:
+        lines.extend((spec.opener, ""))
+    if spec.enabled and spec.company_name:
+        lines.append(f"# {spec.company_name}")
+        if spec.show_category and spec.category:
+            lines.append(f"*{spec.category}*")
+        if spec.slogan:
+            lines.append(f"*{spec.slogan}*")
+    return "\n".join(lines)
+
+
+def footer_to_markdown(spec: FooterSpec) -> str:
+    """Render the footer for the ``.md`` artifact.
+
+    Args:
+        spec: The footer to render.
+
+    Returns:
+        A horizontal rule followed by the contact lines, empty when absent.
+    """
+    if not spec.enabled or not spec.fields:
+        return ""
+    lines = [
+        f"**{label}:** {value}" if label else value for _, label, value in spec.fields
+    ]
+    return "---\n\n" + "  \n".join(lines)

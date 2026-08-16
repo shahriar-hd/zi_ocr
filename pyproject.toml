@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fa-ocr-lora"
+version = "0.1.0"
+description = "Persian (Farsi) LoRA adapter and synthetic dataset pipeline for PaddleOCR-VL 1.6"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Shahriar Hooshmand" }]
+keywords = ["ocr", "persian", "farsi", "lora", "paddleocr", "synthetic-data"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# Runtime dependencies of the dataset pipeline. Training and inference deps
+# (paddlepaddle, erniekit) are deliberately kept out of the default install so
+# Phase 1 stays runnable on a machine with no CUDA toolchain.
+dependencies = [
+    "playwright>=1.40",   # headless Chromium: RTL shaping, PDF, exact bboxes
+    "jinja2>=3.1",        # letter HTML/CSS templates
+    "pyyaml>=6.0",        # configs/synth_config.yaml
+    "pillow>=10.0",       # UTSig signature masking, stamp compositing
+]
+
+[project.optional-dependencies]
+# Text stage: the local LLM client that drafts Persian letter bodies.
+text = ["openai>=1.30", "requests>=2.31"]
+# Training and evaluation, installed separately per CLAUDE.md 3.
+train = ["paddlepaddle-gpu>=2.6", "paddlenlp>=3.0", "numpy>=1.26"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "black>=24.0",
+]
+
+[project.scripts]
+fa-ocr-lora = "fa_ocr_lora.inference.predict:main"
+fa-ocr-synth = "fa_ocr_lora.dataset.synth.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The renderer loads its templates and the pagination script from the package
+# directory, so they must ship inside the wheel.
+"fa_ocr_lora.dataset.synth.render" = ["*.js", "templates/*.j2"]
+
+[tool.black]
+line-length = 90
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+src = ["src", "test"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "D",    # pydocstyle - CLAUDE.md 8 requires docstrings
+    "ANN",  # type annotations on public functions
+]
+ignore = [
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+    "ANN401",  # Any is legitimate for JSON-shaped payloads
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves through their names; full docstrings there add
+# noise without adding information.
+"test/*" = ["D100", "D101", "D102", "D103", "ANN"]
+"scripts/*" = ["D100", "D103"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["src"]
+markers = [
+    "slow: tests that launch a browser or touch the full corpus",
+]

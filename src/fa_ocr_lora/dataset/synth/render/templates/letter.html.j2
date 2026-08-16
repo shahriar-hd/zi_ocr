@@ -1,0 +1,48 @@
+{#-
+  One rendered letter as a single HTML document.
+
+  Structure is dictated by ``paginate.js``, which needs three fixed hooks:
+
+  * ``#sheets``        - the empty host every paper sheet is appended to.
+  * ``#sheet-template`` - the per-sheet skeleton, cloned once per page, so the
+    letterhead and the footer repeat on page 2 and carry their own boxes.
+  * ``#flow``          - the ordered block stream, drained into sheet bodies
+    until each one overflows. It is removed from the DOM before measuring, so
+    no unplaced block can contribute a bounding box.
+
+  Every fragment interpolated here is pre-escaped HTML built by the layout and
+  element modules, which is why ``| safe`` is used throughout: the annotation
+  attributes (``data-ann-type``, ``data-ann-id``) are part of those fragments
+  and must survive intact.
+-#}
+<!DOCTYPE html>
+<html dir="rtl" lang="fa">
+<head>
+<meta charset="utf-8">
+<title>{{ sample_id }}</title>
+<style>
+{{ stylesheet | safe }}
+</style>
+</head>
+<body>
+
+<div id="sheets"></div>
+
+<template id="sheet-template">
+  <section class="sheet">
+    <div class="sheet-content">
+      <div class="sheet-header" data-region="header">{{ header_html | safe }}</div>
+      <div class="sheet-body" data-region="body"></div>
+      <div class="sheet-footer" data-region="footer">{{ footer_html | safe }}</div>
+    </div>
+  </section>
+</template>
+
+{#- The flow order *is* the reading order of the letter: opener, metadata,
+    parties, subject, body blocks, attachments, then the closing block. -#}
+<div id="flow" hidden>
+{% for fragment in flow_blocks %}{{ fragment | safe }}
+{% endfor %}</div>
+
+</body>
+</html>

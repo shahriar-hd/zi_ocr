@@ -1,0 +1,491 @@
+{#-
+  Stylesheet for one rendered letter.
+
+  The template owns geometry and the class contract; every colour, size and
+  bar treatment arrives from the theme, so no visual constant is hardcoded
+  here (CLAUDE.md 8). Class names are fixed by the spec modules that emit the
+  fragments - layout/header_footer.py, metadata_block.py, elements/tables.py,
+  elements/charts.py, layout/signature.py, layout/stamp.py - so renaming one
+  means editing that module too.
+
+  Two rules are load-bearing for the ground truth:
+
+  * Nothing may overflow ``.sheet``. A bbox measured for a node that has
+    spilled past the paper edge is a bbox the annotation would have to clip,
+    and a clipped box teaches the model a wrong extent.
+  * No CSS transform may move an annotated node after layout. ``getBoundingClientRect``
+    reports the *transformed* box, so a rotated paragraph would be boxed
+    axis-aligned around its rotation - the signature ink and the stamp are the
+    only rotated nodes, and both are non-text decoration.
+-#}
+@page {
+  size: {{ page.width_mm }}mm {{ page.height_mm }}mm;
+  margin: 0;
+}
+
+{{ font_css }}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #FFFFFF;
+}
+
+body {
+  direction: rtl;
+  text-align: right;
+  font-family: {{ theme.typography.body_css }};
+  font-size: {{ theme.typography.body_pt }}pt;
+  line-height: {{ theme.typography.line_height }};
+  color: {{ palette.ink }};
+  -webkit-font-smoothing: antialiased;
+  text-rendering: geometricPrecision;
+}
+
+/* ---------------------------------------------------------------- sheet */
+
+.sheet {
+  position: relative;
+  width: {{ page.width_mm }}mm;
+  height: {{ page.height_mm }}mm;
+  overflow: hidden;
+  {{ sheet_css }}
+  page-break-after: always;
+  break-after: page;
+}
+
+.sheet:last-of-type {
+  page-break-after: auto;
+  break-after: auto;
+}
+
+{% if backdrop_css %}
+/* The scan sits on its own layer so the white veil - and the optional
+   180deg flip - never touch the text above it. */
+.sheet::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  {{ backdrop_css }}
+}
+{% endif %}
+
+{% if side_stripe %}
+/* A full-height brand stripe on the inline-start (right) edge. It is a page
+   treatment rather than a header one, which is why the header itself renders
+   bare when this style is drawn. */
+.sheet::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: {{ stripe_mm }}mm;
+  background: {{ palette.accent }};
+  z-index: 1;
+}
+{% endif %}
+
+.sheet-content {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: {{ page.margin_mm }}mm;
+  {% if side_stripe %}padding-right: {{ page.margin_mm + stripe_mm + 3 }}mm;{% endif %}
+}
+
+/* The one growing region: pagination fills it until its scroll height
+   exceeds its client height, then starts a new sheet. */
+.sheet-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------- header */
+
+.letter-header {
+  display: flex;
+  align-items: center;
+  gap: 4mm;
+  margin-bottom: 3mm;
+  padding-bottom: 2mm;
+}
+
+.letter-header.logo-center {
+  flex-direction: column;
+  justify-content: center;
+  text-align: center;
+  gap: 2mm;
+}
+
+.letter-header.logo-left .header-logo {
+  order: 2;
+  margin-right: auto;
+}
+
+.header-logo {
+  display: block;
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.header-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.header-company {
+  font-family: {{ theme.typography.display_css }};
+  font-weight: 700;
+  font-size: {{ theme.typography.subject_pt }}pt;
+  line-height: 1.35;
+  color: {{ palette.accent }};
+}
+
+.header-category,
+.header-slogan {
+  font-size: {{ (theme.typography.body_pt * 0.84) | round(2) }}pt;
+  color: {{ palette.muted_ink }};
+  line-height: 1.4;
+}
+
+/* Bar treatments. ``solid`` paints the whole letterhead, so its text and its
+   logo are recoloured by header_footer.py to the palette's bar_text. */
+.header-rule {
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+}
+
+.header-double_rule {
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.accent }};
+  box-shadow: 0 {{ theme.rule_width_px + 2 }}px 0 0 {{ palette.rule }};
+  margin-bottom: 5mm;
+}
+
+.header-tinted_band {
+  background: {{ palette.tint }};
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border-radius: {{ theme.corner_radius_px }}px;
+  padding: 2.5mm 3mm;
+}
+
+.header-solid {
+  background: {{ palette.brand }};
+  border-radius: {{ theme.corner_radius_px }}px;
+  padding: 3mm;
+}
+
+.header-solid .header-company,
+.header-solid .header-category,
+.header-solid .header-slogan {
+  color: {{ palette.bar_text }};
+}
+
+.header-side_stripe,
+.header-none {
+  border: 0;
+}
+
+/* ------------------------------------------------------------- metadata */
+
+.metadata-block {
+  display: table;
+  margin-bottom: 4mm;
+  font-size: {{ (theme.typography.body_pt * 0.94) | round(2) }}pt;
+  line-height: 1.6;
+}
+
+.metadata-right {
+  margin-left: auto;
+  margin-right: 0;
+  text-align: right;
+}
+
+.metadata-left {
+  margin-right: auto;
+  margin-left: 0;
+  text-align: right;
+}
+
+.metadata-boxed {
+  border: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border-radius: {{ theme.corner_radius_px }}px;
+  padding: 2mm 3mm;
+}
+
+.metadata-field {
+  white-space: nowrap;
+}
+
+.metadata-label {
+  color: {{ palette.muted_ink }};
+  font-weight: 700;
+}
+
+.metadata-value {
+  color: {{ palette.ink }};
+}
+
+/* ---------------------------------------------------------------- frame */
+
+.religious-opener {
+  text-align: center;
+  font-family: {{ theme.typography.display_css }};
+  font-weight: 700;
+  margin: 0 0 4mm;
+  color: {{ palette.accent }};
+}
+
+.letter-party {
+  margin: 0 0 2mm;
+  font-weight: 700;
+  line-height: 1.6;
+}
+
+.letter-subject {
+  font-family: {{ theme.typography.display_css }};
+  font-weight: 700;
+  font-size: {{ theme.typography.subject_pt }}pt;
+  margin: 3mm 0 4mm;
+  color: {{ palette.accent }};
+  {% if subject_underline %}
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  padding-bottom: 1.5mm;
+  {% endif %}
+}
+
+/* ----------------------------------------------------------------- body */
+
+.para {
+  margin: 0 0 2.6mm;
+  {% if theme.typography.justify %}text-align: justify;{% endif %}
+  text-justify: inter-word;
+}
+
+.heading {
+  font-family: {{ theme.typography.display_css }};
+  font-weight: 700;
+  font-size: {{ theme.typography.heading_pt }}pt;
+  margin: 3.4mm 0 1.8mm;
+  color: {{ palette.accent }};
+}
+
+.list-item {
+  display: flex;
+  gap: 1.6mm;
+  margin: 0 0 1.4mm;
+  padding-right: 4mm;
+}
+
+.list-item.indent-1 { padding-right: 9mm; }
+.list-item.indent-2 { padding-right: 14mm; }
+
+.list-marker {
+  flex: 0 0 auto;
+  font-weight: 700;
+  color: {{ palette.accent }};
+}
+
+.list-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.attachments-block {
+  margin: 3mm 0;
+}
+
+.attachments-title {
+  font-weight: 700;
+  margin-bottom: 1.2mm;
+}
+
+/* ------------------------------------------------------------- elements */
+
+.element {
+  margin: 4mm 0;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+.table-caption,
+.chart-caption {
+  font-weight: 700;
+  font-size: {{ (theme.typography.body_pt * 0.92) | round(2) }}pt;
+  margin-bottom: 1.6mm;
+  color: {{ palette.accent }};
+}
+
+.element-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: {{ (theme.typography.body_pt * 0.9) | round(2) }}pt;
+  direction: rtl;
+}
+
+.element-table th,
+.element-table td {
+  border: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  padding: 1.2mm 1.8mm;
+  text-align: right;
+  vertical-align: top;
+}
+
+.element-table th {
+  background: {{ palette.tint }};
+  font-weight: 700;
+  color: {{ palette.accent }};
+}
+
+{% if theme.table_zebra %}
+.element-table tbody tr:nth-child(even) td {
+  background: {{ palette.tint }}80;
+}
+{% endif %}
+
+.element-chart {
+  text-align: center;
+}
+
+.chart-svg {
+  width: 100%;
+  max-width: 130mm;
+  height: auto;
+  direction: rtl;
+}
+
+/* Axis and category labels inherit their colour, so the whole chart obeys
+   the document's palette without charts.py knowing the theme. */
+.chart-svg text {
+  fill: {{ palette.ink }};
+  font-family: {{ theme.typography.body_css }};
+  font-size: 12px;
+}
+
+/* ------------------------------------------------------------ signature */
+
+.signature-block {
+  margin-top: 6mm;
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  max-width: 80mm;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+.signature-right {
+  align-self: flex-start;
+  align-items: center;
+  text-align: center;
+}
+
+.signature-center {
+  align-self: center;
+  align-items: center;
+  text-align: center;
+}
+
+.signature-left {
+  align-self: flex-end;
+  align-items: center;
+  text-align: center;
+}
+
+.signatory-title {
+  font-weight: 700;
+  white-space: pre-line;
+  line-height: 1.5;
+}
+
+/* The ink and the seal overlap deliberately: a real signature crosses the
+   printed line and a stamp lands beside or over it. */
+.signature-marks {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2mm;
+}
+
+.signature-ink {
+  display: block;
+}
+
+.stamp-mark {
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* --------------------------------------------------------------- footer */
+
+.letter-footer {
+  margin-top: 3mm;
+  padding-top: 2mm;
+  font-size: {{ (theme.typography.body_pt * 0.78) | round(2) }}pt;
+  line-height: 1.5;
+  color: {{ palette.muted_ink }};
+}
+
+.footer-rule {
+  border-top: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+}
+
+.footer-double_rule {
+  border-top: {{ theme.rule_width_px }}px solid {{ palette.accent }};
+  box-shadow: 0 -{{ theme.rule_width_px + 2 }}px 0 0 {{ palette.rule }};
+  margin-top: 5mm;
+}
+
+.footer-tinted_band {
+  background: {{ palette.tint }};
+  border-radius: {{ theme.corner_radius_px }}px;
+  padding: 2mm 3mm;
+}
+
+.footer-solid {
+  background: {{ palette.brand }};
+  border-radius: {{ theme.corner_radius_px }}px;
+  padding: 2.4mm 3mm;
+  color: {{ palette.bar_text }};
+}
+
+.footer-none {
+  border: 0;
+}
+
+.footer-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1mm 4mm;
+}
+
+.footer-stacked .footer-fields {
+  flex-direction: column;
+  gap: 0.6mm;
+}
+
+.footer-split .footer-fields {
+  justify-content: space-between;
+}
+
+.footer-field {
+  white-space: nowrap;
+}
+
+.footer-label {
+  font-weight: 700;
+}
+
+.page-number {
+  margin-top: 1.2mm;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}

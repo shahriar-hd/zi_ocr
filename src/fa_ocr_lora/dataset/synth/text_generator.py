@@ -62,6 +62,9 @@ LOGGER: Final[logging.Logger] = logging.getLogger("text_generator")
 
 DEFAULT_BASE_URL: Final[str] = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL: Final[str] = "nvidia/nemotron-3-nano-30b-a3b"
+# DEFAULT_MODEL: Final[str] = "google/gemma-4-31b-it"
+# DEFAULT_MODEL: Final[str] = "meta/llama-3.3-70b-instruct"
+# DEFAULT_MODEL: Final[str] = "z-ai/glm-5.2"
 DEFAULT_API_KEY_ENV: Final[str] = "NVIDIA_API_KEY"
 
 DEFAULT_LOGOS_CSV: Final[str] = "data/thesvg/logos.csv"
@@ -89,7 +92,7 @@ DEFAULT_TOP_P: Final[float] = 0.7
 #: well above the ~1000 completion tokens a typical draft uses: hitting the
 #: ceiling truncates the JSON mid-string and forces a full retry, which costs
 #: far more than the unused headroom does.
-DEFAULT_MAX_TOKENS: Final[int] = 8192
+DEFAULT_MAX_TOKENS: Final[int] = 16384
 DEFAULT_SEED: Final[int] = 1337
 
 REQUEST_TIMEOUT: Final[float] = 180.0
@@ -504,9 +507,9 @@ PLAIN_RULE: Final[str] = "در کلید «attachments» صرفاً لیست مت
 
 #: The JSON contract, shown to the model verbatim.
 OUTPUT_SCHEMA_BLOCK: Final[str] = """{
-  "company_name": "نام شرکت فرستنده (دقیقاً همان نامی که در بالا داده شد)",
+  "company_name": "نام شخص فرستنده بهمراه سمت و عنوان سازمان (دقیقاً همان مقداری که در بالا داده شد)",
   "company_category": "حوزه فعالیت شرکت فرستنده (دقیقاً همان مقداری که در بالا داده شد)",
-  "destination_organization": "نام سازمان یا اداره مقصد که خودت انتخاب می‌کنی",
+  "destination_organization": "نام بخش مقصد مانند مدیریت بخشی یا معاونت یا فرد و کارمند خاصی که خودت انتخاب می‌کنی",
   "letter_number": "شماره نامه رندوم رسمی (مثلا: ۱۲۳/الف/۰۳)",
   "date": "تاریخ رندوم شمسی",
   "national_id": "شناسه ملی ۱۱ رقمی رندوم",
@@ -514,7 +517,7 @@ OUTPUT_SCHEMA_BLOCK: Final[str] = """{
   "subject": "موضوع دقیق نامه که خودت تعیین می‌کنی",
   "body": "متن نامه که مستقیماً با «احتراماً» یا «به استناد» آغاز می‌شود: کامل، مفصل و حقوقی، شامل تمام پاراگراف‌ها، جزئیات، مبالغ، شروط و بندهای اداری...",
   "attachments": "لیست پیوست‌ها طبق قانون ۴",
-  "signatory_title": "سمت امضاکننده (مثلا: مدیرعامل و رئیس هیئت‌مدیره)",
+  "signatory_title": "سمت امضاکننده که خودت انتخاب می‌کنی (مثلا: مدیرعامل، معاون اجرایی، رئیس هیئت‌مدیره)",
   "contact_info": {
     "address": "آدرس کامل اداری رندوم با کدپستی ۱۰ رقمی",
     "phone": "شماره تلفن ثابت رندوم همراه با کد استان",
@@ -548,7 +551,7 @@ def build_prompt(inputs: SampleInputs) -> str:
 - لحن مورد انتظار: {inputs.tone}
 
 قوانین و الزامات مهم نگارش:
-۱. سازمان مقصد، موضوع نامه و شرح درخواست را خودت با خلاقیت و متناسب با حوزه فعالیت \
+۱. بخش مقصد، موضوع نامه و شرح درخواست را خودت با خلاقیت و متناسب با حوزه فعالیت \
 شرکت مبدأ انتخاب کن. تمام داده‌های عددی و شناختی (از جمله: شماره ثبت، شناسه ملی، \
 شماره نامه، تاریخ شمسی، کد پستی، آدرس، تلفن، ایمیل، وب‌سایت، مبالغ، نام اعضا یا \
 قطعات) را به‌صورت رندوم اما کاملاً دقیق، واقعی‌نما و متناسب با عرف اداری ایران تولید کن.
@@ -560,7 +563,7 @@ def build_prompt(inputs: SampleInputs) -> str:
    - جداسازی شروط، تعهدات یا اقلام در قالب بندها یا شماره‌گذاری‌های شفاف داخل متن.
    - جمع‌بندی رسمی، قدردانی و تعیین مهلت یا درخواست اقدام عاجل.
 ۳. اعداد داخل متن با ارقام فارسی نوشته شوند، پاراگراف‌ها با \\n از هم جدا شوند و هیچ \
-کاراکتر کنترلی دیگری در متن نیاید. نام و نام خانوادگی امضاکننده را ننویس؛ فقط سمت او \
+کاراکتر کنترلی دیگری در متن نیاید. نام و نام خانوادگی امضاکننده را بنویس؛ و سمت او \
 در signatory_title بیاید.
 ۴. متن body را مستقیماً با نخستین جملهٔ محتوایی نامه آغاز کن؛ برای مثال با \
 «احتراماً، ...» یا «به استناد ...» یا «پیرو مکاتبه شماره ...». پیش از آن هیچ سربرگ، \
@@ -570,6 +573,7 @@ def build_prompt(inputs: SampleInputs) -> str:
 ۵. {attachment_rule}
 ۶. این نامه باید کاملاً منحصربه‌فرد باشد: از جملات کلیشه‌ای و ساختار تکراری پرهیز کن و \
 سناریوی خاص و باورپذیر خودت را بساز.
+7. نامه ای که تولید میکنی باید بصورت داخلی باشد یعنی نامه درون سازمانی باشد و به هیچ عنوان نامه ای که برای عموم مردم یا مشتریان باشد تولید نکن. شخص یا بخش مبدا و مقصد رو به درستی انتخاب کن.
 
 فرمت دقیق خروجی JSON:
 {OUTPUT_SCHEMA_BLOCK}"""

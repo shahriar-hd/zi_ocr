@@ -1,0 +1,209 @@
+# Synthetic Persian letter rendering - generation knobs.
+#
+# Loaded by fa_ocr_lora.dataset.common.config.load_synth_config, which
+# validates every key. An unknown key here is an error, not a silent no-op.
+# Every value a sample depends on lives in this file, so a corpus is
+# reproducible from (this config, seed) alone - CLAUDE.md 8.
+
+# Master seed. Per-sample RNGs are derived as "{seed}:{purpose}:{index}", so a
+# sample renders identically regardless of run order or batch boundaries.
+seed: 1337
+
+paths:
+  # Output of the text stage: one row per letter, joined with logo + signature.
+  manifest: data/text/generator.csv
+  # Full letter records referenced by manifest.sample_path.
+  plaintext_dir: data/text/plaintext
+  # Logo corpus root; manifest logo_path values are relative to this.
+  logos_dir: data/thesvg
+  # UTSig handwritten signature corpus.
+  signatures_dir: data/UTSig
+  # Prepared blank-page scans used as paper texture.
+  texture_dir: data/texture
+  # Rendered artifacts land in images/, pdf/, markdown/, annotations/ here.
+  output_dir: data/synth
+
+  # Artifact directory names inside output_dir. Override these when a consumer
+  # expects a particular tree - a PaddleFarmer corpus is usually handed
+  # image/ beside json/ - rather than moving files after a 20k-sample run.
+  # An empty name writes that artifact into output_dir itself. The same keys
+  # are available on the CLI as --subdir images=image.
+  subdirs:
+    images: images
+    pdf: pdf
+    markdown: markdown
+    annotations: annotations
+    # paddle_farmer.jsonl and paddle_ocr_vl.jsonl.
+    json: ""
+  # Persian font files, embedded into each page as @font-face data URIs.
+  #
+  # They are NOT resolved by family name through fontconfig: this shell runs
+  # with XDG_DATA_HOME pointing into a VS Code snap sandbox, so fontconfig
+  # expands its `<dir prefix="xdg">fonts</dir>` rule to a directory that does
+  # not exist and never indexes the real one. Chromium then silently falls
+  # back for every Persian family. Embedding the bytes sidesteps host font
+  # state entirely, which a reproducible corpus needs anyway - the same seed
+  # must render the same page on a training box that has none of these
+  # installed. See docs/decisions.md.
+  fonts_dir: ~/.local/share/fonts
+
+render:
+  # 300 DPI is the scan resolution PaddleOCR-VL is typically fed, and keeps an
+  # A4 page at 2480x3508 - large enough for small metadata text to survive
+  # downsampling. Recorded in docs/decisions.md.
+  dpi: 300
+
+  # Weights are relative, not percentages. A4 portrait dominates because it is
+  # what Persian administrative correspondence actually uses; the rest keep the
+  # model from overfitting to one aspect ratio.
+  page_sizes:
+    - name: A4
+      orientation: portrait
+      width_mm: 210
+      height_mm: 297
+      weight: 60
+    - name: US Letter
+      orientation: portrait
+      width_mm: 215.9
+      height_mm: 279.4
+      weight: 15
+    - name: A5
+      orientation: portrait
+      width_mm: 148
+      height_mm: 210
+      weight: 10
+    - name: A4
+      orientation: landscape
+      width_mm: 297
+      height_mm: 210
+      weight: 8
+    - name: A3
+      orientation: portrait
+      width_mm: 297
+      height_mm: 420
+      weight: 7
+
+  # Page margin, sampled per document. Persian administrative letters run
+  # generous margins; the range keeps text away from the sheet edge without
+  # making short letters look empty.
+  margin_mm:
+    min: 18
+    max: 26
+
+  # Safety valve: a body long enough to exceed this is truncated rather than
+  # rendering an unbounded PDF. Bodies top out near 5.6k characters, which
+  # fits comfortably inside 6 A4 pages.
+  max_pages: 6
+
+  # Chromium navigation/render budget per sample.
+  timeout_ms: 30000
+
+probabilities:
+  # Header and footer are near-universal on real letterhead, so they are the
+  # common case rather than a coin flip.
+  header: 0.92
+  footer: 0.78
+  # Company slogan under the letterhead name.
+  header_slogan: 0.3
+  # "بسمه تعالی" style opener above the metadata block.
+  religious_opener: 0.45
+  # Applied only when the manifest row carries a signature_path; ~30% of rows
+  # are unsigned and render with no signature block at all.
+  signature: 1.0
+  # Rubber stamp (مهر) beside the signature, built from the company logo.
+  stamp: 0.55
+  # Paper texture behind the sheet. Half the corpus renders on plain white so
+  # the model sees both clean and scanned-looking pages.
+  texture: 0.5
+  # Table or chart attached to the body. Follows the corpus rather than
+  # CLAUDE.md 5.2's ~1/5: the text stage generated at 0.1, so 166 of 1600 rows
+  # carry element content. See docs/decisions.md.
+  element: 0.1
+  # Page number in the footer.
+  page_number: 0.6
+
+theme:
+  # Body faces, sampled per document by relative weight. These are the Persian
+  # families installed under ~/.local/share/fonts - Chromium resolves them by
+  # family name through fontconfig, so nothing needs vendoring.
+  #
+  # B Nazanin carries the most weight because it is the default face of Iranian
+  # administrative correspondence, so the corpus should look like the real
+  # thing; the rest are there so the adapter does not overfit one skeleton.
+  #
+  # The legacy B-series faces draw small for their nominal point size (their
+  # glyphs occupy well under the em), so each entry carries a scale factor that
+  # normalises optical size across families. Without it a B Nazanin page would
+  # render noticeably smaller than an IRANSansX page at the same pt.
+  font_families:
+    - name: B Nazanin
+      weight: 30
+      scale: 1.22
+    - name: B Mitra
+      weight: 12
+      scale: 1.22
+    - name: B Zar
+      weight: 8
+      scale: 1.20
+    - name: B Badr
+      weight: 6
+      scale: 1.20
+    - name: B Ferdosi
+      weight: 6
+      scale: 1.20
+    - name: B Tehran
+      weight: 5
+      scale: 1.10
+    - name: B Hamid
+      weight: 3
+      scale: 1.15
+    - name: B Yekan
+      weight: 6
+      scale: 1.05
+    - name: IRANSansX
+      weight: 12
+      scale: 1.0
+    - name: IRANSansXFaNum
+      weight: 5
+      scale: 1.0
+    - name: Vazir
+      weight: 5
+      scale: 1.0
+    - name: Sahel
+      weight: 2
+      scale: 1.0
+
+  # Display faces for the subject line and section headings. B Titr ships only
+  # in bold and is the conventional Persian letterhead/title face; the others
+  # are there so headings are not always the same silhouette. An empty entry
+  # means "reuse the body family", which is what a plain letter does.
+  display_font_families:
+    - name: B Titr
+      weight: 34
+    - name: ""
+      weight: 30
+    - name: B Yekan
+      weight: 12
+    - name: IRANSansX
+      weight: 12
+    - name: B Nazanin
+      weight: 12
+
+  body_font_pt:
+    min: 10.5
+    max: 13.0
+
+  line_height:
+    min: 1.6
+    max: 2.0
+
+  # WCAG AA floor for normal text. theme.py derives surfaces from the row's
+  # brand_hex and darkens the ink until it clears this, so no sample renders
+  # illegibly light-on-light.
+  min_contrast_ratio: 4.5
+
+  # Stamp ink colors: office blue, red, and violet.
+  stamp_inks:
+    - "#1B3F94"
+    - "#A81E22"
+    - "#4B2A7B"
