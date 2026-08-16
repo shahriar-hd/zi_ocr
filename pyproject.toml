@@ -32,6 +32,11 @@ dependencies = [
 text = ["openai>=1.30", "requests>=2.31"]
 # Training and evaluation, installed separately per CLAUDE.md 3.
 train = ["paddlepaddle-gpu>=2.6", "paddlenlp>=3.0", "numpy>=1.26"]
+# Google Drive upload for the Colab training handoff (scripts/upload_to_drive.py).
+drive = [
+    "google-api-python-client>=2.140",
+    "google-auth-oauthlib>=1.2",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

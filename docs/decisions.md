@@ -115,10 +115,40 @@ between page screenshots is retried rather than mistaken for complete. The
 manifest CSV row and both JSONL files are appended per sample, so a crash at
 sample 900 leaves 899 usable rows.
 
+## Colab handoff (Google Drive)
+
+**`scripts/upload_to_drive.py` mirrors only what training reads.** Page PNGs
+and `paddle_farmer.jsonl` go up; markdown, PDF, per-page annotations and
+`paddle_ocr_vl.jsonl` stay local. The box-level projection is only needed once
+element-level crops enter the mix, and it would double the metadata transfer
+for a notebook that starts page-level.
+
+**The 8k unrendered plaintext records ship as one `plaintext_pending.jsonl`,
+not 8k files.** Drive charges a round trip per file; one 39 MB bundle uploads
+in seconds where 8k creates take tens of minutes and burn API quota. Colab
+reads it with one `open()`.
+
+**Every path in the uploaded `manifest.csv` is Drive-root-relative**
+(`generate/image/synth_000000_p01.png`), so the notebook joins it with its own
+mount point instead of rewriting absolute local paths. The combined manifest
+carries both datasets, tagged `dataset=generate|text` and
+`status=rendered|pending`, so Source A/B and Source C in the notebook prompt
+select by column rather than by directory listing.
+
+**OAuth scope is `drive.file`, not full `drive`.** The script only ever touches
+files it created, which keeps consent narrow and avoids Google's restricted
+scope review — at the cost of not being able to see a `datasets/` folder made
+by hand in the web UI. `--drive-root-id` is the escape hatch for that case.
+
+**Resume is by name plus byte size**, not a local state file: the destination
+folder listing is the state. An interrupted 8 GB run resumes by re-listing and
+skipping matches, and a re-rendered page with a different size re-uploads on
+its own.
+
 ## Tooling
 
-**PEP 8 is enforced by `compileall` plus a column sweep**, because `ruff` and
-`black` are not installed in this environment. `pyproject.toml` declares both
-at `line-length = 90` for CI. Note that `awk 'length($0) > 90'` counts *bytes*
-and will over-report on Persian source; measure with Python's `len()` on
-decoded text.
+**PEP 8 is enforced by `ruff` and `black`** at `line-length = 90`, declared in
+`pyproject.toml` and installed in the dev environment (`pip install -e
+'.[dev]'`). Where they are unavailable, `compileall` plus a column sweep is the
+fallback — but note that `awk 'length($0) > 90'` counts *bytes* and will
+over-report on Persian source; measure with Python's `len()` on decoded text.
