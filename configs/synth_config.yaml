@@ -1,9 +1,20 @@
 # Synthetic Persian letter rendering - generation knobs.
 #
-# Loaded by fa_ocr_lora.dataset.common.config.load_synth_config, which
-# validates every key. An unknown key here is an error, not a silent no-op.
-# Every value a sample depends on lives in this file, so a corpus is
-# reproducible from (this config, seed) alone - CLAUDE.md 8.
+# Loaded by fa_ocr_lora.config.load_config, which validates every key. An
+# unknown key here is an error, not a silent no-op. Every value a sample
+# depends on lives in this file, so a corpus is reproducible from
+# (this config, seed) alone - CLAUDE.md 8.
+#
+# Two things deliberately do NOT live here: machine-specific paths and secrets.
+# Those come from the environment (see .env.example), which overrides what this
+# file says. The full precedence chain is:
+#
+#     CLI flag  >  environment  >  this file  >  dataclass default
+
+# The Persian words a page is built from - openers, label wordings, table
+# headers, seal words - live in their own file, because retuning wording should
+# never risk touching a probability. Override with FA_OCR_VOCABULARY.
+vocabulary: configs/vocabulary_fa.yaml
 
 # Master seed. Per-sample RNGs are derived as "{seed}:{purpose}:{index}", so a
 # sample renders identically regardless of run order or batch boundaries.
@@ -98,6 +109,30 @@ render:
   # Chromium navigation/render budget per sample.
   timeout_ms: 30000
 
+  # How a page raster is encoded. PNG is lossless and the safe default; JPEG at
+  # quality 92 is roughly a quarter of the size, which is what makes a 20k-page
+  # corpus practical to move to a Colab runtime. Overridable on the CLI as
+  # --image-format / --image-quality.
+  #
+  # The suffix follows the format everywhere it appears - page filenames, the
+  # annotation's image_path, both JSONL projections and the manifest - so
+  # switching format needs no other change.
+  image:
+    format: png        # png | jpeg (jpg) | webp
+    quality: 92        # 1-100; jpeg and lossy webp only, ignored by png
+    optimize: false    # png/jpeg: spend CPU to shrink; a few percent at best
+    lossless: false    # webp only
+
+  # Chromium launch flags. Font hinting is off so a glyph's advance width does
+  # not depend on the host's freetype build: two machines must produce the same
+  # layout, and therefore the same boxes, from the same seed. Add --no-sandbox
+  # here if you run in a container that needs it.
+  chromium_args:
+    - --font-render-hinting=none
+    - --disable-lcd-text
+    - --force-color-profile=srgb
+    - --hide-scrollbars
+
 probabilities:
   # Header and footer are near-universal on real letterhead, so they are the
   # common case rather than a coin flip.
@@ -121,6 +156,258 @@ probabilities:
   element: 0.1
   # Page number in the footer.
   page_number: 0.6
+  # Company category printed as a sub-line under the name, on rows that carry
+  # one at all.
+  header_category: 0.28
+  # Footer contact fields printed with their Persian label rather than bare.
+  footer_labels: 0.72
+  # Explicit sender line when the letterhead already names the company. A
+  # headerless letter always prints one, or the page would never say who wrote
+  # it, so this rate applies only to the letterhead case.
+  sender_line: 0.32
+  # Underline under the subject line.
+  subject_underline: 0.34
+  # Metadata block on the logo's own margin instead of the opposite one. Kept
+  # low because the two crowd each other, but not zero - real letterhead does
+  # it. A centred logo leaves both margins free and ignores this.
+  metadata_same_side: 0.12
+  # Metadata block drawn inside a hairline border.
+  metadata_boxed: 0.34
+  # Metadata fields printed with their Persian label. The minority case is a
+  # letterhead that prints bare values in a fixed column - the model has to
+  # read "۱۴۰۳/۰۵/۲۱" as a date without the word تاریخ next to it.
+  metadata_labels: 0.94
+
+# Where things sit on the sheet and how large they are drawn. Kept apart from
+# `theme` (colour and type) and `probabilities` (whether a feature appears at
+# all), so retuning a logo size can never disturb a contrast floor.
+layout:
+  # Width of the full-height brand stripe, in millimetres.
+  stripe_mm: {min: 6.0, max: 11.0}
+
+  # Letterhead logo height. Below ~9mm a 24x24 mark stops being legible at
+  # 300 DPI; above ~22mm it starts competing with the company name.
+  logo_mm: {min: 9.0, max: 22.0}
+
+  # Which margin the logo hugs, by relative weight. Right dominates because
+  # that is the head of the line in an RTL page, and so where Iranian
+  # letterhead puts the mark.
+  logo_sides:
+    right: 52
+    center: 26
+    left: 22
+
+  # Which margin the closing block hugs. Persian letters sign at the
+  # inline-end (left) side far more often than centred.
+  signature_sides:
+    left: 58
+    center: 26
+    right: 16
+
+  # How the footer arranges its fields: inline on one line, stacked one per
+  # line, or split with the last field pushed to the far margin.
+  footer_layouts:
+    inline: 62
+    stacked: 26
+    split: 12
+
+  # Candidate field orders for the footer, chosen uniformly - so a shape
+  # listed twice is twice as likely. Fields the row does not carry are
+  # dropped, which is why a longer order is not a longer footer. Address
+  # first is the postal convention; the short forms exist because a one-line
+  # footer is very common.
+  contact_orders:
+    - [address, phone, email, website]
+    - [address, phone, website]
+    - [phone, email, website]
+    - [address, phone]
+    - [phone, website]
+    - [address, phone, email]
+
+  # Candidate field orders for the administrative metadata block, chosen
+  # uniformly. CLAUDE.md 5.2 makes this the highest-priority region on the
+  # page, so the corpus varies the order rather than teaching the model a
+  # fixed one: letter_number before date is near-universal, but everything
+  # else genuinely differs between organisations. Fields the row leaves empty
+  # are dropped, so a longer order is not a taller block.
+  metadata_orders:
+    - [letter_number, date, attachment]
+    - [letter_number, date, attachment, national_id]
+    - [registration_number, date, attachment]
+    - [letter_number, registration_number, date, attachment]
+    - [date, letter_number, attachment]
+    - [letter_number, date]
+
+# Handwritten signature: how a UTSig scan is lifted off its paper and how large
+# the ink is drawn. The scans are white paper with 4-8% ink; pasting one whole
+# would print a white rectangle over the letterhead, so the paper is discarded
+# and only the ink survives as an alpha channel.
+signature:
+  # Alpha at or below which a pixel counts as paper rather than ink, on the
+  # 0-255 scale. Derived from the corpus: scanner haze puts the background at
+  # 240-254 (alpha 1-15), while the faintest real stroke edges land well above.
+  # Raise it and thin strokes disappear; lower it and the scan's grey rectangle
+  # prints onto the page.
+  paper_floor: 26
+
+  # Padding kept around the ink's bounding box, as a fraction of the crop, so
+  # rotating the mask does not clip a stroke that ends exactly at the edge.
+  crop_pad: 0.02
+
+  # Longest edge of the emitted PNG. A 46mm signature at 300 DPI needs 543
+  # device pixels, so anything past this is resolution the page cannot show;
+  # the cap holds the inline base64 payload near 80 KB instead of 140 KB.
+  max_edge_px: 720
+
+  # Pen colours, by relative weight. Blue-black leads because Iranian
+  # administrative practice signs in blue. Recolouring also stops the signature
+  # from matching the body ink exactly, which a real pen never does.
+  pen_inks:
+    "#12295C": 34
+    "#1B3A7A": 24
+    "#1A1A1A": 18
+    "#0E1D3D": 14
+    "#2B2B38": 10
+
+  # Rendered width on the page, in millimetres.
+  width_mm: {min: 28.0, max: 46.0}
+
+  # Tilt baked into the ink. A signature is written by hand against a ruled
+  # line, so the range is deliberately narrow.
+  rotate_deg: {min: -7.0, max: 7.0}
+
+  # How far the signature rides up over the signatory's title, as a real one
+  # does rather than sitting neatly below it.
+  overlap_mm: {min: 0.0, max: 5.0}
+
+# ---------------------------------------------------------------------------
+# The rubber stamp (مهر) pressed beside the signature. An Iranian
+# administrative letter is not official until it carries one, so roughly half
+# the signed samples get a seal: the company's own logo inside a geometric
+# border, ringed with Persian text, printed in a single ink.
+#
+# Only per-sample variation lives here. The stamp's internal geometry - its
+# 200-unit viewBox, the border and ring radii, the ring font sizes - stays in
+# layout/stamp.py, because those numbers are meaningful only relative to each
+# other and editing one of them here would break the mark rather than restyle
+# it. The Persian city and seal-word pools move to configs/vocabulary_fa.yaml.
+stamp:
+  # Border shapes, by relative weight. The round forms dominate because that is
+  # what an Iranian company seal almost always is; the angular ones exist so the
+  # model does not learn "stamp == circle". Only these six names are accepted,
+  # and whether a shape's ring text follows an arc is fixed in code - text
+  # curved around a corner is not a thing real stamps do.
+  shapes:
+    circle: 30
+    double_circle: 26
+    oval: 14
+    rounded_square: 12
+    square: 10
+    hexagon: 8
+
+  # Rendered width on the page, in millimetres; the mark is square. Real
+  # company seals run 30-42 mm across, and this brackets that.
+  width_mm: {min: 28.0, max: 42.0}
+
+  # Tilt of the whole mark. A stamp is pressed by hand, so the angle is
+  # sloppier than the signature's.
+  rotate_deg: {min: -18.0, max: 18.0}
+
+  # Overall ink weight. Below ~0.7 the mark stops reading as deliberate; at 1.0
+  # it looks printed rather than pressed.
+  opacity: {min: 0.72, max: 0.94}
+
+  # How far feTurbulence shoves the mark around, in viewBox units. Two units on
+  # a 200-unit box is a visible wobble at the border without smearing the text.
+  wobble: {min: 1.4, max: 3.0}
+
+  # Threshold on the hole mask, as an alpha multiplier. More negative eats less
+  # ink: the intercept shifts the whole grain curve down, so only its brightest
+  # peaks clear zero and survive as dropouts. At -1.2 too much of the field
+  # cleared and thin borders came out dotted rather than pressed, so the range
+  # starts below that.
+  erosion: {min: -3.0, max: -1.8}
+
+  # Border weight in viewBox units.
+  stroke_width: {min: 2.6, max: 4.4}
+
+  # The logo's share of the seal's box.
+  logo_fraction: 0.42
+
+  # Gain applied to the logo's density before it is flooded with ink. Density
+  # is 1 - luminance, so a light brand fill lands near 0.2 and prints as a
+  # watermark next to saturated ring text at low gain. At 4.0 anything darker
+  # than ~75% luminance inks solid, while white knockouts (density 0) and the
+  # transparent margin still drop out - a rubber pad transfers one weight of
+  # ink or none, not a gradient.
+  ink_gain: 4.0
+
+  # Chance the upper ring reads "مهر <name>" rather than the bare
+  # organisation name.
+  name_prefix_probability: 0.35
+
+# ---------------------------------------------------------------------------
+# The optional structured elements attached to a page: a table or a chart.
+#
+# Only *invented* data is configured here. Roughly 118 of the 2000 letter
+# bodies carry a real Markdown pipe table, and about 43 of the chart-bearing
+# ones ship a real label/value series; those are rendered verbatim, because
+# real data beats invented data as a training target, and nothing in this
+# section can reach them.
+#
+# Whether a page gets an element at all, and which kind, lives in
+# `probabilities`. The Persian header, label and caption vocabularies move to
+# configs/vocabulary_fa.yaml. The chart's SVG canvas stays in
+# elements/charts.py: its width is what keeps a chart inside the narrowest
+# supported page (A5), and its pads are meaningful only against that width.
+#
+# Every range below counts whole numbers and includes both ends, so
+# {min: 4, max: 8} can draw 4, 8, or anything between. A bare number sets a
+# constant.
+elements:
+  table:
+    # Body row count. The column count is not drawn - it is the width of the
+    # header row picked from the vocabulary, 3-4 columns as shipped.
+    rows: {min: 4, max: 8}
+
+    # Which range a cell draws from is decided by its column header, so each
+    # only has to be plausible for the columns that name it.
+
+    # A مبلغ/هزینه column, in millions of rials. The multiplier itself stays in
+    # elements/tables.py next to the "مبلغ (ریال)" header wording that declares
+    # the unit, since changing one without the other prints a wrong figure.
+    amount_millions: {min: 5, max: 949}
+
+    # A تعداد column.
+    count: {min: 1, max: 59}
+
+    # A درصد column.
+    percent: {min: 10, max: 99}
+
+    # A تاریخ/زمان column: day of the Jalali month, then the year. The day stops
+    # at 28 so no month can be given a date it does not have. The year brackets
+    # the corpus rather than tracking the present, so a rendered table stays
+    # consistent with the dates written in the letter around it.
+    day: {min: 1, max: 28}
+    year: {min: 1401, max: 1404}
+
+  chart:
+    # Kinds the fallback picks between when the letter body names no chart type.
+    # Pie is deliberately absent: a proportion chart of an invented series is
+    # rarely what an administrative letter would have used, so pie is drawn only
+    # when the body explicitly asks for one with نمودار دایره‌ای. A plain list
+    # rather than a weighted mapping, because this one is drawn with rng.choice.
+    fallback_kinds: [bar, line]
+
+    # Number of categories plotted. Capped in code by the length of the label
+    # vocabulary the series is drawn from, so a range wider than the shortest
+    # pool plots the whole pool instead of repeating a category.
+    series_points: {min: 4, max: 6}
+
+    # Value range per series unit, matched the same way the table's columns are.
+    percent_values: {min: 15, max: 99}
+    count_values: {min: 8, max: 479}
+    amount_values: {min: 12, max: 899}
 
 theme:
   # Body faces, sampled per document by relative weight. These are the Persian
@@ -202,8 +489,288 @@ theme:
   # illegibly light-on-light.
   min_contrast_ratio: 4.5
 
+  # Secondary text - dates, contact lines, captions - is lightened from the body
+  # ink and held to a lower floor, because WCAG AA only demands 4.5 of body copy.
+  muted_ink_lighten: {min: 0.28, max: 0.42}
+  muted_ink_contrast_ratio: 3.0
+
+  # How the contrast floor is chased: darken by this much, at most this many
+  # times, before falling back to the near-black the module pins. A larger step
+  # converges sooner and overshoots the hue further.
+  darken_step: 0.08
+  max_darken_steps: 24
+
+  # Near-black body inks. Pure #000 is rare in print, so the pool leans to very
+  # dark neutrals.
+  ink_candidates:
+    - "#1A1A1A"
+    - "#212121"
+    - "#141414"
+    - "#232323"
+
+  # Page surface tints, warm and cool. Pure #FFFFFF is deliberately absent - no
+  # sheet of paper is white, and the surface is painted at surface_alpha so the
+  # scanned paper composited underneath shows through it.
+  surface_candidates:
+    - "#FCFAF4"
+    - "#FBF9F3"
+    - "#FDFCF8"
+    - "#FAF9F5"
+    - "#F9FAFB"
+    - "#FBFAF6"
+
+  # Nothing on the page is opaque: a light area is an absence of ink, which is
+  # what lets the paper texture show through. These are the opacities each layer
+  # is painted at. Body ink stays near-opaque - the contrast floor is measured on
+  # the composite, so a lower value here is darkened to compensate.
+  surface_alpha: {min: 0.12, max: 0.34}
+  ink_alpha: {min: 0.88, max: 0.97}
+  tint_alpha: {min: 0.42, max: 0.78}
+  panel_alpha: {min: 0.9, max: 0.99}
+  rule_alpha: {min: 0.7, max: 0.94}
+
+  # How far the brand colour is lightened into a band tint, and the accent into
+  # a rule colour. Both are fractions toward white.
+  tint_lighten: {min: 0.86, max: 0.94}
+  rule_lighten: {min: 0.35, max: 0.6}
+
+  # Heading and subject size, as a multiple of the body size.
+  heading_scale: {min: 1.04, max: 1.16}
+  subject_scale: {min: 1.08, max: 1.24}
+
+  # Rule stroke width in CSS pixels, and the panel corner radii to choose
+  # between. 0 appears twice because square corners are twice as likely as any
+  # rounded value - administrative letterhead is mostly square.
+  rule_width_px: {min: 0.8, max: 2.4}
+  corner_radii_px: [0.0, 0.0, 2.0, 4.0, 6.0]
+
+  # Justified body text, and alternating table row shading.
+  justify_probability: 0.65
+  table_zebra_probability: 0.55
+
+  # Text on a solid brand bar: white when the bar is dark enough to carry it,
+  # otherwise this near-black, darkened until it clears min_contrast_ratio.
+  bar_text_light: "#FFFFFF"
+  bar_text_dark: "#1A1A1A"
+
+  # How the header bar is drawn, by relative weight. A plain rule is the most
+  # common treatment on real letterheads, so it dominates without excluding the
+  # rest. The footer draws from the same pool minus side_stripe, which runs the
+  # full page height and so cannot also be a footer treatment.
+  bar_weights:
+    rule: 30
+    tinted_band: 22
+    solid: 16
+    double_rule: 14
+    side_stripe: 10
+    none: 8
+
   # Stamp ink colors: office blue, red, and violet.
   stamp_inks:
     - "#1B3F94"
     - "#A81E22"
     - "#4B2A7B"
+
+# Scanner simulation. The renderer draws a mathematically perfect page: exact
+# geometry, even light, no grain. Real input to an OCR model is a photograph of
+# paper, so every value below reintroduces one physical defect. Each is either a
+# probability or a {min, max} range the sample draws from, so the corpus spans
+# the range instead of sitting on one setting; a bare number pins a range.
+scan:
+  enabled: true
+  # Fraction of samples that get the treatment. The rest stay clean, so the
+  # adapter also sees born-digital pages.
+  probability: 0.85
+
+  # Paper is decided once per document - one letter is printed on one sheet.
+  paper:
+    # Base paper tone. Pure white never appears: paper is warm or cool off-white
+    # even before a scanner's sensor adds its own cast.
+    tints:
+      - "#FBF8F1"
+      - "#F8F6F0"
+      - "#FAFAF7"
+      - "#F6F3EA"
+      - "#F9F5EC"
+    # How much of the scan's grain survives. The scans are flat-fielded first -
+    # each channel is rescaled so its own mean is near-white - so this controls
+    # the depth of the texture, never the brightness of the paper. A raw
+    # mid-grey photograph therefore textures the page instead of greying it.
+    strength: {min: 0.18, max: 0.55}
+    # The scans are raw photographs; these are the passes a scanner's own
+    # software would apply before the grain reaches the page.
+    grayscale: 0.5
+    autocontrast: 0.55
+    brightness: {min: 0.94, max: 1.1}
+
+  # Ink: no printer lays down a hard edge, and no page is printed one-sided
+  # enough to hide the sheet behind it.
+  ink:
+    blur: {min: 0.3, max: 1.1}
+    # How far the darkest ink is lifted toward the paper. Text is never pure
+    # black on a scan - this is what stops the model expecting 0,0,0.
+    lighten: {min: 0.02, max: 0.16}
+    bleed: 0.35
+    bleed_alpha: {min: 0.03, max: 0.11}
+    # Morphological thickening: toner spread on absorbent paper.
+    dilate: 0.18
+
+  # Geometry: how the sheet sat on the platen, and what the lens did.
+  geometry:
+    rotation_deg: {min: -0.9, max: 0.9}
+    # Corner displacement as a fraction of the page, i.e. camera angle.
+    perspective: {min: 0.0, max: 0.005}
+    # Page bow, as a fraction of the page height.
+    warp_amplitude: {min: 0.0, max: 0.009}
+    # Radial lens distortion; negative is barrel, positive pincushion.
+    barrel: {min: -0.01, max: 0.014}
+
+  # Lighting and the sensor's colour response. The three light terms are
+  # re-centred on their own mean before they are applied, so these are the depth
+  # of the unevenness, not an overall dimming of the page.
+  lighting:
+    illumination: {min: 0.04, max: 0.22}
+    vignette: {min: 0.0, max: 0.26}
+    shadow: 0.35
+    shadow_strength: {min: 0.06, max: 0.26}
+    # Both tone knobs bracket 1.0 tightly: paper sits near the top of the range,
+    # where a small gamma or contrast move is a large change in level.
+    gamma: {min: 0.9, max: 1.1}
+    brightness: {min: 0.95, max: 1.06}
+    contrast: {min: 0.92, max: 1.05}
+
+  # Sensor noise, plus the output pass the scanner's own software applies.
+  noise:
+    gaussian_sigma: {min: 0.8, max: 4.5}
+    # Dust: platen grit, loose toner, paper fibre. Counted per megapixel, so the
+    # same numbers mean the same dustiness at 150 and at 400 DPI - up to ~35
+    # specks on an A4 page at 300 DPI, ~9 at 150 DPI, and none at the bottom of
+    # the range. Each is a soft blot with a Gaussian falloff, tinting the paper
+    # rather than replacing it: `strength` well under 1 keeps a speck off pure
+    # black, and `radius` keeps it several pixels wide. Deliberately not
+    # salt-and-pepper noise - a lone flipped pixel is a defect no scanner makes.
+    speck_density: {min: 0.0, max: 4.0}
+    speck_radius: {min: 0.7, max: 1.9}
+    speck_strength: {min: 0.18, max: 0.62}
+    jpeg: 0.45
+    jpeg_quality: {min: 72, max: 95}
+    # Scanning below the nominal DPI and upscaling back, as a cheap scanner does.
+    resample: 0.35
+    resample_scale: {min: 0.7, max: 0.95}
+    # Printer/scanner output modes: greyscale, and 1-bit "B&W" thresholding.
+    grayscale: 0.22
+    bilevel: 0.06
+
+# ---------------------------------------------------------------------------
+# HuggingFace export (pipeline --hugging-face)
+# ---------------------------------------------------------------------------
+#
+# Packs the rendered corpus into sharded Parquet with a dataset card, so it can
+# be published or streamed in Colab instead of shipped as 20k loose files.
+#
+# One family per artifact kind, one subdirectory each, so a family name is also
+# a loadable config name:
+#
+#   data/images/train-00000-of-00040.parquet   ->  load_dataset(repo, "images")
+#   data/pdf/train-00000-of-00003.parquet      ->  load_dataset(repo, "pdf")
+#
+# Every family repeats the same ~30-column sample header, so a consumer who
+# loads only one of them still gets the filters (has_table, letter_genre,
+# overflowed, split, ...) without a join.
+huggingface:
+  # Written to, not read from: kept out of paths.output_dir so an export never
+  # lands among the artifacts it was built from. Override with
+  # FA_OCR_HF_OUTPUT_DIR.
+  output_dir: data/hf
+
+  # Split shares. Must sum to 1.0, and every name must be one of
+  # train | validation | test. Override with FA_OCR_HF_SPLITS=train=0.9,test=0.1
+  # or --hf-splits.
+  #
+  # Do not change these once a dataset has been published: assignment is a hash
+  # of the key below, so different shares re-deal every sample.
+  splits: {train: 0.9, test: 0.1}
+
+  # The unit a split is assigned over: source_sample_id | sample_id.
+  #
+  # source_sample_id is the source plaintext file. A letter renders to several
+  # pages that share a letterhead, a signature and a synthesised table, and one
+  # plaintext file may be rendered more than once - keying on the file keeps all
+  # of that on one side of the train/test line. sample_id keys per render and
+  # leaks in exactly that case, so pick it only when you mean it.
+  group_by: source_sample_id
+
+  # Mixed into the assignment hash. Changing it re-deals the entire corpus, so
+  # it is here rather than on the command line. Leave empty unless you need a
+  # second, independent deal of the same corpus.
+  split_salt: ""
+
+  # Which artifact kinds to pack. Dropping one costs a consumer that artifact
+  # and nothing else; annotations is the one that carries every bounding box.
+  families: [images, plaintext, markdown, pdf, annotations, metadata]
+
+  # Nominal samples per shard - "every 500 processed plaintext files becomes one
+  # batch". A *sample* is a letter, which may be several pages, so an images
+  # shard holds at least this many rows.
+  shard_samples: 500
+
+  # What a full batch steps down to when it would breach max_shard_bytes. The
+  # step-down is logged, never silent.
+  min_shard_samples: 250
+
+  # Payload a shard must reach before the sample count may close it. Without
+  # this, the blob-free families end up as dozens of 200 KB files: metadata at
+  # 20k samples would be 40 shards. The images family is long past 64 MiB by
+  # sample 500, so this only binds where it should. 0 = count only.
+  min_shard_bytes: 67108864
+
+  # Hard ceiling on one shard's payload, measured before compression, so the
+  # written file comes out under this rather than over. 2 GiB keeps a shard
+  # inside a single comfortable upload.
+  max_shard_bytes: 2147483648
+
+  # Parquet codec: zstd | snappy | gzip | none. zstd is the best ratio of the
+  # three that ship in every pyarrow wheel; the images are already compressed,
+  # so this mostly shrinks the text and bbox columns.
+  compression: zstd
+
+  # Dataset card front matter.
+  dataset_name: persian-official-letters-synth
+
+  # cc-by-nc-4.0, not cc-by-4.0: the pages carry third-party brand marks inside
+  # generated seals and real people's signatures from UTSig, and both are
+  # research/non-commercial. A permissive declaration on the container would
+  # contradict the attribution section of the card it sits in. It covers the
+  # pipeline's own output; the composited material keeps its own narrower terms,
+  # which the card spells out.
+  license: cc-by-nc-4.0
+  language: fa
+
+  # Hub upload target, used by --hf-upload and scripts/upload_to_hugging_face.py.
+  # Left empty here on purpose: the destination is per-person, so set it in .env
+  # as FA_OCR_HF_REPO_ID=owner/name (or pass --hf-repo). The write token is read
+  # from HF_TOKEN and never appears in a config file.
+  hub_repo_id: ""
+
+  # Whether a *newly created* repository is private. Ignored for one that
+  # already exists - the Hub does not let an upload flip that flag.
+  hub_private: false
+
+  # First line of each upload's commit message; the family being pushed is
+  # appended, so the repository history reads one line per family.
+  hub_commit_message: Upload synthetic Persian letter corpus
+
+  # Whether per-page element boxes travel in the images rows. Turning this off
+  # leaves image + text, which is all a recognition-only fine-tune reads, and
+  # drops the largest non-image column. The boxes still ship in the annotations
+  # family either way, so nothing leaves the export.
+  include_elements: true
+
+  # Also write the flat metadata.csv index: one row per page, with the split and
+  # the filter flags. Cheap, and the only readable view of the corpus for
+  # someone without pyarrow.
+  write_metadata_csv: true
+
+  # Also write splits.csv: sample_id, source_sample_id, split. Cheap, and it
+  # makes the group disjointness checkable with sort | uniq.
+  write_splits_csv: true

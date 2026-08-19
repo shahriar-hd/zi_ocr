@@ -172,7 +172,7 @@ def write_json(path: str | Path, payload: dict[str, Any], *, indent: int = 2) ->
 
 
 def write_bytes(path: str | Path, payload: bytes) -> Path:
-    """Write binary data atomically, for rendered PNG and PDF artifacts.
+    """Write binary data atomically, for rendered image and PDF artifacts.
 
     Args:
         path: Destination file.

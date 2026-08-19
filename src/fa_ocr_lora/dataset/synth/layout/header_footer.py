@@ -36,6 +36,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Final, Sequence
 
+from ....config import HeaderVocabulary, LayoutConfig, ProbabilityConfig
 from ...common.io_utils import to_persian_digits, weighted_choice
 
 __all__ = [
@@ -51,89 +52,24 @@ __all__ = [
     "footer_to_markdown",
 ]
 
-#: Where the logo sits, with relative weights. Right dominates because that is
-#: the head of the line in an RTL page, and so where Iranian letterhead puts
-#: the mark.
-_LOGO_SIDES: Final[tuple[tuple[str, float], ...]] = (
-    ("right", 52.0),
-    ("center", 26.0),
-    ("left", 22.0),
-)
+#: Fallbacks for a caller that does not hand over the loaded config - the test
+#: suite, mostly. Read off an instance rather than written out again, so there is
+#: exactly one place a default lives: a literal here would be free to drift from
+#: the dataclass, and did (this signature said 0.92 while the dataclass said 0.9).
+_DEFAULT_LAYOUT: Final[LayoutConfig] = LayoutConfig()
+_DEFAULT_PROBABILITIES: Final[ProbabilityConfig] = ProbabilityConfig()
 
-#: Logo height range in millimetres. Below ~9mm a 24x24 mark stops being
-#: legible at 300 DPI; above ~22mm it starts competing with the company name.
-_LOGO_MM_RANGE: Final[tuple[float, float]] = (9.0, 22.0)
+#: Same idea for the Persian wording: the pools live in
+#: ``configs/vocabulary_fa.yaml`` and arrive as ``config.vocabulary.header``.
+_DEFAULT_VOCABULARY: Final[HeaderVocabulary] = HeaderVocabulary()
 
-#: Persian organisational prefixes for the company name. The empty entry is
-#: weighted heavily because many Iranian firms print the bare brand name.
-_NAME_PREFIXES: Final[tuple[tuple[str, float], ...]] = (
-    ("", 34.0),
-    ("شرکت", 30.0),
-    ("گروه", 10.0),
-    ("شرکت فناوری", 8.0),
-    ("مؤسسه", 6.0),
-    ("شرکت مهندسی", 6.0),
-    ("هلدینگ", 6.0),
-)
-
-#: Religious openers printed above the letter body, by relative weight.
-_OPENERS: Final[tuple[tuple[str, float], ...]] = (
-    ("بسمه تعالی", 46.0),
-    ("به نام خدا", 24.0),
-    ("بنام خداوند بخشنده مهربان", 12.0),
-    ("هو الحق", 10.0),
-    ("به نام خداوند جان و خرد", 8.0),
-)
-
-#: Generic Persian corporate slogans for the line under the company name.
-_SLOGANS: Final[tuple[str, ...]] = (
-    "کیفیت، تعهد، نوآوری",
-    "همراه همیشگی شما",
-    "پیشرو در ارائه خدمات تخصصی",
-    "با تکیه بر دانش و تجربه",
-    "اعتماد شما، سرمایه ما",
-    "نوآوری در خدمت مشتری",
-    "راهکارهای هوشمند کسب‌وکار",
-    "تعهد به تعالی سازمانی",
-)
-
-#: Persian labels for the contact fields, keyed as ``ContactInfo`` reports
-#: them. Several wordings exist for each; the first is the most common.
-_CONTACT_LABELS: Final[dict[str, tuple[str, ...]]] = {
-    "address": ("نشانی", "آدرس"),
-    "phone": ("تلفن", "تلفن تماس", "شماره تماس"),
-    "email": ("رایانامه", "ایمیل", "پست الکترونیک"),
-    "website": ("وبگاه", "وب‌سایت", "نشانی اینترنتی"),
-}
-
-#: Field orders for the footer. Address first is the postal convention; the
-#: short forms exist because a one-line footer is very common.
-_CONTACT_ORDERS: Final[tuple[tuple[str, ...], ...]] = (
-    ("address", "phone", "email", "website"),
-    ("address", "phone", "website"),
-    ("phone", "email", "website"),
-    ("address", "phone"),
-    ("phone", "website"),
-    ("address", "phone", "email"),
-)
-
-#: Page-number wordings. ``{page}`` and ``{total}`` are filled by
-#: ``paginate.js`` once the sheet count is known.
-_PAGE_TEMPLATES: Final[tuple[str, ...]] = (
-    "صفحه {page} از {total}",
-    "{page} از {total}",
-    "- {page} -",
-    "صفحه {page}",
-)
-
-#: How footer fields are laid out, by relative weight.
-_FOOTER_LAYOUTS: Final[tuple[tuple[str, float], ...]] = (
-    ("inline", 62.0),
-    ("stacked", 26.0),
-    ("split", 12.0),
-)
+#: Field orders for the footer, and how those fields are laid out, both now live
+#: in ``layout.contact_orders`` / ``layout.footer_layouts``.
 
 #: Root-tag ``fill="..."`` on an ``<svg>`` element.
+#:
+#: Intentionally not a knob: this is the grammar of the SVG files on disk, not
+#: a stylistic choice.
 _ROOT_FILL: Final[re.Pattern[str]] = re.compile(
     r"(<svg\b[^>]*?)\bfill\s*=\s*(['\"])(.*?)\2", re.IGNORECASE | re.DOTALL
 )
@@ -297,9 +233,12 @@ def build_header(
     logo_path: Path | None,
     bar_style: str,
     rng: random.Random,
-    header_probability: float = 0.92,
-    slogan_probability: float = 0.3,
-    opener_probability: float = 0.45,
+    layout: LayoutConfig = _DEFAULT_LAYOUT,
+    header_probability: float = _DEFAULT_PROBABILITIES.header,
+    slogan_probability: float = _DEFAULT_PROBABILITIES.header_slogan,
+    opener_probability: float = _DEFAULT_PROBABILITIES.religious_opener,
+    category_probability: float = _DEFAULT_PROBABILITIES.header_category,
+    vocabulary: HeaderVocabulary = _DEFAULT_VOCABULARY,
 ) -> HeaderSpec:
     """Assemble the letterhead for one document.
 
@@ -309,25 +248,34 @@ def build_header(
         logo_path: Resolved logo SVG, or ``None`` when the row has none.
         bar_style: Header bar treatment chosen by the theme.
         rng: The sample's seeded RNG, conventionally ``purpose="header"``.
+        layout: Logo placement and size, from ``synth_config.yaml``.
         header_probability: Chance the letter has a header at all.
         slogan_probability: Chance a slogan line is printed.
         opener_probability: Chance a religious opener is printed. Drawn even
             when the header is disabled, because the opener sits above the
             body and survives a bare page.
+        category_probability: Chance the category sub-line is printed, for a
+            row that carries a category at all.
+        vocabulary: The ``header`` pools from ``vocabulary_fa.yaml``: name
+            prefixes, openers and slogans.
 
     Returns:
         The header spec; ``enabled`` is ``False`` for a headerless letter.
     """
     enabled = rng.random() < header_probability
     opener = (
-        weighted_choice(_OPENERS, rng) if rng.random() < opener_probability else ""
+        weighted_choice(vocabulary.religious_openers, rng)
+        if rng.random() < opener_probability
+        else ""
     )
-    prefix = weighted_choice(_NAME_PREFIXES, rng)
+    prefix = weighted_choice(vocabulary.name_prefixes, rng)
     name = f"{prefix} {company_name}".strip() if company_name else prefix
-    slogan = rng.choice(_SLOGANS) if rng.random() < slogan_probability else ""
-    side = weighted_choice(_LOGO_SIDES, rng)
-    height = round(rng.uniform(*_LOGO_MM_RANGE), 1)
-    show_category = bool(category) and rng.random() < 0.28
+    slogan = rng.choice(vocabulary.slogans) if rng.random() < slogan_probability else ""
+    side = weighted_choice(layout.logo_sides, rng)
+    height = round(layout.logo_mm.draw(rng), 1)
+    # Drawn before the `category` test rather than after it, so a row with no
+    # category advances the stream exactly as far as one that has it.
+    wants_category = rng.random() < category_probability
     return HeaderSpec(
         enabled=enabled,
         company_name=name,
@@ -337,7 +285,7 @@ def build_header(
         logo_side=side,
         logo_height_mm=height,
         bar_style=bar_style,
-        show_category=show_category,
+        show_category=bool(category) and wants_category,
         category=category,
     )
 
@@ -346,8 +294,11 @@ def build_footer(
     contact_fields: Sequence[tuple[str, str, str]],
     bar_style: str,
     rng: random.Random,
-    footer_probability: float = 0.78,
-    page_number_probability: float = 0.6,
+    layout: LayoutConfig = _DEFAULT_LAYOUT,
+    footer_probability: float = _DEFAULT_PROBABILITIES.footer,
+    page_number_probability: float = _DEFAULT_PROBABILITIES.page_number,
+    label_probability: float = _DEFAULT_PROBABILITIES.footer_labels,
+    vocabulary: HeaderVocabulary = _DEFAULT_VOCABULARY,
 ) -> FooterSpec:
     """Assemble the footer for one document.
 
@@ -357,8 +308,13 @@ def build_footer(
             populated fields arrive here.
         bar_style: Footer bar treatment chosen by the theme.
         rng: The sample's seeded RNG, conventionally ``purpose="footer"``.
+        layout: Field order and arrangement, from ``synth_config.yaml``.
         footer_probability: Chance the letter has a footer at all.
         page_number_probability: Chance a page number is printed.
+        label_probability: Chance the fields are labelled rather than printed
+            as bare values.
+        vocabulary: The ``header`` pools from ``vocabulary_fa.yaml``, for the
+            contact labels and the page-number wordings.
 
     Returns:
         The footer spec. A letter whose record carries no contact details at
@@ -367,8 +323,8 @@ def build_footer(
     """
     enabled = rng.random() < footer_probability
     available = {key: (label, value) for key, label, value in contact_fields}
-    order = rng.choice(_CONTACT_ORDERS)
-    show_labels = rng.random() < 0.72
+    order = rng.choice(layout.contact_orders)
+    show_labels = rng.random() < label_probability
     fields = tuple(
         (
             key,
@@ -381,16 +337,19 @@ def build_footer(
     # Label wording varies per sample, but only when labels are shown at all.
     if show_labels:
         fields = tuple(
-            (key, rng.choice(_CONTACT_LABELS.get(key, (label,))), value)
+            (key, rng.choice(vocabulary.labels_for(key, label)), value)
             for key, label, value in fields
         )
     template = (
-        rng.choice(_PAGE_TEMPLATES) if rng.random() < page_number_probability else ""
+        rng.choice(vocabulary.page_templates)
+        if rng.random() < page_number_probability
+        else ""
     )
+    arrangement = weighted_choice(layout.footer_layouts, rng)
     return FooterSpec(
         enabled=enabled,
         fields=fields,
-        layout=weighted_choice(_FOOTER_LAYOUTS, rng),
+        layout=arrangement,
         bar_style=bar_style,
         page_number_template=template,
     )

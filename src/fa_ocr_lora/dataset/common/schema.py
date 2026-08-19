@@ -5,7 +5,7 @@ synthetic generator - emits :class:`DocumentAnnotation`. Downstream training
 code therefore never special-cases the data source or the element type.
 
 Coordinates are always **device pixels** of the rendered page image, with the
-origin at the top-left corner, matching the PNG that ships alongside the
+origin at the top-left corner, matching the page image that ships alongside the
 annotation.
 """
 
@@ -311,6 +311,13 @@ class DocumentAnnotation:
     This is the single interchange format between dataset sources and
     training code (CLAUDE.md 5.3). ``prepare_manifest.py`` merges sources by
     reading this and nothing else.
+
+    Two fields describe how the page was degraded rather than what it says.
+    ``texture`` names the paper scan the sheet was printed on, and ``scan``
+    records the whole scanner simulation - the ink softening, the geometry, the
+    lighting and the noise a sample was drawn - so a page's appearance stays
+    traceable without re-running the pipeline. Both are ``None`` for a
+    born-digital page, which is what a real-data source would leave them as.
     """
 
     sample_id: str
@@ -322,6 +329,7 @@ class DocumentAnnotation:
     pages: tuple[Page, ...]
     letter_fields: dict[str, Any] = field(default_factory=dict)
     texture: str | None = None
+    scan: dict[str, Any] | None = None
     full_transcription: str = ""
     schema_version: str = SCHEMA_VERSION
 
@@ -365,6 +373,7 @@ class DocumentAnnotation:
             "page_size": self.page_size,
             "orientation": self.orientation,
             "texture": self.texture,
+            "scan": self.scan,
             "letter_fields": self.letter_fields,
             "full_transcription": self.full_transcription,
             "pages": [page.as_dict() for page in self.pages],
@@ -384,6 +393,11 @@ class DocumentAnnotation:
                 pages=tuple(Page.from_dict(item) for item in payload["pages"]),
                 letter_fields=dict(payload.get("letter_fields") or {}),
                 texture=payload.get("texture"),
+                scan=(
+                    dict(payload["scan"])
+                    if isinstance(payload.get("scan"), dict)
+                    else None
+                ),
                 full_transcription=str(payload.get("full_transcription", "")),
                 schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
             )

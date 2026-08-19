@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
-from ..common.config import SynthConfig
+from ...config import SynthConfig
 from ..common.io_utils import read_json, relative_to_repo, resolve_repo_path
 from .elements.charts import chart_series_block
 from .markdown_blocks import Block, BlockKind, parse_body

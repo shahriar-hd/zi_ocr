@@ -14,7 +14,7 @@ Three decisions follow from what the scans actually look like:
   channel keeps each stroke's own antialiasing, so the pen reads as pen.
 * **A paper floor is still needed.** Scanner haze puts most "white" pixels at
   240-254 rather than 255; carried through as faint alpha it prints a visible
-  grey box. Everything above :data:`_PAPER_FLOOR` is cut to fully
+  grey box. Everything at or below ``signature.paper_floor`` is cut to fully
   transparent and the remainder is rescaled, which removes the box without
   eating stroke ends.
 * **The ink is recoloured.** A scan's ink is near-black; real signatures are
@@ -40,6 +40,7 @@ from typing import Final
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from ....config import SignatureConfig
 from ...common.io_utils import weighted_choice
 from .theme import hex_to_rgb
 
@@ -51,38 +52,10 @@ __all__ = [
     "signature_block_to_markdown",
 ]
 
-#: Alpha at or below which a pixel counts as paper rather than ink. Derived
-#: from the corpus: the scans' background sits at 240-254 (alpha 1-15), while
-#: the faintest real stroke edges land well above this.
-_PAPER_FLOOR: Final[int] = 26
-
-#: Pen colours. Kept here rather than in YAML for the same reason as
-#: ``theme.py``'s ink pool: these are fixed facts about what pens look like,
-#: not knobs a run would retune. Blue-black leads because Iranian
-#: administrative practice signs in blue.
-_PEN_INKS: Final[tuple[tuple[str, float], ...]] = (
-    ("#12295C", 34.0),
-    ("#1B3A7A", 24.0),
-    ("#1A1A1A", 18.0),
-    ("#0E1D3D", 14.0),
-    ("#2B2B38", 10.0),
-)
-
-#: Rendered signature width on the page, in millimetres.
-_WIDTH_MM_RANGE: Final[tuple[float, float]] = (28.0, 46.0)
-
-#: Rotation applied to the ink, in degrees. A signature is written by hand
-#: against a ruled line, so the tilt is small.
-_ROTATE_DEG_RANGE: Final[tuple[float, float]] = (-7.0, 7.0)
-
-#: Longest edge of the emitted PNG. A 46 mm signature at 300 DPI needs 543
-#: device pixels, so anything past this is resolution the page cannot show;
-#: capping here holds the base64 payload near 80 KB rather than 140 KB.
-_MAX_EDGE_PX: Final[int] = 720
-
-#: Padding kept around the ink's bounding box, as a fraction of the crop, so a
-#: rotation does not clip a stroke that ends exactly at the edge.
-_CROP_PAD: Final[float] = 0.02
+#: Fallback for a caller that does not hand over the loaded config - the test
+#: suite, mostly. Read off an instance so a literal here cannot drift from the
+#: dataclass default.
+_DEFAULT_SIGNATURE: Final[SignatureConfig] = SignatureConfig()
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,14 +100,23 @@ class SignatureSpec:
 
 
 @lru_cache(maxsize=64)
-def _extract_alpha(path: Path) -> tuple[Image.Image, tuple[int, int]] | None:
+def _extract_alpha(
+    path: Path, paper_floor: int, crop_pad: float, max_edge_px: int
+) -> tuple[Image.Image, tuple[int, int]] | None:
     """Lift the ink off one scan as a standalone alpha mask.
 
     Cached because a 20k-sample run reuses each of the 5175 scans several
-    times, and the decode plus level correction is the expensive half.
+    times, and the decode plus level correction is the expensive half. The
+    three extraction parameters are arguments rather than config reads so they
+    are part of the cache key: two configs cutting at different floors in one
+    process must not share a mask.
 
     Args:
         path: A UTSig ``.tif``.
+        paper_floor: ``signature.paper_floor`` - alpha at or below which a
+            pixel is paper.
+        crop_pad: ``signature.crop_pad`` - padding kept around the ink.
+        max_edge_px: ``signature.max_edge_px`` - cap on the longest edge.
 
     Returns:
         ``(alpha, source_size)`` where ``alpha`` is an ``L``-mode image
@@ -156,12 +138,12 @@ def _extract_alpha(path: Path) -> tuple[Image.Image, tuple[int, int]] | None:
     # prints as a faint grey rectangle over the letterhead. Cutting at the
     # floor and rescaling the remainder removes the box while keeping faint
     # stroke ends at their relative weight.
-    span = 255 - _PAPER_FLOOR
+    span = 255 - paper_floor
     alpha = alpha.point(
         [
             0
-            if level <= _PAPER_FLOOR
-            else min(255, round((level - _PAPER_FLOOR) * 255 / span))
+            if level <= paper_floor
+            else min(255, round((level - paper_floor) * 255 / span))
             for level in range(256)
         ]
     )
@@ -169,7 +151,7 @@ def _extract_alpha(path: Path) -> tuple[Image.Image, tuple[int, int]] | None:
     box = alpha.getbbox()
     if box is None:
         return None
-    pad = round(max(box[2] - box[0], box[3] - box[1]) * _CROP_PAD)
+    pad = round(max(box[2] - box[0], box[3] - box[1]) * crop_pad)
     alpha = alpha.crop(
         (
             max(0, box[0] - pad),
@@ -180,8 +162,8 @@ def _extract_alpha(path: Path) -> tuple[Image.Image, tuple[int, int]] | None:
     )
     if alpha.width < 2 or alpha.height < 2:
         return None
-    if max(alpha.size) > _MAX_EDGE_PX:
-        alpha.thumbnail((_MAX_EDGE_PX, _MAX_EDGE_PX), Image.LANCZOS)
+    if max(alpha.size) > max_edge_px:
+        alpha.thumbnail((max_edge_px, max_edge_px), Image.LANCZOS)
     return alpha, source_size
 
 
@@ -212,6 +194,7 @@ def build_signature(
     path: Path | None,
     rng: random.Random,
     probability: float = 1.0,
+    config: SignatureConfig = _DEFAULT_SIGNATURE,
 ) -> SignatureSpec | None:
     """Prepare the signature for one letter, or none.
 
@@ -221,6 +204,8 @@ def build_signature(
             unsigned and must not claim a signature bounding box.
         rng: The sample's seeded RNG, conventionally ``purpose="signature"``.
         probability: Chance of drawing a signature when the row has one.
+        config: The ``signature`` config section: pen colours, size and tilt
+            ranges, and the ink-extraction thresholds.
 
     Returns:
         The prepared signature, or ``None`` when the letter is unsigned or the
@@ -230,14 +215,16 @@ def build_signature(
     # RNG exactly as a signed one does and the sample's later choices do not
     # shift with the signature rate.
     draw = rng.random()
-    ink = weighted_choice(_PEN_INKS, rng)
-    width_mm = round(rng.uniform(*_WIDTH_MM_RANGE), 1)
-    rotate_deg = round(rng.uniform(*_ROTATE_DEG_RANGE), 2)
-    overlap_mm = round(rng.uniform(0.0, 5.0), 1)
+    ink = weighted_choice(config.pen_inks, rng)
+    width_mm = round(config.width_mm.draw(rng), 1)
+    rotate_deg = round(config.rotate_deg.draw(rng), 2)
+    overlap_mm = round(config.overlap_mm.draw(rng), 1)
     if path is None or draw >= probability:
         return None
 
-    extracted = _extract_alpha(path)
+    extracted = _extract_alpha(
+        path, config.paper_floor, config.crop_pad, config.max_edge_px
+    )
     if extracted is None:
         return None
     alpha, source_size = extracted

@@ -18,6 +18,7 @@ import random
 from dataclasses import dataclass
 from typing import Final, Sequence
 
+from ....config import TableConfig, TableVocabulary
 from ...common.io_utils import to_persian_digits
 from ..markdown_blocks import Block
 
@@ -29,92 +30,23 @@ __all__ = [
     "table_to_markdown",
 ]
 
-#: Column-header vocabularies, keyed by the flavour of table. Each entry is a
-#: full header row, so a synthesised table reads as a coherent document rather
-#: than a random mix of unrelated columns.
-_HEADER_SETS: Final[tuple[tuple[str, ...], ...]] = (
-    ("ردیف", "شرح خدمات", "مبلغ (ریال)", "توضیحات"),
-    ("ردیف", "عنوان", "تعداد", "مبلغ (ریال)"),
-    ("ردیف", "مرحله اجرا", "زمان‌بندی", "درصد پیشرفت"),
-    ("ردیف", "شرح هزینه", "مبلغ (ریال)"),
-    ("ردیف", "نام مدرک", "تاریخ صدور", "وضعیت"),
-    ("ردیف", "واحد سازمانی", "تعداد نیرو", "شرح وظیفه"),
-)
+#: Fallback for a caller that does not hand over the loaded config - the test
+#: suite, mostly. Read off an instance rather than restated here, so a literal
+#: cannot drift from the dataclass default.
+_DEFAULT_TABLE: Final[TableConfig] = TableConfig()
 
-_SERVICE_LABELS: Final[tuple[str, ...]] = (
-    "طراحی و پیاده‌سازی سامانه",
-    "پشتیبانی فنی و نگهداری",
-    "به‌روزرسانی زیرساخت ابری",
-    "آموزش کارکنان",
-    "تأمین تجهیزات جانبی",
-    "مشاوره فنی و امنیتی",
-    "میزبانی و پهنای باند",
-    "ممیزی امنیت اطلاعات",
-    "تهیه مستندات فنی",
-    "استقرار و راه‌اندازی",
-)
+#: Rials per unit of ``elements.table.amount_millions``. Intentionally not a
+#: knob: it is fixed by the ``مبلغ (ریال)`` header wording that declares the
+#: unit, so changing one without the other would print a wrong figure.
+_AMOUNT_SCALE: Final[int] = 1_000_000
 
-_STAGE_LABELS: Final[tuple[str, ...]] = (
-    "مطالعات امکان‌سنجی",
-    "طراحی تفصیلی",
-    "اجرای فاز نخست",
-    "اجرای فاز دوم",
-    "آزمون و تحویل موقت",
-    "بهره‌برداری آزمایشی",
-    "تحویل قطعی",
-)
-
-_DOCUMENT_LABELS: Final[tuple[str, ...]] = (
-    "گواهی ثبت شرکت",
-    "اساسنامه",
-    "گواهی‌نامه ایزو ۹۰۰۱",
-    "صورت‌های مالی حسابرسی‌شده",
-    "گواهی حسن انجام کار",
-    "بیمه‌نامه مسئولیت",
-    "پروانه بهره‌برداری",
-)
-
-_UNIT_LABELS: Final[tuple[str, ...]] = (
-    "اداره فناوری اطلاعات",
-    "واحد پشتیبانی فنی",
-    "دفتر برنامه‌ریزی",
-    "امور مالی",
-    "واحد حراست",
-    "دبیرخانه مرکزی",
-    "واحد آموزش",
-)
-
-_STATUS_VALUES: Final[tuple[str, ...]] = ("تأیید شده", "در دست بررسی", "تکمیل شده")
-
-_DETAIL_VALUES: Final[tuple[str, ...]] = (
-    "مطابق شرح خدمات پیوست",
-    "بر اساس قرارداد جاری",
-    "نیازمند تأیید کارفرما",
-    "طبق برنامه زمان‌بندی",
-    "-",
-)
-
-_PERSIAN_MONTHS: Final[tuple[str, ...]] = (
-    "فروردین",
-    "اردیبهشت",
-    "خرداد",
-    "تیر",
-    "مرداد",
-    "شهریور",
-    "مهر",
-    "آبان",
-    "آذر",
-    "دی",
-    "بهمن",
-    "اسفند",
-)
-
-_CAPTIONS: Final[tuple[str, ...]] = (
-    "جدول ۱: ریز اقلام و مبالغ",
-    "جدول ۱: جزئیات اجرایی",
-    "جدول ۱: خلاصه وضعیت",
-    "جدول ۱: فهرست مدارک پیوست",
-)
+#: The header sets, the cell-value pools they draw from, the month names and the
+#: caption wordings all live in ``configs/vocabulary_fa.yaml`` and arrive as
+#: ``config.vocabulary.elements.table``. A header set is one full row rather than
+#: a bag of columns, so a synthesised table reads as a coherent document; and the
+#: header text is what *chooses* the value pool below, which is why retuning the
+#: two together in one file matters.
+_DEFAULT_VOCABULARY: Final[TableVocabulary] = TableVocabulary()
 
 
 def _group_digits(value: int) -> str:
@@ -122,13 +54,22 @@ def _group_digits(value: int) -> str:
     return to_persian_digits(f"{value:,}")
 
 
-def _synth_cell(header: str, row_index: int, rng: random.Random) -> str:
+def _synth_cell(
+    header: str,
+    row_index: int,
+    rng: random.Random,
+    config: TableConfig = _DEFAULT_TABLE,
+    vocabulary: TableVocabulary = _DEFAULT_VOCABULARY,
+) -> str:
     """Invent one cell value appropriate to its column header.
 
     Args:
         header: The column's header text.
         row_index: Zero-based row index, used for the ``ردیف`` column.
         rng: The sample's seeded RNG.
+        config: The ``elements.table`` section, supplying each value range.
+        vocabulary: The ``elements.table`` pools from ``vocabulary_fa.yaml``,
+            supplying every non-numeric value.
 
     Returns:
         A Persian cell value.
@@ -136,28 +77,28 @@ def _synth_cell(header: str, row_index: int, rng: random.Random) -> str:
     if "ردیف" in header:
         return to_persian_digits(row_index + 1)
     if "مبلغ" in header or "هزینه" in header:
-        return _group_digits(rng.randrange(5, 950) * 1_000_000)
+        return _group_digits(config.amount_millions.draw(rng) * _AMOUNT_SCALE)
     if "تعداد" in header:
-        return to_persian_digits(rng.randrange(1, 60))
+        return to_persian_digits(config.count.draw(rng))
     if "درصد" in header:
-        return f"{to_persian_digits(rng.randrange(10, 100))}٪"
+        return f"{to_persian_digits(config.percent.draw(rng))}٪"
     if "زمان" in header or "تاریخ" in header:
         return (
-            f"{to_persian_digits(rng.randrange(1, 29))} "
-            f"{rng.choice(_PERSIAN_MONTHS)} "
-            f"{to_persian_digits(rng.randrange(1401, 1405))}"
+            f"{to_persian_digits(config.day.draw(rng))} "
+            f"{rng.choice(vocabulary.months)} "
+            f"{to_persian_digits(config.year.draw(rng))}"
         )
     if "وضعیت" in header:
-        return rng.choice(_STATUS_VALUES)
+        return rng.choice(vocabulary.status_values)
     if "مدرک" in header or "نام" in header:
-        return rng.choice(_DOCUMENT_LABELS)
+        return rng.choice(vocabulary.document_labels)
     if "مرحله" in header:
-        return rng.choice(_STAGE_LABELS)
+        return rng.choice(vocabulary.stage_labels)
     if "واحد" in header:
-        return rng.choice(_UNIT_LABELS)
+        return rng.choice(vocabulary.unit_labels)
     if "وظیفه" in header or "توضیح" in header:
-        return rng.choice(_DETAIL_VALUES)
-    return rng.choice(_SERVICE_LABELS)
+        return rng.choice(vocabulary.detail_values)
+    return rng.choice(vocabulary.service_labels)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,25 +166,36 @@ def _from_block(block: Block) -> TableSpec:
     return TableSpec(header=header, rows=tuple(rows), synthesized=False)
 
 
-def synthesize_table(subject: str, rng: random.Random) -> TableSpec:
+def synthesize_table(
+    subject: str,
+    rng: random.Random,
+    config: TableConfig = _DEFAULT_TABLE,
+    vocabulary: TableVocabulary = _DEFAULT_VOCABULARY,
+) -> TableSpec:
     """Invent a Persian table consistent with the letter's subject.
 
     Args:
         subject: The letter subject, used to bias the caption wording.
         rng: The sample's seeded RNG.
+        config: The ``elements.table`` section, supplying the row count and
+            every invented value's range.
+        vocabulary: The ``elements.table`` pools from ``vocabulary_fa.yaml``:
+            header sets, cell values, months and captions.
 
     Returns:
-        A synthesised table of 3-4 columns and 4-8 rows.
+        A synthesised table. The column count is the width of the header row
+        drawn from the vocabulary, 3-4 columns as shipped; the row count comes
+        from ``config.rows``.
     """
-    header = rng.choice(_HEADER_SETS)
-    row_count = rng.randrange(4, 9)
+    header = rng.choice(vocabulary.header_sets)
+    row_count = config.rows.draw(rng)
     rows = tuple(
-        tuple(_synth_cell(column, index, rng) for column in header)
+        tuple(_synth_cell(column, index, rng, config, vocabulary) for column in header)
         for index in range(row_count)
     )
-    caption = rng.choice(_CAPTIONS)
+    caption = rng.choice(vocabulary.captions)
     if "مبلغ" in " ".join(header) and "هزینه" in subject:
-        caption = "جدول ۱: برآورد هزینه‌ها"
+        caption = vocabulary.cost_caption
     return TableSpec(header=header, rows=rows, caption=caption, synthesized=True)
 
 
@@ -251,6 +203,8 @@ def build_table(
     body_tables: Sequence[Block],
     subject: str,
     rng: random.Random,
+    config: TableConfig = _DEFAULT_TABLE,
+    vocabulary: TableVocabulary = _DEFAULT_VOCABULARY,
 ) -> TableSpec:
     """Return the table to render, preferring real data over synthesis.
 
@@ -258,6 +212,9 @@ def build_table(
         body_tables: Table blocks found in the letter body.
         subject: Letter subject, for caption wording.
         rng: The sample's seeded RNG.
+        config: The ``elements.table`` section. Reaches only the synthesis
+            path - a real table from the body is rendered verbatim.
+        vocabulary: The ``elements.table`` pools, likewise synthesis-only.
 
     Returns:
         A spec drawn from the body when one exists, else a synthesised one.
@@ -265,7 +222,7 @@ def build_table(
     usable = [block for block in body_tables if block.rows and len(block.rows) > 1]
     if usable:
         return _from_block(usable[0])
-    return synthesize_table(subject, rng)
+    return synthesize_table(subject, rng, config, vocabulary)
 
 
 def table_to_html(spec: TableSpec, element_id: str) -> str:

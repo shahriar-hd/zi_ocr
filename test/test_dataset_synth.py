@@ -24,10 +24,11 @@ from typing import Any, Iterator, Mapping
 
 import pytest
 
-from fa_ocr_lora.dataset.common.config import (
+from fa_ocr_lora.config import (
     ConfigError,
+    ImageFormatConfig,
     SynthConfig,
-    load_synth_config,
+    load_config,
 )
 from fa_ocr_lora.dataset.common.io_utils import read_manifest
 from fa_ocr_lora.dataset.common.schema import (
@@ -41,6 +42,7 @@ from fa_ocr_lora.dataset.synth.layout.page_composer import compose_letter
 from fa_ocr_lora.dataset.synth.letter_source import LetterSource, load_letter_source
 from fa_ocr_lora.dataset.synth.pipeline import (
     MANIFEST_COLUMNS,
+    _apply_overrides,
     _select_rows,
     artifact_paths,
     is_complete,
@@ -64,7 +66,7 @@ _LONG_ROW = "plaintext_007666"
 def config() -> SynthConfig:
     """Return the shipped configuration, skipping the suite if it is absent."""
     try:
-        return load_synth_config()
+        return load_config()
     except (FileNotFoundError, OSError) as error:  # pragma: no cover - env issue
         pytest.skip(f"synth config unavailable: {error}")
 
@@ -306,6 +308,71 @@ class TestManifestPlumbing:
             "synth_000000_p03.png",
         )
         assert list(names) == sorted(names)
+
+
+class TestImageFormatPlumbing:
+    """The chosen format must reach the filenames, not just the encoder.
+
+    A page written as JPEG under a ``.png`` name is worse than either: the
+    annotation points at a file whose extension lies, and every consumer that
+    dispatches on the suffix - including HuggingFace's ``imagefolder`` - guesses
+    wrong. The suffix therefore comes from the same object as the encoding.
+    """
+
+    @pytest.mark.parametrize(
+        ("spelling", "suffix"),
+        [("png", ".png"), ("jpeg", ".jpg"), ("jpg", ".jpg"), ("webp", ".webp")],
+    )
+    def test_page_names_carry_the_configured_suffix(
+        self, spelling: str, suffix: str
+    ) -> None:
+        spec = ImageFormatConfig(format=spelling)
+        names = sheet_image_names("synth_000000", 2, spec.suffix)
+        assert names == (
+            f"synth_000000_p01{suffix}",
+            f"synth_000000_p02{suffix}",
+        )
+
+    def test_recorded_image_path_follows_the_format(
+        self, config: SynthConfig
+    ) -> None:
+        spec = ImageFormatConfig(format="jpg")
+        name = sheet_image_names("synth_000000", 1, spec.suffix)[0]
+        assert config.paths.image_ref(name) == "images/synth_000000_p01.jpg"
+
+    def test_cli_overrides_the_format_and_quality(self, config: SynthConfig) -> None:
+        assert config.render.image.format == "png"
+        overridden = _apply_overrides(
+            config,
+            dpi=None,
+            output_dir=None,
+            image_format="jpg",
+            image_quality=80,
+        )
+        assert overridden.render.image.format == "jpeg"
+        assert overridden.render.image.quality == 80
+        assert overridden.render.image.suffix == ".jpg"
+        # Unrelated settings survive an image-only override.
+        assert overridden.render.dpi == config.render.dpi
+        assert overridden.paths.output_dir == config.paths.output_dir
+
+    def test_a_quality_override_keeps_the_configured_format(
+        self, config: SynthConfig
+    ) -> None:
+        overridden = _apply_overrides(
+            config, dpi=None, output_dir=None, image_quality=60
+        )
+        assert overridden.render.image.format == config.render.image.format
+        assert overridden.render.image.quality == 60
+
+    def test_an_out_of_range_quality_is_rejected_on_the_cli_too(
+        self, config: SynthConfig
+    ) -> None:
+        with pytest.raises(ConfigError):
+            _apply_overrides(config, dpi=None, output_dir=None, image_quality=0)
+
+    def test_no_overrides_returns_the_same_config(self, config: SynthConfig) -> None:
+        assert _apply_overrides(config, dpi=None, output_dir=None) is config
 
 
 class TestArtifactLayout:
@@ -560,7 +627,17 @@ class TestRenderedSample:
         assert tables and cells
         table = tables[0]
         assert table.text == "", "a container must not duplicate its cells' text"
-        assert table.content.get("header")
+        # The container keeps the structure instead: the cell matrix lives here,
+        # under the key ``TableSpec.as_content`` actually emits.
+        assert table.content.get("columns")
+        assert table.content.get("rows")
+        assert table.content["row_count"] == len(table.content["rows"])
+        # Every cell has to sit inside the table that owns it, or the nesting
+        # taught the model a containment that is not on the page.
+        box = table.bbox
+        for cell in cells:
+            assert cell.bbox.x0 >= box.x0 - 1 and cell.bbox.x1 <= box.x1 + 1
+            assert cell.bbox.y0 >= box.y0 - 1 and cell.bbox.y1 <= box.y1 + 1
 
     def test_long_letter_paginates_with_per_page_boxes(
         self,

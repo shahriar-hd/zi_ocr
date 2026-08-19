@@ -1600,12 +1600,17 @@ def configure_logging(verbose: bool) -> None:
 
 
 def load_dotenv_if_available() -> None:
-    """Load a local ``.env`` file when ``python-dotenv`` is installed."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    load_dotenv()
+    """Load the repository's ``.env`` file.
+
+    Delegates to :func:`fa_ocr_lora.config.ensure_dotenv_loaded`, which needs no
+    third-party package. The name is kept because this stage's CLI has always
+    called it, but the "if available" is now historical: loading is
+    unconditional, so a host without ``python-dotenv`` no longer silently runs
+    without its API keys.
+    """
+    from ...config import ensure_dotenv_loaded
+
+    ensure_dotenv_loaded()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> GeneratorConfig:

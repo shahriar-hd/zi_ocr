@@ -26,6 +26,7 @@ import random
 from dataclasses import dataclass
 from typing import Final, Sequence
 
+from ...config import LayoutConfig, MetadataVocabulary, ProbabilityConfig
 from ..common.io_utils import to_persian_digits, weighted_choice
 
 __all__ = [
@@ -36,75 +37,36 @@ __all__ = [
     "metadata_to_markdown",
 ]
 
-#: Label wordings per field key. The first entry is the most common form on
-#: real letterhead, and carries the most weight in :func:`_pick_label`.
-_LABEL_VARIANTS: Final[dict[str, tuple[str, ...]]] = {
-    "letter_number": ("شماره", "شماره نامه", "شمارهٔ نامه", "شماره اندیکاتور"),
-    "registration_number": ("شماره ثبت", "شمارهٔ ثبت", "شماره ثبت نامه"),
-    "date": ("تاریخ", "تاریخ نامه", "مورخ"),
-    "attachment": ("پیوست", "ضمائم", "پیوست‌ها"),
-    "national_id": ("شناسه ملی", "شناسهٔ ملی", "شناسه ملی شرکت"),
-}
+#: Field order variants now live in ``layout.metadata_orders``; the block's three
+#: placement probabilities live in the ``probabilities`` section. The label
+#: wordings, their weights, the separators and the two attachment values live in
+#: ``configs/vocabulary_fa.yaml`` and arrive as ``config.vocabulary.metadata_block``.
 
-#: Weights matching ``_LABEL_VARIANTS`` order: the canonical wording dominates
-#: so the corpus still reads as real correspondence.
-_LABEL_WEIGHTS: Final[tuple[float, ...]] = (60.0, 18.0, 14.0, 8.0)
-
-#: Separator drawn between label and value, with relative weights. The empty
-#: string is a real treatment - many letterheads align values in a column and
-#: use whitespace alone.
-_SEPARATORS: Final[tuple[tuple[str, float], ...]] = (
-    (":", 62.0),
-    ("", 20.0),
-    ("ـــــ", 10.0),
-    (".....", 8.0),
-)
-
-#: Value for a letter that has attachments.
-_ATTACHMENT_PRESENT: Final[tuple[str, ...]] = ("دارد", "دارد (۱ برگ)", "به پیوست")
-
-#: Value for a letter with nothing attached. Real letters print this rather
-#: than omitting the row, which is why the field survives an empty value.
-_ATTACHMENT_ABSENT: Final[tuple[str, ...]] = ("ندارد", "-", "فاقد پیوست")
-
-#: Field order variants. ``letter_number`` before ``date`` is near-universal;
-#: the rest of the ordering genuinely varies between organisations.
-_FIELD_ORDERS: Final[tuple[tuple[str, ...], ...]] = (
-    ("letter_number", "date", "attachment"),
-    ("letter_number", "date", "attachment", "national_id"),
-    ("registration_number", "date", "attachment"),
-    ("letter_number", "registration_number", "date", "attachment"),
-    ("date", "letter_number", "attachment"),
-    ("letter_number", "date"),
-)
-
-#: Probability that the block is placed on the same side as the logo. Kept low
-#: because the two crowd each other, but not zero - real letterhead does it.
-_SAME_SIDE_PROBABILITY: Final[float] = 0.12
-
-#: Probability that the block is drawn inside a hairline border.
-_BOXED_PROBABILITY: Final[float] = 0.34
-
-#: Probability that labels are rendered at all. A minority of real letters
-#: print bare values in a fixed column.
-_LABELLED_PROBABILITY: Final[float] = 0.94
+#: Fallbacks for a caller that does not hand over the loaded config - the test
+#: suite, mostly. Read off an instance rather than written out again, so a
+#: literal here cannot drift from the dataclass default.
+_DEFAULT_LAYOUT: Final[LayoutConfig] = LayoutConfig()
+_DEFAULT_PROBABILITIES: Final[ProbabilityConfig] = ProbabilityConfig()
+_DEFAULT_VOCABULARY: Final[MetadataVocabulary] = MetadataVocabulary()
 
 
-def _pick_label(key: str, rng: random.Random) -> str:
+def _pick_label(
+    key: str, rng: random.Random, vocabulary: MetadataVocabulary = _DEFAULT_VOCABULARY
+) -> str:
     """Pick one wording for a field's label.
 
     Args:
         key: Field key, e.g. ``letter_number``.
         rng: The sample's seeded RNG.
+        vocabulary: The ``metadata_block`` pools from ``vocabulary_fa.yaml``.
 
     Returns:
         A Persian label, or the key itself if it is unknown.
     """
-    variants = _LABEL_VARIANTS.get(key)
-    if not variants:
+    weighted = vocabulary.weighted_labels(key)
+    if not weighted:
         return key
-    weights = _LABEL_WEIGHTS[: len(variants)]
-    return weighted_choice(tuple(zip(variants, weights)), rng)
+    return weighted_choice(weighted, rng)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +145,11 @@ def build_metadata_block(
     has_attachments: bool,
     rng: random.Random,
     logo_side: str = "right",
+    layout: LayoutConfig = _DEFAULT_LAYOUT,
+    same_side_probability: float = _DEFAULT_PROBABILITIES.metadata_same_side,
+    boxed_probability: float = _DEFAULT_PROBABILITIES.metadata_boxed,
+    label_probability: float = _DEFAULT_PROBABILITIES.metadata_labels,
+    vocabulary: MetadataVocabulary = _DEFAULT_VOCABULARY,
 ) -> MetadataBlockSpec:
     """Assemble the metadata block for one letter.
 
@@ -200,6 +167,15 @@ def build_metadata_block(
         rng: The sample's seeded RNG, conventionally ``purpose="metadata"``.
         logo_side: Which side the header logo sits on, so the block can take
             the opposite margin.
+        layout: Placement config; supplies the candidate field orders.
+        same_side_probability: Chance the block takes the logo's own margin.
+            Kept low because the two crowd each other, but not zero - real
+            letterhead does it.
+        boxed_probability: Chance the block is drawn inside a hairline border.
+        label_probability: Chance labels are rendered at all. A minority of
+            real letters print bare values in a fixed column.
+        vocabulary: The ``metadata_block`` pools from ``vocabulary_fa.yaml``:
+            label wordings and weights, separators, attachment values.
 
     Returns:
         The block spec, with at least one field.
@@ -210,16 +186,18 @@ def build_metadata_block(
         "date": to_persian_digits(date).strip(),
         "national_id": to_persian_digits(national_id).strip(),
         "attachment": rng.choice(
-            _ATTACHMENT_PRESENT if has_attachments else _ATTACHMENT_ABSENT
+            vocabulary.attachment_present
+            if has_attachments
+            else vocabulary.attachment_absent
         ),
     }
 
-    order = rng.choice(_FIELD_ORDERS)
-    separator = weighted_choice(_SEPARATORS, rng)
+    order = rng.choice(layout.metadata_orders)
+    separator = weighted_choice(vocabulary.separators, rng)
     fields = tuple(
         MetadataField(
             key=key,
-            label=_pick_label(key, rng),
+            label=_pick_label(key, rng, vocabulary),
             value=values[key],
             separator=separator,
         )
@@ -230,21 +208,21 @@ def build_metadata_block(
         fields = (
             MetadataField(
                 key="date",
-                label=_pick_label("date", rng),
+                label=_pick_label("date", rng, vocabulary),
                 value=values["date"] or "-",
                 separator=separator,
             ),
         )
 
     opposite = "left" if logo_side == "right" else "right"
-    side = logo_side if rng.random() < _SAME_SIDE_PROBABILITY else opposite
+    side = logo_side if rng.random() < same_side_probability else opposite
     return MetadataBlockSpec(
         fields=fields,
         # A centred logo leaves both margins free, so the block keeps the
         # right-hand side that Persian letterhead defaults to.
         side="right" if logo_side == "center" else side,
-        boxed=rng.random() < _BOXED_PROBABILITY,
-        show_labels=rng.random() < _LABELLED_PROBABILITY,
+        boxed=rng.random() < boxed_probability,
+        show_labels=rng.random() < label_probability,
     )
 
 

@@ -25,18 +25,27 @@ dependencies = [
     "jinja2>=3.1",        # letter HTML/CSS templates
     "pyyaml>=6.0",        # configs/synth_config.yaml
     "pillow>=10.0",       # UTSig signature masking, stamp compositing
+    "numpy>=1.26",        # scan simulation: homography, light field, sensor noise
 ]
 
 [project.optional-dependencies]
 # Text stage: the local LLM client that drafts Persian letter bodies.
 text = ["openai>=1.30", "requests>=2.31"]
 # Training and evaluation, installed separately per CLAUDE.md 3.
-train = ["paddlepaddle-gpu>=2.6", "paddlenlp>=3.0", "numpy>=1.26"]
+train = ["paddlepaddle-gpu>=2.6", "paddlenlp>=3.0"]
 # Google Drive upload for the Colab training handoff (scripts/upload_to_drive.py).
 drive = [
     "google-api-python-client>=2.140",
     "google-auth-oauthlib>=1.2",
 ]
+# HuggingFace export (pipeline --hugging-face): sharded Parquet with the page
+# images embedded. Kept optional and imported lazily, so a machine that only
+# renders never needs it.
+hf = ["pyarrow>=15"]
+# Publishing that export to the Hub (pipeline --hf-upload, or
+# scripts/upload_to_hugging_face.py). Separate from `hf`: building the Parquet
+# tree needs no network access and no Hub client.
+hub = ["huggingface_hub>=0.26"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
@@ -54,6 +63,8 @@ where = ["src"]
 # The renderer loads its templates and the pagination script from the package
 # directory, so they must ship inside the wheel.
 "fa_ocr_lora.dataset.synth.render" = ["*.js", "templates/*.j2"]
+# Same for the HuggingFace exporter's dataset card.
+"fa_ocr_lora.dataset.export" = ["templates/*.j2"]
 
 [tool.black]
 line-length = 90

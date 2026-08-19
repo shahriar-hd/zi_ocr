@@ -1,0 +1,354 @@
+{% set repo = settings.hub_repo_id if settings.hub_repo_id else "<owner>/" ~ settings.dataset_name %}
+---
+pretty_name: {{ settings.dataset_name }}
+language:
+  - {{ settings.language }}
+license: {{ settings.license_id }}
+size_categories:
+  - {{ size_category }}
+task_categories:
+  - image-to-text
+task_ids:
+  - image-captioning
+tags:
+  - ocr
+  - persian
+  - farsi
+  - document-understanding
+  - synthetic
+  - administrative-letters
+  - paddleocr-vl
+annotations_creators:
+  - machine-generated
+language_creators:
+  - machine-generated
+source_datasets:
+  - original
+{% if loadable %}
+configs:
+{% for config in loadable %}
+  - config_name: {{ config.name }}
+{# `datasets` resolves a bare load_dataset(repo) through this per-entry flag -
+   MetadataConfigs.get_default_config_name reads `default`, and ignores a
+   top-level `default_config_name`, which is a loading-script field. Without it
+   a multi-config repo raises "Config name is missing". #}
+{% if config.name == default_config %}
+    default: true
+{% endif %}
+    data_files:
+{% for split in config.splits %}
+      - split: {{ split.name }}
+        path: {{ split.path }}
+{% endfor %}
+{% endfor %}
+dataset_info:
+{{ dataset_info_yaml }}
+{% endif %}
+---
+
+# {{ settings.dataset_name }}
+
+Synthetic Persian (Farsi) administrative letters — نامه‌های اداری — rendered as
+full pages with page-level transcriptions and element bounding boxes, built to
+fine-tune [PaddleOCR-VL](https://huggingface.co/PaddlePaddle/PaddleOCR-VL) with a
+small LoRA adapter.
+
+{{ synthetic_notice }}
+
+## At a glance
+
+{% set page_configs = configs | selectattr('name', 'equalto', 'images') | list %}
+| | |
+| --- | --- |
+| Letters (source documents) | {{ summary.samples }} |
+| Pages | {{ page_configs[0].rows if page_configs else "not exported" }} |
+| Configs | {{ loadable | length }} ({{ loadable | map(attribute='name') | join(', ') }}) |
+| Splits | {{ summary.splits | join(', ') }} |
+| Parquet files | {{ summary.shard_count }} |
+| Uncompressed payload | {{ (summary.payload_bytes / 1048576) | round(1) }} MiB |
+| Annotation schema | `{{ schema_version }}` |
+| Language | Persian (`{{ settings.language }}`) |
+| Element boxes in `images` | {{ "yes" if summary.include_elements else "no — see the `annotations` config" }} |
+
+## Splits
+
+Every page of one letter is in exactly one split. See
+[How the split was made](#how-the-split-was-made).
+
+| Split | Letters | Requested share | Actual share |
+| --- | --- | --- | --- |
+{% for split in summary.splits %}
+{% set count = split_samples.get(split, 0) %}
+| `{{ split }}` | {{ count }} | {{ (plan.fraction_of(split) * 100) | round(1) }}% | {{ ((count / summary.samples * 100) | round(1)) if summary.samples else 0 }}% |
+{% endfor %}
+
+## Configs
+
+Each artifact the pipeline produces is packed as its own config, so you download
+only what you need — the page images are two orders of magnitude larger than the
+text.
+
+| Config | One row per | Rows | Files | Payload | Download | Contents |
+| --- | --- | --- | --- | --- | --- | --- |
+{% for config in configs %}
+| `{{ config.name }}` | {{ config.granularity }} | {{ config.rows }} | {{ config.shard_count }} | {{ (config.payload_bytes / 1048576) | round(1) }} MiB | {{ (config.download_size / 1048576) | round(1) }} MiB | {{ config.summary }} |
+{% endfor %}
+
+{% if loadable %}
+`{{ default_config }}` is the default config, so the plain one-argument form
+works and gives you the pages:
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("{{ repo }}")          # -> DatasetDict with {{ summary.splits | join(' and ') }}
+{% if loadable[0].splits | length > 1 %}
+train = dataset["{{ loadable[0].splits[0].name }}"]
+{% endif %}
+```
+
+Name a config for any other artifact:
+
+```python
+{% for config in loadable %}
+{{ config.name }} = load_dataset("{{ repo }}", "{{ config.name }}", split="{{ config.splits[0].name }}")
+{% endfor %}
+```
+
+The features and per-split row counts are declared in this card's front matter,
+so `load_dataset` knows the schema before it downloads a shard, and the `image`
+column arrives as a decoded `PIL.Image` rather than a byte struct.
+
+The image column decodes lazily, so streaming a few hundred pages does not pull
+the whole shard set:
+
+```python
+pages = load_dataset("{{ repo }}", "{{ default_config }}", split="{{ loadable[0].splits[0].name }}", streaming=True)
+page = next(iter(pages))
+page["image"].save("page.png")
+print(page["text"][:200])
+```
+{% else %}
+This export produced no shards, so there is nothing to load. Re-run the export
+over a non-empty render tree.
+{% endif %}
+
+## The shared sample header
+
+These columns are on **every row of every config**, computed once per letter and
+repeated, so a consumer who downloads only `{{ default_config }}` still has every
+filter without joining a second table.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+{% for column in header_columns %}
+| `{{ column.name }}` | {{ column.kind }} | {{ column.note }} |
+{% endfor %}
+
+## Per-config columns
+
+Beyond the header above, each config carries its own payload.
+
+{% for config in configs %}
+### `{{ config.name }}`
+
+{{ config.summary }} One row per {{ config.granularity }}{% if config.missing_samples %}; {{ config.missing_samples }} sample(s) had no such artifact in the render tree and are absent from this config{% endif %}.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+{% for column in config.columns %}
+| `{{ column.name }}` | {{ column.kind }} | {{ column.note }} |
+{% endfor %}
+
+{% endfor %}
+## Bounding boxes
+
+Boxes are `[x0, y0, x1, y1]` in **pixels of the page image they belong to**,
+origin at the top-left, already mapped through the scanner simulation — a box on
+a rotated, bowed page follows the ink rather than the pristine layout. A box is
+the axis-aligned hull of the four mapped corners of the original rectangle, and a
+box pushed off the page is dropped rather than clamped.
+
+`reading_order` is derived on the flat page before any warp: Persian is
+right-to-left, so it runs top-to-bottom, right-to-left, and it is deliberately
+not recomputed from tilted boxes.
+
+Element types are nested — a `table_cell` is a child of its `table`, containment
+tested at 86% area overlap because subpixel layout and shared cell borders make a
+child overhang its parent by a fraction of a pixel.
+
+## How the split was made
+
+Assignment hashes the **source letter id**, never the page and never a shuffle:
+
+```
+position = blake2b(f"{salt}:{source_sample_id}", digest_size=8) / 2**64
+```
+
+then walks the cumulative shares. Four consequences, all of them the point:
+
+- **A multi-page letter cannot straddle the split.** The same letterhead,
+  signature and synthesised table appear on every page of one letter; splitting
+  per page would put near-duplicates on both sides and the eval would read
+  several points better than the model deserves.
+- **Adding letters never moves an existing one.** Assignment reads only the id,
+  so a later export that appends samples leaves every earlier assignment intact.
+  A shuffle-and-slice split would silently re-deal the whole corpus.
+- **It is reproducible anywhere.** `blake2b`, not Python's `hash()`, which is
+  salted per process.
+- **Changing the plan is detectable.** The plan is fingerprinted and stored, and
+  an incremental export under different shares is refused.
+
+| | |
+| --- | --- |
+| Plan | `{{ plan.describe() }}` |
+| Fingerprint | `{{ plan.fingerprint() }}` |
+| Group key | `{{ plan.group_by }}` |
+
+`splits.csv` at the repository root lists `sample_id, source_sample_id, split`,
+so the disjointness is checkable without reading any Parquet:
+
+```bash
+python - <<'PY'
+import csv, collections
+groups = collections.defaultdict(set)
+with open("splits.csv") as handle:
+    for row in csv.DictReader(handle):
+        groups[row["source_sample_id"]].add(row["split"])
+print("letters spanning >1 split:", sum(1 for s in groups.values() if len(s) > 1))
+PY
+```
+
+## How it was made
+
+1. **Letter text.** Persian letter bodies drafted by a large language model
+   (see [Provenance](#provenance-of-the-letter-text)), with genre, tone and
+   whether a table or chart belongs on the page recorded per letter.
+2. **Layout.** One HTML document per letter, laid out and paginated by injected
+   JS, then rendered by headless Chromium — which is also what reports the
+   geometry, so the image, the PDF and the boxes cannot drift apart.
+3. **Furniture.** A letterhead with a logo, a religious opener, the
+   registration-number / date / attachment block, tables, charts, a handwritten
+   signature and a مهر stamp, each attached with its own probability and its own
+   RNG stream.
+4. **Scanner simulation.** Most pages are passed through a simulated scan:
+   paper texture, uneven illumination, a single composed geometric warp, sensor
+   noise, soft dust specks, then the greyscale/autocontrast/JPEG pass a scanner's
+   own software applies. The bounding boxes go through the same map the pixels
+   did.
+5. **Export.** This tree.
+
+Every sample records its RNG seed, so any page can be regenerated exactly.
+
+## Limitations
+
+- **Synthetic, so the failure modes are synthetic too.** No real ink bleed, no
+  staples, no coffee, no handwriting other than the composited signatures, no
+  photocopy-of-a-photocopy generation loss.
+- **The letters are not real Persian correspondence.** Phrasing and structure
+  follow administrative conventions, but a model trained on this alone will not
+  have seen the idiosyncrasies of any real organisation's house style.
+- **The logo set is not Persian.** The marks are drawn from an open icon
+  collection, so a letterhead may carry a mark no Iranian organisation uses.
+- **Bounding-box precision is secondary to page-level text.** Boxes are measured
+  from the DOM and are tight, but the corpus was built to improve
+  transcription first; a few element types (nested table structure especially)
+  are approximations.
+- **Tables and charts are synthesised, not parsed from the letter text.** Their
+  contents are deterministic from the sample seed and topically consistent with
+  the subject, not extracted from prose.
+
+## Provenance of the letter text
+
+The Persian letter bodies were drafted by
+{% if text_models %}
+{% for model in text_models %}
+- `{{ model }}`
+{% endfor %}
+{% else %}
+- a large language model whose id this export did not record
+{% endif %}
+and the drafting parameters (base URL, temperature, top-p, seed, attempt count)
+travel with each row in the `generation` column, so any body can be traced to the
+call that produced it. Everything *except* the body — the field values, the
+layout, the boxes, the transcription — is produced deterministically by this
+repository's own code, never by a model, so the ground truth is not a model's
+opinion of what it wrote.
+
+Whatever obligations the model's own licence and acceptable-use terms place on
+generated output travel with this dataset; check the model card before using the
+text for anything beyond OCR training.
+
+## Licences and attribution
+
+The declared licence, **`{{ settings.license_id }}`**, covers what this pipeline
+itself produced: the page images, the PDFs, the Markdown reconstructions, the
+annotations and the metadata. It does **not** and cannot relicense the
+third-party material composited into the pages, each of which keeps its own
+terms — and those terms are narrower. Read the three sections below as
+restrictions that apply on top of the declared licence.
+
+### Logos and letterheads — {{ logo_corpus.name }}
+
+Source: {{ logo_corpus.url }}
+
+{{ logo_corpus.terms }}
+
+{% if logos.available %}
+The full manifest ships with this dataset as
+[`{{ logos.exported }}`]({{ logos.exported }}) — {{ logos.rows }} icons, one row
+per icon with `File_Name, Source, License, Author, Original_File`.
+
+{% if logos.licences %}
+| Licence | Icons |
+| --- | --- |
+{% for licence, count in logos.licences %}
+| `{{ licence }}` | {{ count }} |
+{% endfor %}
+{% endif %}
+{% else %}
+The upstream licence manifest was not available when this export ran, so it is
+**not** republished here. Fetch it from {{ logo_corpus.url }} before
+redistributing: the MIT and Apache-2.0 icons require their notice to travel with
+any copy.
+{% endif %}
+
+### Signatures — {{ signature_corpus.name }}
+
+Source: {{ signature_corpus.url }}
+
+Please cite the dataset's paper:
+
+> {{ signature_corpus.citation }}
+
+{{ signature_corpus.terms }}
+
+### Logos and stamps on the generated pages
+
+{{ non_commercial_notice }}
+
+### Fonts
+
+The Persian faces are embedded in the rendered pages as glyphs, not as font
+files, and no font binary is redistributed here. Each face keeps its own
+upstream licence.
+
+## Citation
+
+{% set entry_key = settings.dataset_name | replace("-", "_") | replace(".", "_") %}
+{% set credits = text_models | join(", ") if text_models else "a large language model" %}
+```bibtex
+@misc{{ "{" }}{{ entry_key }},
+  title  = "{{ settings.dataset_name }}: synthetic Persian administrative letters for OCR",
+  note   = "Synthetic dataset. Letter text drafted by {{ credits }}; logos from {{ logo_corpus.name }}; signatures from {{ signature_corpus.name }}",
+  url    = "https://huggingface.co/datasets/{{ repo }}"
+}
+```
+
+If you use the signature composites, cite {{ signature_corpus.name }} as well.
+
+---
+
+Generated by this repository's export stage. `dataset_info.json` carries the same
+facts in machine-readable form, including the per-file shard list and the split
+plan.

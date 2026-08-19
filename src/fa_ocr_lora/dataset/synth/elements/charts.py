@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import Final, Sequence
 
+from ....config import CHART_KINDS, ChartConfig, ChartVocabulary
 from ...common.io_utils import to_persian_digits
 from ..markdown_blocks import Block
 
@@ -33,6 +34,11 @@ __all__ = [
     "chart_to_svg",
     "chart_to_markdown",
 ]
+
+#: Fallback for a caller that does not hand over the loaded config - the test
+#: suite, mostly. Read off an instance rather than restated here, so a literal
+#: cannot drift from the dataclass default.
+_DEFAULT_CHART: Final[ChartConfig] = ChartConfig()
 
 #: Persian chart-type labels as they appear in the letter bodies, mapped to
 #: the kind we render.
@@ -63,34 +69,16 @@ _DIGIT_MAP: Final[dict[int, int]] = {
 
 _NUMBER_RE: Final[re.Pattern[str]] = re.compile(r"-?\d+(?:\.\d+)?")
 
-#: Synthesised series vocabularies, each a coherent set of categories.
-_SERIES_POOLS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
-    (
-        "هزینه (میلیون ریال)",
-        ("حقوق و دستمزد", "زیرساخت ابری", "تجهیزات", "آموزش", "پشتیبانی"),
-    ),
-    (
-        "تعداد درخواست",
-        ("فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور"),
-    ),
-    (
-        "درصد پیشرفت",
-        ("فاز نخست", "فاز دوم", "فاز سوم", "تحویل نهایی"),
-    ),
-    (
-        "تعداد سامانه",
-        ("مدیریت محتوا", "تحلیل داده", "میزبانی", "امنیت", "پشتیبان‌گیری"),
-    ),
-)
-
-_CAPTIONS: Final[dict[str, str]] = {
-    "bar": "نمودار ۱: مقایسه مقادیر",
-    "line": "نمودار ۱: روند تغییرات",
-    "pie": "نمودار ۱: سهم هر بخش",
-}
+#: The synthesised series - each a coherent set of categories with the unit it is
+#: measured in - and the per-kind captions live in ``configs/vocabulary_fa.yaml``
+#: and arrive as ``config.vocabulary.elements.chart``. The unit's wording is what
+#: picks the value range below, so the two belong in one file.
+_DEFAULT_VOCABULARY: Final[ChartVocabulary] = ChartVocabulary()
 
 #: Chart canvas geometry in CSS pixels. Chosen to sit comfortably inside the
-#: narrowest supported page (A5) without horizontal overflow.
+#: narrowest supported page (A5) without horizontal overflow. Intentionally not
+#: a knob: the pads are meaningful only against the width and height they sit
+#: inside, and a wider canvas would overflow A5 silently rather than visibly.
 _WIDTH: Final[int] = 460
 _HEIGHT: Final[int] = 250
 _PAD_TOP: Final[int] = 16
@@ -104,7 +92,10 @@ class ChartKind:
     BAR: Final[str] = "bar"
     LINE: Final[str] = "line"
     PIE: Final[str] = "pie"
-    ALL: Final[tuple[str, ...]] = ("bar", "line", "pie")
+    #: Read from the config's vocabulary rather than written out again, so the
+    #: pool the loader validates against and the pool the renderer can draw are
+    #: the same tuple by construction.
+    ALL: Final[tuple[str, ...]] = CHART_KINDS
 
 
 def _to_number(text: str) -> float | None:
@@ -198,12 +189,17 @@ def _persian_value(value: float) -> str:
     return to_persian_digits(_format_value(value))
 
 
-def _detect_kind(blocks: Sequence[Block], rng: random.Random) -> str:
+def _detect_kind(
+    blocks: Sequence[Block],
+    rng: random.Random,
+    config: ChartConfig = _DEFAULT_CHART,
+) -> str:
     """Infer the chart kind from any Persian chart-type line in the body.
 
     Args:
         blocks: All parsed body blocks.
         rng: The sample's seeded RNG, used when no label is present.
+        config: The ``elements.chart`` section, supplying the fallback pool.
 
     Returns:
         A chart kind.
@@ -215,7 +211,7 @@ def _detect_kind(blocks: Sequence[Block], rng: random.Random) -> str:
         for label, kind in _KIND_BY_LABEL.items():
             if label in stripped:
                 return kind
-    return rng.choice((ChartKind.BAR, ChartKind.LINE))
+    return rng.choice(config.fallback_kinds)
 
 
 def _series_from_block(
@@ -255,31 +251,42 @@ def _series_from_block(
     return tuple(labels), tuple(values)
 
 
-def synthesize_chart(kind: str, rng: random.Random) -> ChartSpec:
+def synthesize_chart(
+    kind: str,
+    rng: random.Random,
+    config: ChartConfig = _DEFAULT_CHART,
+    vocabulary: ChartVocabulary = _DEFAULT_VOCABULARY,
+) -> ChartSpec:
     """Invent a plausible Persian data series.
 
     Args:
         kind: The chart kind to build.
         rng: The sample's seeded RNG.
+        config: The ``elements.chart`` section, supplying the series length and
+            the value range each unit draws from.
+        vocabulary: The ``elements.chart`` pools from ``vocabulary_fa.yaml``:
+            the series categories and the captions.
 
     Returns:
         A synthesised chart spec.
     """
-    unit, pool = rng.choice(_SERIES_POOLS)
-    count = min(len(pool), rng.randrange(4, 7))
+    unit, pool = rng.choice(vocabulary.series_pools)
+    # The vocabulary caps the length: a range wider than the shortest pool
+    # simply plots the whole pool rather than repeating a category.
+    count = min(len(pool), config.series_points.draw(rng))
     labels = tuple(pool[:count])
     if "درصد" in unit:
-        values = tuple(float(rng.randrange(15, 100)) for _ in labels)
+        values = tuple(float(config.percent_values.draw(rng)) for _ in labels)
     elif "تعداد" in unit:
-        values = tuple(float(rng.randrange(8, 480)) for _ in labels)
+        values = tuple(float(config.count_values.draw(rng)) for _ in labels)
     else:
-        values = tuple(float(rng.randrange(12, 900)) for _ in labels)
+        values = tuple(float(config.amount_values.draw(rng)) for _ in labels)
     return ChartSpec(
         kind=kind,
         labels=labels,
         values=values,
         unit=unit,
-        caption=_CAPTIONS[kind],
+        caption=vocabulary.caption_for(kind),
         synthesized=True,
     )
 
@@ -310,18 +317,24 @@ def chart_series_block(body_blocks: Sequence[Block]) -> Block | None:
 def build_chart(
     body_blocks: Sequence[Block],
     rng: random.Random,
+    config: ChartConfig = _DEFAULT_CHART,
+    vocabulary: ChartVocabulary = _DEFAULT_VOCABULARY,
 ) -> ChartSpec:
     """Return the chart to render, preferring the body's own series.
 
     Args:
         body_blocks: All parsed body blocks.
         rng: The sample's seeded RNG.
+        config: The ``elements.chart`` section. The fallback pool is consulted
+            whichever branch wins; the value ranges reach only synthesis.
+        vocabulary: The ``elements.chart`` pools. The caption is read whichever
+            branch wins; the series categories reach only synthesis.
 
     Returns:
         A spec parsed from a label/value table when one exists, else a
         synthesised series.
     """
-    kind = _detect_kind(body_blocks, rng)
+    kind = _detect_kind(body_blocks, rng, config)
     block = chart_series_block(body_blocks)
     if block is not None:
         series = _series_from_block(block)
@@ -333,10 +346,10 @@ def build_chart(
                 labels=labels,
                 values=values,
                 unit=unit if unit not in _VALUE_HEADERS else "",
-                caption=_CAPTIONS[kind],
+                caption=vocabulary.caption_for(kind),
                 synthesized=False,
             )
-    return synthesize_chart(kind, rng)
+    return synthesize_chart(kind, rng, config, vocabulary)
 
 
 def chart_to_markdown(spec: ChartSpec) -> str:

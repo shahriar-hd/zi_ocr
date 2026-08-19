@@ -25,9 +25,9 @@ from __future__ import annotations
 import html
 import random
 from dataclasses import dataclass, field
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
-from ...common.config import PageSizeSpec, SynthConfig
+from ....config import LetterVocabulary, PageSizeSpec, SynthConfig
 from ...common.io_utils import sample_rng, to_persian_digits, weighted_choice
 from ..elements.charts import ChartSpec, build_chart, chart_series_block
 from ..elements.charts import chart_to_markdown, chart_to_svg
@@ -59,62 +59,16 @@ from .signature import (
     signature_block_to_markdown,
 )
 from .stamp import StampSpec, build_stamp, city_from_address, stamp_to_html
-from .texture import Texture, backdrop_css, background_css, choose_texture
+from .texture import Texture, background_css, choose_texture
 from .theme import BarStyle, Theme, build_theme
 
 __all__ = ["PageGeometry", "ComposedLetter", "compose_letter"]
 
-#: Width of the full-height brand stripe, in millimetres. A page treatment
-#: rather than a tunable rate, so it lives here with the other geometry.
-_STRIPE_MM_RANGE: Final[tuple[float, float]] = (6.0, 11.0)
-
-#: How the recipient line is introduced. Iranian administrative practice uses
-#: all of these; the plain honorific form is the most common.
-_RECIPIENT_PREFIXES: Final[tuple[tuple[str, float], ...]] = (
-    ("", 30.0),
-    ("به: ", 22.0),
-    ("جناب آقای/سرکار خانم ", 8.0),
-    ("ریاست محترم ", 18.0),
-    ("مدیریت محترم ", 14.0),
-)
-
-#: How the sender line is introduced, on the samples that print one.
-_SENDER_PREFIXES: Final[tuple[tuple[str, float], ...]] = (
-    ("از: ", 46.0),
-    ("فرستنده: ", 30.0),
-    ("", 24.0),
-)
-
-#: Chance of printing an explicit sender line when the letterhead already
-#: carries the company name. Without a letterhead the line is always printed,
-#: since otherwise the page never names its sender.
-_SENDER_LINE_PROBABILITY: Final[float] = 0.32
-
-#: How the subject line is labelled.
-_SUBJECT_PREFIXES: Final[tuple[tuple[str, float], ...]] = (
-    ("موضوع: ", 62.0),
-    ("موضوع : ", 12.0),
-    ("", 26.0),
-)
-
-#: Chance of underlining the subject.
-_SUBJECT_UNDERLINE_PROBABILITY: Final[float] = 0.34
-
-#: Which margin the closing block hugs. Persian letters sign at the inline-end
-#: (left) side far more often than centred.
-_SIGNATURE_SIDES: Final[tuple[tuple[str, float], ...]] = (
-    ("left", 58.0),
-    ("center", 26.0),
-    ("right", 16.0),
-)
-
-#: Attachment list headings.
-_ATTACHMENT_TITLES: Final[tuple[str, ...]] = (
-    "پیوست‌ها:",
-    "فهرست پیوست‌ها:",
-    "ضمائم:",
-    "مدارک پیوست:",
-)
+#: How the recipient, sender and subject lines are worded, and the attachment
+#: list's heading, all live in ``configs/vocabulary_fa.yaml`` and arrive as
+#: ``config.vocabulary.letter``. This module reads them off the config it is
+#: handed, so there is no module-level pool here to fall out of step with the
+#: file.
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +120,8 @@ class ComposedLetter:
         page_spec: The config page size drawn for this sample.
         geometry: The template's view of the paper.
         theme: Palette, typography and bar treatments.
-        texture: Background scan, or ``None`` for plain white paper.
+        texture: Paper scan composited under the page by the scan stage,
+            or ``None`` for paper with no grain.
         header: The letterhead spec, enabled or not.
         footer: The footer spec, enabled or not.
         metadata: The administrative metadata block.
@@ -491,14 +446,21 @@ def _pick_page(config: SynthConfig, rng: random.Random) -> tuple[PageSizeSpec, f
 def _compose_frame(
     source: LetterSource,
     header: HeaderSpec,
+    sender_line_probability: float,
     rng: random.Random,
+    vocabulary: LetterVocabulary,
 ) -> tuple[str, str, str]:
     """Draw the recipient, sender and subject lines as printed.
 
     Args:
         source: The letter being composed.
         header: The letterhead, which may already name the sender.
+        sender_line_probability: Chance of repeating the sender under a
+            letterhead that already names it.
         rng: The sample's ``compose`` RNG.
+        vocabulary: The ``letter`` pools from ``vocabulary_fa.yaml``. Each
+            prefix carries its own trailing space, so it is concatenated
+            rather than joined.
 
     Returns:
         ``(recipient line, sender line, subject line)``, any of which may be
@@ -506,20 +468,20 @@ def _compose_frame(
     """
     recipient = source.destination_organization.strip()
     if recipient:
-        recipient = weighted_choice(_RECIPIENT_PREFIXES, rng) + recipient
+        recipient = weighted_choice(vocabulary.recipient_prefixes, rng) + recipient
 
     sender_name = (source.company_name or source.logo_title).strip()
     # Repeating the sender under a letterhead that already names it is
     # something real letters do, but rarely; without a letterhead the page
     # would otherwise never say who wrote it.
-    wants_sender = rng.random() < _SENDER_LINE_PROBABILITY or not header.enabled
+    wants_sender = rng.random() < sender_line_probability or not header.enabled
     sender = ""
     if sender_name and wants_sender:
-        sender = weighted_choice(_SENDER_PREFIXES, rng) + sender_name
+        sender = weighted_choice(vocabulary.sender_prefixes, rng) + sender_name
 
     subject = source.subject.strip()
     if subject:
-        subject = weighted_choice(_SUBJECT_PREFIXES, rng) + subject
+        subject = weighted_choice(vocabulary.subject_prefixes, rng) + subject
     return recipient, sender, subject
 
 
@@ -626,6 +588,8 @@ def compose_letter(
     theme = build_theme(source.brand_hex, config.theme, rng_for("theme"))
     palette = theme.palette
     probabilities = config.probabilities
+    layout = config.layout
+    words = config.vocabulary
 
     texture = choose_texture(
         config.paths.texture_dir, probabilities.texture, rng_for("texture")
@@ -638,16 +602,22 @@ def compose_letter(
         source.logo_path,
         theme.header_bar,
         rng_for("header"),
+        layout=layout,
         header_probability=probabilities.header,
         slogan_probability=probabilities.header_slogan,
         opener_probability=probabilities.religious_opener,
+        category_probability=probabilities.header_category,
+        vocabulary=words.header,
     )
     footer = build_footer(
         source.contact.labelled_fields,
         theme.footer_bar,
         rng_for("footer"),
+        layout=layout,
         footer_probability=probabilities.footer,
         page_number_probability=probabilities.page_number,
+        label_probability=probabilities.footer_labels,
+        vocabulary=words.header,
     )
     metadata = build_metadata_block(
         source.letter_number,
@@ -657,34 +627,59 @@ def compose_letter(
         bool(source.attachment_lines),
         rng_for("metadata"),
         logo_side=header.logo_side,
+        layout=layout,
+        same_side_probability=probabilities.metadata_same_side,
+        boxed_probability=probabilities.metadata_boxed,
+        label_probability=probabilities.metadata_labels,
+        vocabulary=words.metadata_block,
     )
 
     table = (
-        build_table(source.body_tables, source.subject, rng_for("table"))
+        build_table(
+            source.body_tables,
+            source.subject,
+            rng_for("table"),
+            config.elements.table,
+            words.elements.table,
+        )
         if source.wants_table or source.body_tables
         else None
     )
     chart = (
-        build_chart(source.body_blocks, rng_for("chart")) if source.wants_chart else None
+        build_chart(
+            source.body_blocks,
+            rng_for("chart"),
+            config.elements.chart,
+            words.elements.chart,
+        )
+        if source.wants_chart
+        else None
     )
     signature = build_signature(
-        source.signature_path, rng_for("signature"), probability=probabilities.signature
+        source.signature_path,
+        rng_for("signature"),
+        probability=probabilities.signature,
+        config=config.signature,
     )
     stamp = build_stamp(
         source.logo_path,
         company_name,
-        city_from_address(source.contact.address),
+        city_from_address(source.contact.address, words.stamp),
         config.theme.stamp_inks,
         rng_for("stamp"),
         probability=probabilities.stamp,
+        config=config.stamp,
+        vocabulary=words.stamp,
     )
 
     compose_rng = rng_for("compose")
-    recipient, sender, subject = _compose_frame(source, header, compose_rng)
-    subject_underline = compose_rng.random() < _SUBJECT_UNDERLINE_PROBABILITY
-    signature_side = weighted_choice(_SIGNATURE_SIDES, compose_rng)
-    attachment_title = compose_rng.choice(_ATTACHMENT_TITLES)
-    stripe_mm = round(compose_rng.uniform(*_STRIPE_MM_RANGE), 1)
+    recipient, sender, subject = _compose_frame(
+        source, header, probabilities.sender_line, compose_rng, words.letter
+    )
+    subject_underline = compose_rng.random() < probabilities.subject_underline
+    signature_side = weighted_choice(layout.signature_sides, compose_rng)
+    attachment_title = compose_rng.choice(words.letter.attachment_titles)
+    stripe_mm = round(layout.stripe_mm.draw(compose_rng), 1)
 
     body = _compose_body(source, table, chart, palette.accent)
     stamp_html = stamp_to_html(stamp) if stamp is not None else ""
@@ -734,8 +729,7 @@ def compose_letter(
         "theme": theme,
         "palette": palette,
         "font_css": font_css,
-        "sheet_css": background_css(texture, palette.surface),
-        "backdrop_css": backdrop_css(texture),
+        "sheet_css": background_css(palette.surface_css),
         "side_stripe": theme.header_bar == BarStyle.SIDE_STRIPE,
         "stripe_mm": stripe_mm,
         "subject_underline": subject_underline,

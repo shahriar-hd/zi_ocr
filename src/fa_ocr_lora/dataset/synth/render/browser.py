@@ -32,7 +32,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Final, Mapping, Sequence
 
-from ...common.config import CSS_PPI, PageSizeSpec, RenderConfig
+from ....config import CSS_PPI, PageSizeSpec, RenderConfig
 
 __all__ = [
     "RenderError",
@@ -48,10 +48,11 @@ __all__ = [
 #: data (see ``pyproject.toml``).
 _PAGINATE_JS: Final[Path] = Path(__file__).with_name("paginate.js")
 
-#: Chromium flags. Font hinting is disabled so a glyph's advance width does not
-#: depend on the host's freetype build - two machines must produce the same
-#: layout, and therefore the same boxes, from the same seed.
-_LAUNCH_ARGS: Final[tuple[str, ...]] = (
+#: Chromium flags used when a caller passes none. The shipped config carries
+#: the same list as ``render.chromium_args`` and the pipeline always passes it;
+#: this default exists so a direct ``PageRenderer()`` in a script or a test still
+#: gets the deterministic text rendering the corpus depends on.
+_DEFAULT_LAUNCH_ARGS: Final[tuple[str, ...]] = (
     "--font-render-hinting=none",
     "--disable-lcd-text",
     "--force-color-profile=srgb",
@@ -199,13 +200,21 @@ class PageRenderer:
             result = renderer.render(html, target)
     """
 
-    def __init__(self, *, headless: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        headless: bool = True,
+        launch_args: Sequence[str] | None = None,
+    ) -> None:
         """Start Playwright and launch Chromium.
 
         Args:
             headless: Whether to run without a visible window. PDF generation
                 requires headless Chromium, so this is only ever turned off
                 for interactive debugging of the layout.
+            launch_args: Chromium flags, normally ``config.render.chromium_args``.
+                Defaults to :data:`_DEFAULT_LAUNCH_ARGS`, which is what the
+                shipped config carries.
 
         Raises:
             RenderError: If Playwright or its Chromium build is unavailable.
@@ -222,7 +231,9 @@ class PageRenderer:
         try:
             self._browser = self._playwright.chromium.launch(
                 headless=headless,
-                args=list(_LAUNCH_ARGS),
+                args=list(
+                    launch_args if launch_args is not None else _DEFAULT_LAUNCH_ARGS
+                ),
             )
         except Exception as error:  # pragma: no cover - environment issue
             self._playwright.stop()
@@ -326,6 +337,11 @@ class PageRenderer:
         from the same box the annotation was measured from, so a sheet's raster
         and its boxes share an origin by construction.
 
+        The capture omits the browser's background, so the PNG is ``RGBA`` with
+        a transparent ground: the page's light areas are an *absence of ink*
+        rather than a coat of white. ``render/scan.py`` then composites paper
+        underneath them. Flattening here instead would bury the paper.
+
         Args:
             page: The Playwright page.
             count: How many sheets pagination created.
@@ -338,25 +354,32 @@ class PageRenderer:
         locator = page.locator(".sheet")
         sheets: list[RenderedSheet] = []
         for index in range(count):
-            png = locator.nth(index).screenshot(type="png", animations="disabled")
+            png = locator.nth(index).screenshot(
+                type="png", animations="disabled", omit_background=True
+            )
             sheets.append(
                 RenderedSheet(index=index, png=png, width=width, height=height)
             )
         return tuple(sheets)
 
 
-def sheet_image_names(sample_id: str, count: int) -> tuple[str, ...]:
+def sheet_image_names(
+    sample_id: str, count: int, suffix: str = ".png"
+) -> tuple[str, ...]:
     """Return the conventional per-page image filenames for a sample.
 
     Args:
         sample_id: The render-stage sample id, e.g. ``synth_000000``.
         count: Number of pages.
+        suffix: File extension, including the dot. Comes from
+            :attr:`~fa_ocr_lora.config.ImageFormatConfig.suffix`, so the name
+            and the encoding cannot disagree.
 
     Returns:
         One name per page, ``synth_000000_p01.png`` style, so a directory
         listing sorts into reading order.
     """
-    return tuple(f"{sample_id}_p{index + 1:02d}.png" for index in range(count))
+    return tuple(f"{sample_id}_p{index + 1:02d}{suffix}" for index in range(count))
 
 
 def as_mapping_sequence(boxes: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:

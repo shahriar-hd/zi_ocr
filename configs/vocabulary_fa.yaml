@@ -1,0 +1,326 @@
+# ===========================================================================
+# Persian content pools for the synthetic letter generator.
+#
+# This file holds the *words*. configs/synth_config.yaml holds the *numbers*
+# that decide how they are arranged. They are separate because they are edited
+# for different reasons: widening a logo is a layout decision, while rewording
+# «شماره اندیکاتور» is a question about how Iranian administrative
+# correspondence is actually written. Point at a different file with
+# `vocabulary:` in synth_config.yaml, or with FA_OCR_VOCABULARY.
+#
+# Two things about every pool below are easy to get wrong.
+#
+# 1. ORDER IS LOAD-BEARING. Rewording or reweighting an entry is safe. Moving
+#    one is not: a weighted pool is drawn with a single random number and an
+#    unweighted one by index, so reordering changes which phrase a given seed
+#    picks - the same seed stops reproducing the same page. Append rather than
+#    insert when you can.
+#
+# 2. WHITESPACE IS CONTENT. A prefix like "موضوع: " is glued straight onto the
+#    subject that follows it, so that trailing space is the space between them.
+#    Quote any phrase whose leading or trailing space matters, or YAML will
+#    strip it. The empty phrase "" is a real, deliberate entry: it is how a
+#    letter prints a bare brand name with no «شرکت», or a value with no
+#    separator at all.
+#
+# A weighted pool is written `phrase: weight`. Weights are relative, so they
+# need not add to 100 - {a: 3, b: 1} draws `a` three times as often as `b`.
+# An unweighted pool is a plain list and every entry is equally likely.
+#
+# Deleting a key falls back to the value compiled into the loader, so a
+# partial file is legal. An empty pool is not: it fails at startup rather
+# than at sample 400.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# The letterhead and the footer.
+# ---------------------------------------------------------------------------
+header:
+  # Organisational prefix glued before the brand name from the CSV row. The
+  # empty entry is the bare name, which is what a third of real letterheads
+  # print.
+  name_prefixes:
+    "": 34.0
+    "شرکت": 30.0
+    "گروه": 10.0
+    "شرکت فناوری": 8.0
+    "مؤسسه": 6.0
+    "شرکت مهندسی": 6.0
+    "هلدینگ": 6.0
+
+  # The opener above the body. Present on most but not all letters - how often
+  # is `probabilities.opener`, not something this pool controls.
+  religious_openers:
+    "بسمه تعالی": 46.0
+    "به نام خدا": 24.0
+    "بنام خداوند بخشنده مهربان": 12.0
+    "هو الحق": 10.0
+    "به نام خداوند جان و خرد": 8.0
+
+  # Slogan line under the company name, drawn evenly.
+  slogans:
+    - "کیفیت، تعهد، نوآوری"
+    - "همراه همیشگی شما"
+    - "پیشرو در ارائه خدمات تخصصی"
+    - "با تکیه بر دانش و تجربه"
+    - "اعتماد شما، سرمایه ما"
+    - "نوآوری در خدمت مشتری"
+    - "راهکارهای هوشمند کسب‌وکار"
+    - "تعهد به تعالی سازمانی"
+
+  # Footer contact labels. The key is the field the value comes from, so it
+  # must stay in English and must stay spelled as it is; only the wordings are
+  # yours to change. Drawn evenly, so a wording you want to dominate should be
+  # the only one listed.
+  contact_labels:
+    address: ["نشانی", "آدرس"]
+    phone: ["تلفن", "تلفن تماس", "شماره تماس"]
+    email: ["رایانامه", "ایمیل", "پست الکترونیک"]
+    website: ["وبگاه", "وب‌سایت", "نشانی اینترنتی"]
+
+  # Page numbering. {page} and {total} are filled in by the paginator once
+  # Chromium has decided how many sheets the letter needs. Every wording must
+  # carry {page}; {total} is optional, since a letter that never says how many
+  # pages it has is perfectly ordinary.
+  page_templates:
+    - "صفحه {page} از {total}"
+    - "{page} از {total}"
+    - "- {page} -"
+    - "صفحه {page}"
+
+# ---------------------------------------------------------------------------
+# The letter's own lines. Every prefix here is concatenated directly onto the
+# name or subject that follows it, which is why the trailing spaces are quoted.
+# ---------------------------------------------------------------------------
+letter:
+  # How the recipient is addressed. The empty entry prints the bare name.
+  recipient_prefixes:
+    "": 30.0
+    "به: ": 22.0
+    "جناب آقای/سرکار خانم ": 8.0
+    "ریاست محترم ": 18.0
+    "مدیریت محترم ": 14.0
+
+  sender_prefixes:
+    "از: ": 46.0
+    "فرستنده: ": 30.0
+    "": 24.0
+
+  # Both spacings of the colon are in real correspondence, and the model should
+  # see both.
+  subject_prefixes:
+    "موضوع: ": 62.0
+    "موضوع : ": 12.0
+    "": 26.0
+
+  # Heading above the attachment list, drawn evenly.
+  attachment_titles:
+    - "پیوست‌ها:"
+    - "فهرست پیوست‌ها:"
+    - "ضمائم:"
+    - "مدارک پیوست:"
+
+# ---------------------------------------------------------------------------
+# The administrative metadata block - شماره ثبت / تاریخ / پیوست. CLAUDE.md
+# makes this the highest-priority field for model accuracy, so it gets the
+# widest label vocabulary of anything here.
+# ---------------------------------------------------------------------------
+metadata_block:
+  # Wordings per field, most common first. The key is the value's source and
+  # must stay spelled as it is; a key with no wordings renders as the key
+  # itself, which is a visible bug rather than a silent one.
+  labels:
+    letter_number: ["شماره", "شماره نامه", "شمارهٔ نامه", "شماره اندیکاتور"]
+    registration_number: ["شماره ثبت", "شمارهٔ ثبت", "شماره ثبت نامه"]
+    date: ["تاریخ", "تاریخ نامه", "مورخ"]
+    attachment: ["پیوست", "ضمائم", "پیوست‌ها"]
+    national_id: ["شناسه ملی", "شناسهٔ ملی", "شناسه ملی شرکت"]
+
+  # Weights applied to `labels` by position and then cut to however many
+  # wordings each field actually has, so one list serves a field with three
+  # and a field with four. The first weight dominates deliberately: a corpus
+  # where every letter picks a different synonym stops reading as real
+  # correspondence. Needs at least as many entries as the widest field above.
+  label_weights: [60.0, 18.0, 14.0, 8.0]
+
+  # Drawn between label and value. The empty entry is a real treatment - many
+  # letterheads align the values in a column and use whitespace alone.
+  separators:
+    ":": 62.0
+    "": 20.0
+    "ـــــ": 10.0
+    ".....": 8.0
+
+  # The attachment row's value. A letter with no attachments prints one of the
+  # absent wordings rather than dropping the row, which is what real ones do.
+  attachment_present: ["دارد", "دارد (۱ برگ)", "به پیوست"]
+  attachment_absent: ["ندارد", "-", "فاقد پیوست"]
+
+# ---------------------------------------------------------------------------
+# Wording around the rubber stamp. Its geometry is `stamp:` in
+# synth_config.yaml.
+# ---------------------------------------------------------------------------
+stamp:
+  # Lower-ring city, used when the letter's own address names none. Drawn
+  # evenly, so this list is a weighting: adding Tehran twice would not be a
+  # mistake if you wanted it twice as often.
+  cities:
+    - "تهران"
+    - "اصفهان"
+    - "مشهد"
+    - "شیراز"
+    - "تبریز"
+    - "کرج"
+    - "قم"
+    - "اهواز"
+    - "رشت"
+    - "کرمان"
+    - "یزد"
+    - "ارومیه"
+
+  # Printed beside the city. The empty entry prints the city alone.
+  seal_words:
+    "مهر رسمی": 26.0
+    "": 24.0
+    "ثبت شده": 18.0
+    "مهر شرکت": 16.0
+    "دبیرخانه": 16.0
+
+# ---------------------------------------------------------------------------
+# The optional table or chart. Only *invented* content is here: a letter body
+# that ships its own Markdown table or label/value series is rendered
+# verbatim, and nothing in this section can reach it.
+#
+# The counts and value ranges these words are filled with live under
+# `elements:` in synth_config.yaml.
+# ---------------------------------------------------------------------------
+elements:
+  table:
+    # Whole header rows, not a pool of columns, so a synthesised table reads as
+    # one coherent document instead of a mix of unrelated fields. The row's
+    # width is the table's column count - that is why the count is not a knob.
+    #
+    # The header text also *chooses the cell values*: the generator matches on
+    # مبلغ/هزینه, تعداد, درصد, زمان/تاریخ, وضعیت, مدرک/نام, مرحله, واحد and
+    # وظیفه/توضیح, and falls back to the service labels. A header worded
+    # outside that vocabulary gets service labels under it, so rename with the
+    # matching pool in mind.
+    header_sets:
+      - ["ردیف", "شرح خدمات", "مبلغ (ریال)", "توضیحات"]
+      - ["ردیف", "عنوان", "تعداد", "مبلغ (ریال)"]
+      - ["ردیف", "مرحله اجرا", "زمان‌بندی", "درصد پیشرفت"]
+      - ["ردیف", "شرح هزینه", "مبلغ (ریال)"]
+      - ["ردیف", "نام مدرک", "تاریخ صدور", "وضعیت"]
+      - ["ردیف", "واحد سازمانی", "تعداد نیرو", "شرح وظیفه"]
+
+    # Values for a شرح خدمات column, and the fallback for any column no other
+    # pool claims.
+    service_labels:
+      - "طراحی و پیاده‌سازی سامانه"
+      - "پشتیبانی فنی و نگهداری"
+      - "به‌روزرسانی زیرساخت ابری"
+      - "آموزش کارکنان"
+      - "تأمین تجهیزات جانبی"
+      - "مشاوره فنی و امنیتی"
+      - "میزبانی و پهنای باند"
+      - "ممیزی امنیت اطلاعات"
+      - "تهیه مستندات فنی"
+      - "استقرار و راه‌اندازی"
+
+    # Values for a مرحله column.
+    stage_labels:
+      - "مطالعات امکان‌سنجی"
+      - "طراحی تفصیلی"
+      - "اجرای فاز نخست"
+      - "اجرای فاز دوم"
+      - "آزمون و تحویل موقت"
+      - "بهره‌برداری آزمایشی"
+      - "تحویل قطعی"
+
+    # Values for a مدرک or نام column.
+    document_labels:
+      - "گواهی ثبت شرکت"
+      - "اساسنامه"
+      - "گواهی‌نامه ایزو ۹۰۰۱"
+      - "صورت‌های مالی حسابرسی‌شده"
+      - "گواهی حسن انجام کار"
+      - "بیمه‌نامه مسئولیت"
+      - "پروانه بهره‌برداری"
+
+    # Values for a واحد column.
+    unit_labels:
+      - "اداره فناوری اطلاعات"
+      - "واحد پشتیبانی فنی"
+      - "دفتر برنامه‌ریزی"
+      - "امور مالی"
+      - "واحد حراست"
+      - "دبیرخانه مرکزی"
+      - "واحد آموزش"
+
+    status_values: ["تأیید شده", "در دست بررسی", "تکمیل شده"]
+
+    # Values for a توضیحات or شرح وظیفه column. The dash is deliberate: real
+    # tables leave cells empty, and the model should learn to read one.
+    detail_values:
+      - "مطابق شرح خدمات پیوست"
+      - "بر اساس قرارداد جاری"
+      - "نیازمند تأیید کارفرما"
+      - "طبق برنامه زمان‌بندی"
+      - "-"
+
+    # Jalali month names for a date column. All twelve are required, in
+    # calendar order, because the day drawn alongside is validated against the
+    # month's length.
+    months:
+      - "فروردین"
+      - "اردیبهشت"
+      - "خرداد"
+      - "تیر"
+      - "مرداد"
+      - "شهریور"
+      - "مهر"
+      - "آبان"
+      - "آذر"
+      - "دی"
+      - "بهمن"
+      - "اسفند"
+
+    # Caption above the table, drawn evenly.
+    captions:
+      - "جدول ۱: ریز اقلام و مبالغ"
+      - "جدول ۱: جزئیات اجرایی"
+      - "جدول ۱: خلاصه وضعیت"
+      - "جدول ۱: فهرست مدارک پیوست"
+
+    # Overrides the drawn caption when the header row names amounts and the
+    # letter's subject is about costs, so the two agree.
+    cost_caption: "جدول ۱: برآورد هزینه‌ها"
+
+  chart:
+    # A series is one unit and the categories plotted under it, drawn as a
+    # pair so the axis label and the bars always agree.
+    #
+    # The unit's wording also picks the value range: «درصد» plots percentages,
+    # «تعداد» plots counts, anything else plots amounts. Renaming a unit
+    # therefore changes the numbers under it - a unit reading «درصد» will not
+    # plot values above 99 no matter what `elements.chart` says.
+    #
+    # Each pool needs at least two categories. The shortest pool also caps
+    # `elements.chart.series_points`: a request for more points than a pool has
+    # plots the whole pool rather than repeating a category.
+    series_pools:
+      - unit: "هزینه (میلیون ریال)"
+        labels: ["حقوق و دستمزد", "زیرساخت ابری", "تجهیزات", "آموزش", "پشتیبانی"]
+      - unit: "تعداد درخواست"
+        labels: ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور"]
+      - unit: "درصد پیشرفت"
+        labels: ["فاز نخست", "فاز دوم", "فاز سوم", "تحویل نهایی"]
+      - unit: "تعداد سامانه"
+        labels: ["مدیریت محتوا", "تحلیل داده", "میزبانی", "امنیت", "پشتیبان‌گیری"]
+
+    # Caption per chart kind. Every kind the renderer can draw needs an entry;
+    # write "" for one that should render without a caption.
+    captions:
+      bar: "نمودار ۱: مقایسه مقادیر"
+      line: "نمودار ۱: روند تغییرات"
+      pie: "نمودار ۱: سهم هر بخش"

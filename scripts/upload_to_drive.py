@@ -18,9 +18,10 @@ Setup (one time):
 2.  In Google Cloud Console: create/pick a project, enable the **Google Drive
     API**, then create an OAuth 2.0 Client ID of type **Desktop app** and
     download its JSON.
-3.  Save it as ``secrets/drive_client_secret.json`` (or pass
-    ``--credentials``).  The first run opens a browser for consent and caches a
-    refresh token in ``secrets/drive_token.json``.
+3.  Save it as ``secrets/drive_client_secret.json`` (or point
+    ``GOOGLE_DRIVE_CREDENTIALS`` at it in ``.env``, or pass ``--credentials``).
+    The first run opens a browser for consent and caches a refresh token in
+    ``secrets/drive_token.json`` (or ``GOOGLE_DRIVE_TOKEN``).
 
 Usage::
 
@@ -55,11 +56,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from fa_ocr_lora.config import ensure_dotenv_loaded, env_path  # noqa: E402
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Local inputs.
 GENERATE_DIR = PROJECT_ROOT / "data" / "dataset" / "generate"
@@ -78,10 +83,18 @@ DRIVE_IMAGE_DIR = "generate/image"
 DRIVE_GENERATE_JSON_DIR = "generate/json"
 DRIVE_TEXT_JSON_DIR = "text/json"
 
-# OAuth.
+# OAuth. Both files hold credentials, so their location comes from the
+# environment (`.env`) rather than being pinned in source: a shared machine or a
+# CI runner keeps them outside the checkout. The `secrets/` fallback is what a
+# single-developer setup gets.
+ensure_dotenv_loaded()
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-DEFAULT_CLIENT_SECRET = PROJECT_ROOT / "secrets" / "drive_client_secret.json"
-DEFAULT_TOKEN = PROJECT_ROOT / "secrets" / "drive_token.json"
+DEFAULT_CLIENT_SECRET = env_path(
+    "GOOGLE_DRIVE_CREDENTIALS", PROJECT_ROOT / "secrets" / "drive_client_secret.json"
+)
+DEFAULT_TOKEN = env_path(
+    "GOOGLE_DRIVE_TOKEN", PROJECT_ROOT / "secrets" / "drive_token.json"
+)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 RESUMABLE_THRESHOLD = 8 * 1024 * 1024  # bytes; below this a simple upload wins

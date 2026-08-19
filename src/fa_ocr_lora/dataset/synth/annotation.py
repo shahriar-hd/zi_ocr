@@ -27,10 +27,10 @@ to happen before that list is training data:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Final, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any, Final, Iterable, Mapping, Protocol, Sequence
 
-from ..common.config import CSS_PPI
+from ...config import CSS_PPI
 from ..common.schema import (
     AnnotationError,
     BBox,
@@ -44,9 +44,11 @@ from .layout.page_composer import ComposedLetter
 from .render.browser import RenderResult
 
 __all__ = [
+    "BoxMap",
     "build_annotation",
     "build_pages",
     "reading_order",
+    "remap_boxes",
 ]
 
 #: Two boxes belong to the same visual line when their vertical centres sit
@@ -361,7 +363,7 @@ def build_pages(
 
     Args:
         result: What :meth:`.render.browser.PageRenderer.render` returned.
-        image_names: One PNG filename per sheet, as written to disk. Stored
+        image_names: One image filename per sheet, as written to disk. Stored
             verbatim so the annotation stays valid after the files move, as
             long as they move together.
         content_map: Structured payloads keyed by element id, normally
@@ -426,7 +428,7 @@ def build_annotation(
     Args:
         composed: The composed letter, for its seed, paper and content map.
         result: The Chromium pass that rasterised it.
-        image_names: One PNG filename per page, in order.
+        image_names: One image filename per page, in order.
 
     Returns:
         The complete annotation, with ``full_transcription`` built from the
@@ -454,4 +456,68 @@ def build_annotation(
         pages=pages,
         letter_fields=letter_fields,
         texture=composed.texture_name,
+    )
+
+
+class BoxMap(Protocol):
+    """Anything that can move a box from the rendered page to the scanned one.
+
+    :class:`.render.scan.SheetGeometry` is the implementation. It is taken
+    structurally rather than imported so this module stays free of the scan
+    stage's numpy and Pillow dependencies - the ground truth has to be
+    buildable on a machine that only reads annotations.
+    """
+
+    def map_bbox(self, bbox: Sequence[float]) -> tuple[int, int, int, int]:
+        """Return the box's axis-aligned extent after the transform."""
+        ...
+
+
+def remap_boxes(
+    annotation: DocumentAnnotation,
+    geometries: Sequence[BoxMap | None],
+    *,
+    scan: Mapping[str, Any] | None = None,
+) -> DocumentAnnotation:
+    """Move every box through the geometry its own sheet was scanned with.
+
+    The scan stage rotates, warps and bows each sheet *after* the boxes were
+    measured, so an un-remapped annotation describes a page that no longer
+    exists. Reading order is deliberately left as it was: it was computed on
+    the un-rotated page, where the lines are exactly horizontal, and a
+    sub-degree rotation can only make that grouping worse.
+
+    A box that the transform pushes off the page collapses to zero extent and
+    is dropped rather than clamped to a sliver, since a one-pixel box at the
+    paper edge is not something worth teaching.
+
+    Args:
+        annotation: The ground truth as measured on the clean render.
+        geometries: One map per page, in page order; ``None`` for a page that
+            was not transformed. Shorter sequences leave the remaining pages
+            untouched.
+        scan: The scan provenance to record on the annotation, normally
+            :meth:`.render.scan.ScanProfile.as_content`.
+
+    Returns:
+        A new annotation. The original is left alone, as are its pages when
+        nothing about them changed.
+    """
+    pages: list[Page] = []
+    for index, page in enumerate(annotation.pages):
+        geometry = geometries[index] if index < len(geometries) else None
+        if geometry is None:
+            pages.append(page)
+            continue
+        elements: list[Element] = []
+        for element in page.elements:
+            x0, y0, x1, y1 = geometry.map_bbox(element.bbox.as_list())
+            if x1 <= x0 or y1 <= y0:
+                continue
+            elements.append(replace(element, bbox=BBox(x0, y0, x1, y1)))
+        pages.append(replace(page, elements=tuple(elements)))
+    return replace(
+        annotation,
+        pages=tuple(pages),
+        scan=dict(scan) if scan is not None else annotation.scan,
     )

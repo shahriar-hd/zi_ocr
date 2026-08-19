@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Sequence
 
+from ....config import STAMP_ROUND_SHAPES, StampConfig, StampVocabulary
 from ...common.io_utils import weighted_choice
 from .header_footer import logo_data_uri
 
@@ -45,76 +46,26 @@ __all__ = [
     "city_from_address",
 ]
 
-#: Border shapes, by relative weight. The round forms dominate because that is
-#: what an Iranian company seal almost always is; the angular ones exist so the
-#: model does not learn "stamp == circle".
-_SHAPES: Final[tuple[tuple[str, float], ...]] = (
-    ("circle", 30.0),
-    ("double_circle", 26.0),
-    ("oval", 14.0),
-    ("rounded_square", 12.0),
-    ("square", 10.0),
-    ("hexagon", 8.0),
-)
+#: Fallback for a caller that does not hand over the loaded config - the test
+#: suite, mostly. Read off an instance rather than restated here, so a literal
+#: cannot drift from the dataclass default.
+_DEFAULT_STAMP: Final[StampConfig] = StampConfig()
 
-#: Shapes whose ring text follows an arc. The rest print straight lines above
-#: and below the logo, because text curved around a corner is not a thing real
-#: stamps do.
-_ROUND_SHAPES: Final[frozenset[str]] = frozenset(
-    {"circle", "double_circle", "oval"}
-)
+#: Border shapes, their weights, and every per-sample range the mark varies
+#: over now live in the ``stamp`` config section. Shapes whose ring text
+#: follows an arc come from :data:`~fa_ocr_lora.config.STAMP_ROUND_SHAPES`:
+#: that is a fact about each shape, not a choice, since text curved around a
+#: corner is not a thing real stamps do.
 
-#: Cities for the lower ring. The letter records name a city in the address
-#: only sometimes, so one is sampled when the address does not supply it.
-_CITIES: Final[tuple[str, ...]] = (
-    "تهران",
-    "اصفهان",
-    "مشهد",
-    "شیراز",
-    "تبریز",
-    "کرج",
-    "قم",
-    "اهواز",
-    "رشت",
-    "کرمان",
-    "یزد",
-    "ارومیه",
-)
-
-#: Words printed in the lower ring beside the city, with relative weights.
-_SEAL_WORDS: Final[tuple[tuple[str, float], ...]] = (
-    ("مهر رسمی", 26.0),
-    ("", 24.0),
-    ("ثبت شده", 18.0),
-    ("مهر شرکت", 16.0),
-    ("دبیرخانه", 16.0),
-)
-
-#: Rendered stamp width on the page, in millimetres. Real company seals run
-#: 30-42 mm across; the range brackets that.
-_WIDTH_MM_RANGE: Final[tuple[float, float]] = (28.0, 42.0)
-
-#: Tilt applied to the whole mark. A stamp is pressed by hand, so the angle is
-#: sloppier than a signature's.
-_ROTATE_DEG_RANGE: Final[tuple[float, float]] = (-18.0, 18.0)
-
-#: Overall ink weight. Below ~0.7 the mark stops reading as deliberate; at 1.0
-#: it looks printed rather than pressed.
-_OPACITY_RANGE: Final[tuple[float, float]] = (0.72, 0.94)
-
-#: How far ``feTurbulence`` shoves the mark around, in viewBox units. Two units
-#: on a 200-unit box is a visible wobble at the border without smearing text.
-_WOBBLE_RANGE: Final[tuple[float, float]] = (1.4, 3.0)
-
-#: Threshold on the hole mask, as an alpha multiplier. More negative eats less
-#: ink: the intercept shifts the whole grain curve down, so only its brightest
-#: peaks clear zero and survive as holes. At ``-1.2`` too much of the field
-#: cleared, and thin borders came out as dotted lines rather than pressed
-#: rubber, so the range starts below that.
-_EROSION_RANGE: Final[tuple[float, float]] = (-3.0, -1.8)
+#: The cities the lower ring can name and the words printed beside them live in
+#: ``configs/vocabulary_fa.yaml`` and arrive as ``config.vocabulary.stamp``. The
+#: city list is read twice: once to sample a fallback, and once by
+#: :func:`city_from_address` to recognise a city the footer already names.
+_DEFAULT_VOCABULARY: Final[StampVocabulary] = StampVocabulary()
 
 #: The stamp's own coordinate system. Every geometry constant below is in these
-#: units, so the mark scales by changing only the CSS width.
+#: units, so the mark scales by changing only the CSS width. Intentionally not
+#: a knob: these numbers are meaningful only relative to each other.
 _BOX: Final[int] = 200
 _CENTRE: Final[float] = 100.0
 
@@ -124,24 +75,17 @@ _INNER_R: Final[float] = 84.0
 _TOP_TEXT_R: Final[float] = 76.0
 _BOTTOM_TEXT_R: Final[float] = 74.0
 
-#: Ring text size in viewBox units, and the logo's share of the box.
+#: Ring text size in viewBox units. The logo's share of the box is a knob and
+#: lives in ``stamp.logo_fraction``; these two are part of the frame above.
 _RING_FONT: Final[float] = 15.0
 _LINE_FONT: Final[float] = 16.0
-_LOGO_FRACTION: Final[float] = 0.42
 
 #: Alpha row of the logo density matrix: ``A - luminance(RGB)`` with the
 #: Rec. 709 coefficients. Dark marks ink fully, white knockouts drop out, and
 #: anything already transparent stays transparent - which is what turns an
-#: arbitrary brand logo into a one-colour seal impression.
+#: arbitrary brand logo into a one-colour seal impression. Intentionally not a
+#: knob: it is the definition of relative luminance, not a preference.
 _DENSITY_ROW: Final[str] = "-0.2126 -0.7152 -0.0722 1 0"
-
-#: Gain applied to that density before it is flooded with ink. Density is
-#: ``1 - luminance``, so a light brand fill lands near 0.2 and printed as a
-#: watermark next to fully-saturated ring text at low gain. At 4.0 anything
-#: darker than ~75% luminance inks solid, while white knockouts (density 0)
-#: and the transparent margin still drop out - a rubber pad transfers one
-#: weight of ink or none, not a gradient.
-_INK_GAIN: Final[float] = 4.0
 
 #: Below this the ring text stops being legible at 300 DPI, so a name too long
 #: to fit is truncated rather than shrunk further.
@@ -210,7 +154,9 @@ def _clip_ring(text: str) -> str:
     return head.strip()
 
 
-def city_from_address(address: str) -> str:
+def city_from_address(
+    address: str, vocabulary: StampVocabulary = _DEFAULT_VOCABULARY
+) -> str:
     """Find the city named in a postal address, if it names one.
 
     The generated addresses mention a city only about half the time
@@ -220,11 +166,13 @@ def city_from_address(address: str) -> str:
 
     Args:
         address: The letter's ``contact_info.address``.
+        vocabulary: The ``stamp`` pools from ``vocabulary_fa.yaml``; only
+            ``cities`` is read here.
 
     Returns:
         The matched city, or ``""`` when the address names none.
     """
-    for city in _CITIES:
+    for city in vocabulary.cities:
         if city in address:
             return city
     return ""
@@ -239,7 +187,8 @@ class StampSpec:
             ink, or ``""`` when the row has no usable logo - the seal then
             prints as text and border alone, which real seals also do.
         logo_name: Source filename, for provenance.
-        shape: Border treatment from :data:`_SHAPES`.
+        shape: Border treatment, one of
+            :data:`~fa_ocr_lora.config.STAMP_SHAPES`.
         ink: The single colour everything is printed in.
         top_text: Upper ring, normally the organisation name.
         bottom_text: Lower ring, normally city plus a seal word.
@@ -251,6 +200,14 @@ class StampSpec:
         noise_seed: Seed handed to ``feTurbulence``, so a sample's grain is
             reproducible rather than up to the renderer.
         stroke_width: Border weight in viewBox units.
+        logo_fraction: The logo's share of the box's width.
+        ink_gain: Gain applied to the logo's density before it is flooded with
+            ink; see :func:`_ink_filter_svg`.
+
+    The last two are carried on the spec rather than read from the config where
+    they are used, because :func:`stamp_to_html` and :func:`_ink_filter_svg`
+    are handed only a spec. Both keep the shipped default so an existing
+    construction stays valid.
     """
 
     logo_uri: str
@@ -266,11 +223,13 @@ class StampSpec:
     erosion: float
     noise_seed: int
     stroke_width: float
+    logo_fraction: float = _DEFAULT_STAMP.logo_fraction
+    ink_gain: float = _DEFAULT_STAMP.ink_gain
 
     @property
     def is_round(self) -> bool:
         """Whether the ring text follows an arc rather than a straight line."""
-        return self.shape in _ROUND_SHAPES
+        return self.shape in STAMP_ROUND_SHAPES
 
     @property
     def text(self) -> str:
@@ -297,6 +256,8 @@ def build_stamp(
     ink_pool: Sequence[str],
     rng: random.Random,
     probability: float = 0.55,
+    config: StampConfig = _DEFAULT_STAMP,
+    vocabulary: StampVocabulary = _DEFAULT_VOCABULARY,
 ) -> StampSpec | None:
     """Design the seal for one letter, or none.
 
@@ -307,6 +268,10 @@ def build_stamp(
         ink_pool: Candidate stamp inks from ``theme.stamp_inks``.
         rng: The sample's seeded RNG, conventionally ``purpose="stamp"``.
         probability: Chance the letter is stamped at all.
+        config: The ``stamp`` config section - shape pool, per-sample ranges,
+            and the two values carried onto the spec for rendering.
+        vocabulary: The ``stamp`` pools from ``vocabulary_fa.yaml``: the seal
+            words and the fallback city list.
 
     Returns:
         The designed seal, or ``None`` when this letter carries no stamp.
@@ -314,22 +279,24 @@ def build_stamp(
     # Drawn unconditionally, as in texture.py and signature.py, so retuning the
     # stamp rate does not shift every later choice in the sample.
     draw = rng.random()
-    shape = weighted_choice(_SHAPES, rng)
+    shape = weighted_choice(config.shapes, rng)
     ink = ink_pool[rng.randrange(len(ink_pool))] if ink_pool else "#1B3F94"
-    seal_word = weighted_choice(_SEAL_WORDS, rng)
-    fallback_city = _CITIES[rng.randrange(len(_CITIES))]
-    width_mm = round(rng.uniform(*_WIDTH_MM_RANGE), 1)
-    rotate_deg = round(rng.uniform(*_ROTATE_DEG_RANGE), 2)
-    opacity = round(rng.uniform(*_OPACITY_RANGE), 3)
-    wobble = round(rng.uniform(*_WOBBLE_RANGE), 2)
-    erosion = round(rng.uniform(*_EROSION_RANGE), 2)
+    seal_word = weighted_choice(vocabulary.seal_words, rng)
+    cities = vocabulary.cities
+    fallback_city = cities[rng.randrange(len(cities))]
+    width_mm = round(config.width_mm.draw(rng), 1)
+    rotate_deg = round(config.rotate_deg.draw(rng), 2)
+    opacity = round(config.opacity.draw(rng), 3)
+    wobble = round(config.wobble.draw(rng), 2)
+    erosion = round(config.erosion.draw(rng), 2)
     noise_seed = rng.randrange(10_000)
-    stroke_width = round(rng.uniform(2.6, 4.4), 2)
+    stroke_width = round(config.stroke_width.draw(rng), 2)
     if draw >= probability:
         return None
 
     name = company_name.strip()
-    top_text = f"مهر {name}" if name and rng.random() < 0.35 else name
+    prefixed = name and rng.random() < config.name_prefix_probability
+    top_text = f"مهر {name}" if prefixed else name
     bottom_parts = [city.strip() or fallback_city]
     if seal_word:
         bottom_parts.append(seal_word)
@@ -354,6 +321,8 @@ def build_stamp(
         erosion=erosion,
         noise_seed=noise_seed,
         stroke_width=stroke_width,
+        logo_fraction=config.logo_fraction,
+        ink_gain=config.ink_gain,
     )
 
 
@@ -368,7 +337,7 @@ def _ink_filter_svg(spec: StampSpec, uid: str) -> str:
     1. ``feColorMatrix`` replaces alpha with ``A - luminance``, so dark ink
        stays opaque, white knockouts and pale tints fall away, and the
        transparent margin is untouched.
-    2. ``feComponentTransfer`` multiplies that density by :data:`_INK_GAIN`,
+    2. ``feComponentTransfer`` multiplies that density by ``spec.ink_gain``,
        because a mid-tone brand colour would otherwise print as a ghost.
     3. ``feFlood`` + ``feComposite operator="in"`` paint the surviving shape
        in the seal's ink.
@@ -389,7 +358,7 @@ def _ink_filter_svg(spec: StampSpec, uid: str) -> str:
         "0 0 0 0 0 "
         f'{_DENSITY_ROW}" result="density"/>'
         '<feComponentTransfer in="density" result="inked">'
-        f'<feFuncA type="linear" slope="{_INK_GAIN}" intercept="0"/>'
+        f'<feFuncA type="linear" slope="{spec.ink_gain}" intercept="0"/>'
         "</feComponentTransfer>"
         f'<feFlood flood-color="{spec.ink}" result="pad"/>'
         '<feComposite in="pad" in2="inked" operator="in"/>'
@@ -553,7 +522,7 @@ def stamp_to_html(spec: StampSpec, element_id: str = "stamp") -> str:
     logo = ""
     ink_filter = ""
     if spec.logo_uri:
-        size = _BOX * _LOGO_FRACTION
+        size = _BOX * spec.logo_fraction
         offset = _CENTRE - size / 2
         ink_filter = _ink_filter_svg(spec, uid)
         logo = (

@@ -6,8 +6,8 @@ import io
 from tqdm import tqdm
 
 # ==================== تنظیمات ====================
-INPUT_DIR = "./data/persian_pixel/hf/data/"              # مسیر پوشه‌ای که فایل‌های parquet در آن قرار دارند
-OUTPUT_DIR = "./data/persian_pixel/page/"  # مسیر پوشه خروجی
+INPUT_DIR = "/home/shahriar/Documents/zilber_ocr/data/hf/data/"              # مسیر پوشه‌ای که فایل‌های parquet در آن قرار دارند
+OUTPUT_DIR = "/home/shahriar/Documents/zilber_ocr/data/hf/data/temp/"  # مسیر پوشه خروجی
 # =================================================
 
 def extract_parquet_files(input_dir, output_dir):

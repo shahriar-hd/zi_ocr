@@ -28,7 +28,7 @@ import random
 from dataclasses import dataclass
 from typing import Final, Sequence
 
-from ...common.config import FontSpec, ThemeConfig
+from ....config import BAR_STYLES, FontSpec, ThemeConfig
 from ...common.io_utils import weighted_choice
 
 __all__ = [
@@ -37,13 +37,18 @@ __all__ = [
     "Typography",
     "Theme",
     "build_theme",
+    "composite",
     "contrast_ratio",
     "hex_to_rgb",
+    "rgba",
 ]
 
 #: How the header and footer bars are drawn. The composer maps these to CSS
 #: classes; the annotation records the name so a consumer can tell a solid
-#: block apart from a hairline rule.
+#: block apart from a hairline rule. The canonical list lives in
+#: :data:`fa_ocr_lora.config.BAR_STYLES` so ``theme.bar_weights`` can be
+#: validated against it at load time; these attributes are the readable
+#: spellings for use at a call site.
 class BarStyle:
     """Header/footer bar treatments."""
 
@@ -53,39 +58,8 @@ class BarStyle:
     DOUBLE_RULE: Final[str] = "double_rule"
     SIDE_STRIPE: Final[str] = "side_stripe"
     NONE: Final[str] = "none"
-    ALL: Final[tuple[str, ...]] = (
-        "solid",
-        "tinted_band",
-        "rule",
-        "double_rule",
-        "side_stripe",
-        "none",
-    )
+    ALL: Final[tuple[str, ...]] = BAR_STYLES
 
-
-#: Relative weights for the bar styles. A plain rule is the most common
-#: treatment on real letterheads, so it dominates without excluding the rest.
-_BAR_WEIGHTS: Final[tuple[tuple[str, float], ...]] = (
-    (BarStyle.RULE, 30.0),
-    (BarStyle.TINTED_BAND, 22.0),
-    (BarStyle.SOLID, 16.0),
-    (BarStyle.DOUBLE_RULE, 14.0),
-    (BarStyle.SIDE_STRIPE, 10.0),
-    (BarStyle.NONE, 8.0),
-)
-
-#: Near-black ink candidates. Pure ``#000`` is rare in print, so the pool
-#: leans to very dark neutrals and a brand-tinted near-black.
-_INK_CANDIDATES: Final[tuple[str, ...]] = ("#1A1A1A", "#212121", "#141414", "#232323")
-
-#: Page surfaces: white plus barely-there warm and cool paper tints.
-_SURFACE_CANDIDATES: Final[tuple[str, ...]] = (
-    "#FFFFFF",
-    "#FFFFFF",
-    "#FDFDFB",
-    "#FCFBF7",
-    "#FBFCFD",
-)
 
 _SRGB_THRESHOLD: Final[float] = 0.04045
 _SRGB_DIVISOR: Final[float] = 12.92
@@ -98,9 +72,11 @@ _LUMA_R: Final[float] = 0.2126
 _LUMA_G: Final[float] = 0.7152
 _LUMA_B: Final[float] = 0.0722
 
-#: Most a colour is darkened per step while chasing the contrast floor.
-_DARKEN_STEP: Final[float] = 0.08
-_MAX_DARKEN_STEPS: Final[int] = 24
+#: Last resort when even full darkening cannot clear the contrast floor.
+#: Intentionally not a knob: it is the value that makes the floor a guarantee
+#: rather than a preference, and a config file able to raise it could ship an
+#: unreadable page.
+_INK_FLOOR: Final[str] = "#111111"
 
 
 def hex_to_rgb(hex_colour: str) -> tuple[int, int, int]:
@@ -196,7 +172,12 @@ def _lighten(hex_colour: str, amount: float) -> str:
     return _mix(hex_colour, "#FFFFFF", amount)
 
 
-def _ensure_contrast(foreground: str, background: str, minimum: float) -> str:
+def _ensure_contrast(
+    foreground: str,
+    background: str,
+    minimum: float,
+    config: ThemeConfig,
+) -> str:
     """Darken a colour until it clears a contrast floor against its surface.
 
     A light brand colour used directly as text can fall below the readable
@@ -207,22 +188,94 @@ def _ensure_contrast(foreground: str, background: str, minimum: float) -> str:
         foreground: Desired text colour.
         background: The surface behind it.
         minimum: Required contrast ratio.
+        config: Theme constraints, for the darkening step and its attempt cap.
 
     Returns:
         The original colour when it already passes, else a darkened variant.
         Falls back to near-black if even full darkening cannot pass.
     """
+    return _ensure_contrast_over(foreground, background, 1.0, minimum, config)
+
+
+def _ensure_contrast_over(
+    foreground: str,
+    background: str,
+    alpha: float,
+    minimum: float,
+    config: ThemeConfig,
+) -> str:
+    """Darken a colour until its *composite* clears a contrast floor.
+
+    Ink is painted with an alpha (§ :attr:`Palette.ink_alpha`) so the paper
+    grain beneath shows through it, which lightens what the eye - and the
+    model - actually sees. The floor therefore has to be measured on the
+    composite rather than on the nominal colour, or a translucent ink could
+    pass the check and still render unreadably pale.
+
+    Args:
+        foreground: Desired text colour, before compositing.
+        background: The surface behind it.
+        alpha: Opacity the colour will be painted with, in ``[0, 1]``.
+        minimum: Required contrast ratio.
+        config: Theme constraints, for the darkening step and its attempt cap.
+
+    Returns:
+        The base colour to paint at ``alpha``. Falls back to near-black when
+        even full darkening cannot pass.
+    """
     candidate = foreground
-    for _ in range(_MAX_DARKEN_STEPS):
-        if contrast_ratio(candidate, background) >= minimum:
+    for _ in range(config.max_darken_steps):
+        if contrast_ratio(composite(background, candidate, alpha), background) >= minimum:
             return candidate
-        candidate = _darken(candidate, _DARKEN_STEP)
-    return "#111111"
+        candidate = _darken(candidate, config.darken_step)
+    return _INK_FLOOR
+
+
+def composite(background: str, foreground: str, alpha: float) -> str:
+    """Return the colour a translucent foreground actually shows as.
+
+    Every ink on the page is painted with an alpha, so its nominal hex is not
+    what the eye or the model receives. Contrast checks - here and in the tests -
+    have to be made against this, the composited result.
+
+    Args:
+        background: Colour behind the paint, as ``#rrggbb``.
+        foreground: Colour being painted, as ``#rrggbb``.
+        alpha: Opacity it is painted with; values outside ``[0, 1]`` are clamped.
+
+    Returns:
+        The resulting ``#rrggbb`` colour.
+    """
+    return _mix(background, foreground, max(0.0, min(1.0, alpha)))
+
+
+def rgba(hex_colour: str, alpha: float) -> str:
+    """Return a CSS ``rgba()`` string for a hex colour and an opacity.
+
+    Every light colour on the page is expressed this way rather than as an
+    opaque hex, so "white" is an absence of ink - transparent - instead of a
+    sprayed-on layer that would hide the paper texture composited underneath.
+
+    Args:
+        hex_colour: A ``#rrggbb`` colour.
+        alpha: Opacity in ``[0, 1]``, rounded to three decimals.
+
+    Returns:
+        e.g. ``rgba(26, 26, 26, 0.94)``.
+    """
+    red, green, blue = hex_to_rgb(hex_colour)
+    return f"rgba({red}, {green}, {blue}, {max(0.0, min(1.0, alpha)):.3f})"
 
 
 @dataclass(frozen=True, slots=True)
 class Palette:
     """The colours one document is allowed to use.
+
+    Colours are stored as opaque hex - the contrast maths needs a definite
+    value - and *painted* through the ``*_css`` properties, which attach the
+    matching alpha. Nothing on the page is fully opaque white: light areas are
+    transparent, so the paper tone and the scanned grain composited beneath the
+    sheet remain visible through them.
 
     Attributes:
         brand: The row's own brand colour, unmodified.
@@ -233,6 +286,13 @@ class Palette:
         tint: A pale brand wash for banded bars and table header rows.
         rule: Hairline colour for borders and separators.
         bar_text: Text colour that sits on a solid brand bar.
+        surface_alpha: Opacity of the paper wash. Deliberately low: the sheet
+            is a tint over the scanned paper, not a coat of paint over it.
+        ink_alpha: Opacity of text. Toner is never fully opaque, and the
+            residual transparency is what lets grain break up the glyph edges.
+        tint_alpha: Opacity of pale washes - banded bars, zebra rows.
+        panel_alpha: Opacity of saturated fills - solid bars, side stripes.
+        rule_alpha: Opacity of hairlines.
     """
 
     brand: str
@@ -243,8 +303,63 @@ class Palette:
     tint: str
     rule: str
     bar_text: str
+    surface_alpha: float = 0.24
+    ink_alpha: float = 0.94
+    tint_alpha: float = 0.6
+    panel_alpha: float = 0.95
+    rule_alpha: float = 0.82
 
-    def as_content(self) -> dict[str, str]:
+    @property
+    def surface_css(self) -> str:
+        """Paper wash for the sheet, translucent over the scanned paper."""
+        return rgba(self.surface, self.surface_alpha)
+
+    @property
+    def ink_css(self) -> str:
+        """Body text colour."""
+        return rgba(self.ink, self.ink_alpha)
+
+    @property
+    def muted_ink_css(self) -> str:
+        """Secondary text colour."""
+        return rgba(self.muted_ink, self.ink_alpha)
+
+    @property
+    def accent_css(self) -> str:
+        """Brand-coloured text and chart ink."""
+        return rgba(self.accent, self.ink_alpha)
+
+    @property
+    def brand_css(self) -> str:
+        """Saturated fill for solid bars and stripes."""
+        return rgba(self.brand, self.panel_alpha)
+
+    @property
+    def accent_panel_css(self) -> str:
+        """Saturated accent fill, for the full-height side stripe."""
+        return rgba(self.accent, self.panel_alpha)
+
+    @property
+    def tint_css(self) -> str:
+        """Pale brand wash for banded bars and table header rows."""
+        return rgba(self.tint, self.tint_alpha)
+
+    @property
+    def tint_soft_css(self) -> str:
+        """Half-strength wash, for zebra-striped table body rows."""
+        return rgba(self.tint, self.tint_alpha * 0.5)
+
+    @property
+    def rule_css(self) -> str:
+        """Hairline colour for borders and separators."""
+        return rgba(self.rule, self.rule_alpha)
+
+    @property
+    def bar_text_css(self) -> str:
+        """Text sitting on a solid brand bar."""
+        return rgba(self.bar_text, self.ink_alpha)
+
+    def as_content(self) -> dict[str, object]:
         """Return the palette for the annotation's provenance block."""
         return {
             "brand": self.brand,
@@ -252,7 +367,11 @@ class Palette:
             "ink": self.ink,
             "surface": self.surface,
             "tint": self.tint,
+            "surface_alpha": round(self.surface_alpha, 3),
+            "ink_alpha": round(self.ink_alpha, 3),
         }
+
+
 @dataclass(frozen=True, slots=True)
 class Typography:
     """The type choices one document is allowed to use.
@@ -371,24 +490,40 @@ def _build_palette(
         rng: The sample's seeded RNG.
 
     Returns:
-        A palette whose body ink clears the configured contrast floor.
+        A palette whose body ink clears the configured contrast floor once
+        composited at its own alpha.
     """
-    surface = rng.choice(_SURFACE_CANDIDATES)
-    ink = _ensure_contrast(
-        rng.choice(_INK_CANDIDATES), surface, config.min_contrast_ratio
+    surface = rng.choice(config.surface_candidates)
+    # Alphas first, because the contrast floor is measured on the composite.
+    surface_alpha = round(config.surface_alpha.draw(rng), 3)
+    ink_alpha = round(config.ink_alpha.draw(rng), 3)
+    ink = _ensure_contrast_over(
+        rng.choice(config.ink_candidates),
+        surface,
+        ink_alpha,
+        config.min_contrast_ratio,
+        config,
     )
-    accent = _ensure_contrast(brand_hex, surface, config.min_contrast_ratio)
-    muted_ink = _ensure_contrast(
-        _lighten(ink, rng.uniform(0.28, 0.42)), surface, 3.0
+    accent = _ensure_contrast_over(
+        brand_hex, surface, ink_alpha, config.min_contrast_ratio, config
     )
-    tint = _lighten(brand_hex, rng.uniform(0.86, 0.94))
-    rule = _lighten(accent, rng.uniform(0.35, 0.6))
+    muted_ink = _ensure_contrast_over(
+        _lighten(ink, config.muted_ink_lighten.draw(rng)),
+        surface,
+        ink_alpha,
+        config.muted_ink_contrast_ratio,
+        config,
+    )
+    tint = _lighten(brand_hex, config.tint_lighten.draw(rng))
+    rule = _lighten(accent, config.rule_lighten.draw(rng))
     # Text printed on a solid brand bar needs the bar as its background, not
     # the page, so it gets its own contrast decision.
     bar_text = (
-        "#FFFFFF"
-        if contrast_ratio("#FFFFFF", brand_hex) >= config.min_contrast_ratio
-        else _ensure_contrast("#1A1A1A", brand_hex, config.min_contrast_ratio)
+        config.bar_text_light
+        if contrast_ratio(config.bar_text_light, brand_hex) >= config.min_contrast_ratio
+        else _ensure_contrast(
+            config.bar_text_dark, brand_hex, config.min_contrast_ratio, config
+        )
     )
     return Palette(
         brand=brand_hex,
@@ -399,6 +534,11 @@ def _build_palette(
         tint=tint,
         rule=rule,
         bar_text=bar_text,
+        surface_alpha=surface_alpha,
+        ink_alpha=ink_alpha,
+        tint_alpha=round(config.tint_alpha.draw(rng), 3),
+        panel_alpha=round(config.panel_alpha.draw(rng), 3),
+        rule_alpha=round(config.rule_alpha.draw(rng), 3),
     )
 
 
@@ -431,17 +571,17 @@ def build_theme(
         display_family=display_font.name or body_font.name,
         body_pt=body_pt,
         line_height=round(rng.uniform(line_minimum, line_maximum), 2),
-        heading_scale=round(rng.uniform(1.04, 1.16), 3),
-        subject_scale=round(rng.uniform(1.08, 1.24), 3),
-        justify=rng.random() < 0.65,
+        heading_scale=round(config.heading_scale.draw(rng), 3),
+        subject_scale=round(config.subject_scale.draw(rng), 3),
+        justify=rng.random() < config.justify_probability,
     )
 
-    header_bar = weighted_choice(_BAR_WEIGHTS, rng)
+    header_bar = weighted_choice(config.bar_weights, rng)
     # A side stripe runs the full page height, so it cannot also be a footer
     # treatment; pairing it with itself would double the stripe.
     footer_options = tuple(
         (style, weight)
-        for style, weight in _BAR_WEIGHTS
+        for style, weight in config.bar_weights
         if style != BarStyle.SIDE_STRIPE
     )
     footer_bar = weighted_choice(footer_options, rng)
@@ -451,7 +591,7 @@ def build_theme(
         typography=typography,
         header_bar=header_bar,
         footer_bar=footer_bar,
-        rule_width_px=round(rng.uniform(0.8, 2.4), 2),
-        corner_radius_px=round(rng.choice((0.0, 0.0, 2.0, 4.0, 6.0)), 1),
-        table_zebra=rng.random() < 0.55,
+        rule_width_px=round(config.rule_width_px.draw(rng), 2),
+        corner_radius_px=round(rng.choice(config.corner_radii_px), 1),
+        table_zebra=rng.random() < config.table_zebra_probability,
     )

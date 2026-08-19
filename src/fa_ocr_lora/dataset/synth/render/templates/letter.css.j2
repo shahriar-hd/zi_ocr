@@ -29,11 +29,15 @@
   box-sizing: border-box;
 }
 
+/* Nothing paints an opaque white ground. The screenshot is captured with an
+   omitted background so every light area stays transparent, and the scan stage
+   composites the paper tone and its grain underneath. A white fill here would
+   bury both. */
 html,
 body {
   margin: 0;
   padding: 0;
-  background: #FFFFFF;
+  background: transparent;
 }
 
 body {
@@ -42,7 +46,7 @@ body {
   font-family: {{ theme.typography.body_css }};
   font-size: {{ theme.typography.body_pt }}pt;
   line-height: {{ theme.typography.line_height }};
-  color: {{ palette.ink }};
+  color: {{ palette.ink_css }};
   -webkit-font-smoothing: antialiased;
   text-rendering: geometricPrecision;
 }
@@ -64,18 +68,6 @@ body {
   break-after: auto;
 }
 
-{% if backdrop_css %}
-/* The scan sits on its own layer so the white veil - and the optional
-   180deg flip - never touch the text above it. */
-.sheet::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  {{ backdrop_css }}
-}
-{% endif %}
-
 {% if side_stripe %}
 /* A full-height brand stripe on the inline-start (right) edge. It is a page
    treatment rather than a header one, which is why the header itself renders
@@ -87,7 +79,7 @@ body {
   bottom: 0;
   right: 0;
   width: {{ stripe_mm }}mm;
-  background: {{ palette.accent }};
+  background: {{ palette.accent_panel_css }};
   z-index: 1;
 }
 {% endif %}
@@ -148,37 +140,37 @@ body {
   font-weight: 700;
   font-size: {{ theme.typography.subject_pt }}pt;
   line-height: 1.35;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
 }
 
 .header-category,
 .header-slogan {
   font-size: {{ (theme.typography.body_pt * 0.84) | round(2) }}pt;
-  color: {{ palette.muted_ink }};
+  color: {{ palette.muted_ink_css }};
   line-height: 1.4;
 }
 
 /* Bar treatments. ``solid`` paints the whole letterhead, so its text and its
    logo are recoloured by header_footer.py to the palette's bar_text. */
 .header-rule {
-  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule_css }};
 }
 
 .header-double_rule {
-  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.accent }};
-  box-shadow: 0 {{ theme.rule_width_px + 2 }}px 0 0 {{ palette.rule }};
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.accent_css }};
+  box-shadow: 0 {{ theme.rule_width_px + 2 }}px 0 0 {{ palette.rule_css }};
   margin-bottom: 5mm;
 }
 
 .header-tinted_band {
-  background: {{ palette.tint }};
-  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  background: {{ palette.tint_css }};
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule_css }};
   border-radius: {{ theme.corner_radius_px }}px;
   padding: 2.5mm 3mm;
 }
 
 .header-solid {
-  background: {{ palette.brand }};
+  background: {{ palette.brand_css }};
   border-radius: {{ theme.corner_radius_px }}px;
   padding: 3mm;
 }
@@ -186,7 +178,7 @@ body {
 .header-solid .header-company,
 .header-solid .header-category,
 .header-solid .header-slogan {
-  color: {{ palette.bar_text }};
+  color: {{ palette.bar_text_css }};
 }
 
 .header-side_stripe,
@@ -216,7 +208,7 @@ body {
 }
 
 .metadata-boxed {
-  border: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border: {{ theme.rule_width_px }}px solid {{ palette.rule_css }};
   border-radius: {{ theme.corner_radius_px }}px;
   padding: 2mm 3mm;
 }
@@ -226,12 +218,12 @@ body {
 }
 
 .metadata-label {
-  color: {{ palette.muted_ink }};
+  color: {{ palette.muted_ink_css }};
   font-weight: 700;
 }
 
 .metadata-value {
-  color: {{ palette.ink }};
+  color: {{ palette.ink_css }};
 }
 
 /* ---------------------------------------------------------------- frame */
@@ -241,7 +233,7 @@ body {
   font-family: {{ theme.typography.display_css }};
   font-weight: 700;
   margin: 0 0 4mm;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
 }
 
 .letter-party {
@@ -255,9 +247,9 @@ body {
   font-weight: 700;
   font-size: {{ theme.typography.subject_pt }}pt;
   margin: 3mm 0 4mm;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
   {% if subject_underline %}
-  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border-bottom: {{ theme.rule_width_px }}px solid {{ palette.rule_css }};
   padding-bottom: 1.5mm;
   {% endif %}
 }
@@ -275,7 +267,7 @@ body {
   font-weight: 700;
   font-size: {{ theme.typography.heading_pt }}pt;
   margin: 3.4mm 0 1.8mm;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
 }
 
 .list-item {
@@ -291,7 +283,7 @@ body {
 .list-marker {
   flex: 0 0 auto;
   font-weight: 700;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
 }
 
 .list-text {
@@ -321,7 +313,7 @@ body {
   font-weight: 700;
   font-size: {{ (theme.typography.body_pt * 0.92) | round(2) }}pt;
   margin-bottom: 1.6mm;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
 }
 
 .element-table table {
@@ -333,21 +325,21 @@ body {
 
 .element-table th,
 .element-table td {
-  border: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border: {{ theme.rule_width_px }}px solid {{ palette.rule_css }};
   padding: 1.2mm 1.8mm;
   text-align: right;
   vertical-align: top;
 }
 
 .element-table th {
-  background: {{ palette.tint }};
+  background: {{ palette.tint_css }};
   font-weight: 700;
-  color: {{ palette.accent }};
+  color: {{ palette.accent_css }};
 }
 
 {% if theme.table_zebra %}
 .element-table tbody tr:nth-child(even) td {
-  background: {{ palette.tint }}80;
+  background: {{ palette.tint_soft_css }};
 }
 {% endif %}
 
@@ -365,7 +357,7 @@ body {
 /* Axis and category labels inherit their colour, so the whole chart obeys
    the document's palette without charts.py knowing the theme. */
 .chart-svg text {
-  fill: {{ palette.ink }};
+  fill: {{ palette.ink_css }};
   font-family: {{ theme.typography.body_css }};
   font-size: 12px;
 }
@@ -431,30 +423,30 @@ body {
   padding-top: 2mm;
   font-size: {{ (theme.typography.body_pt * 0.78) | round(2) }}pt;
   line-height: 1.5;
-  color: {{ palette.muted_ink }};
+  color: {{ palette.muted_ink_css }};
 }
 
 .footer-rule {
-  border-top: {{ theme.rule_width_px }}px solid {{ palette.rule }};
+  border-top: {{ theme.rule_width_px }}px solid {{ palette.rule_css }};
 }
 
 .footer-double_rule {
-  border-top: {{ theme.rule_width_px }}px solid {{ palette.accent }};
-  box-shadow: 0 -{{ theme.rule_width_px + 2 }}px 0 0 {{ palette.rule }};
+  border-top: {{ theme.rule_width_px }}px solid {{ palette.accent_css }};
+  box-shadow: 0 -{{ theme.rule_width_px + 2 }}px 0 0 {{ palette.rule_css }};
   margin-top: 5mm;
 }
 
 .footer-tinted_band {
-  background: {{ palette.tint }};
+  background: {{ palette.tint_css }};
   border-radius: {{ theme.corner_radius_px }}px;
   padding: 2mm 3mm;
 }
 
 .footer-solid {
-  background: {{ palette.brand }};
+  background: {{ palette.brand_css }};
   border-radius: {{ theme.corner_radius_px }}px;
   padding: 2.4mm 3mm;
-  color: {{ palette.bar_text }};
+  color: {{ palette.bar_text_css }};
 }
 
 .footer-none {
