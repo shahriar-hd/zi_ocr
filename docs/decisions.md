@@ -430,6 +430,395 @@ declared licence covers the pipeline's own output and cannot relicense the
 composited material, and reproduces the logo corpus' per-file licences as
 `attribution/attribution.csv`.
 
+## LoRA training notebook — build and layout
+
+**The notebook's source of truth is a jupytext percent-format `.py`, not the
+`.ipynb`.** `notebooks/paddleocr_vl_lora_train.py` is one linear script whose
+`# %%` / `# %% [markdown]` blocks are cells;
+`scripts/build_training_notebook.py` converts it to
+`notebooks/paddleocr_vl_lora_train.ipynb`. The reason is CLAUDE.md §8: `ruff`
+and `black` cannot see inside a hand-edited notebook, and a notebook diff is
+unreviewable. The builder has no third-party dependency (an `.ipynb` is JSON),
+derives cell ids from the cell index so rebuilds are byte-identical, and offers
+`--check` so CI can fail on a stale artefact. It also audits its own output for
+the spec's "every cell has a markdown explanation above it" rule — that audit is
+what caught Cell 2b sharing Cell 2a's header.
+
+**`notebooks/*.py` gets a per-file-ignores block in `pyproject.toml`.** The
+exempted rules are notebook idiom, not slack: `E501` because cells are written
+to Jupyter's editor width (~110 columns, and the markdown table rows in the cell
+headers cannot be wrapped at all); `E402`/`F811` because every cell re-imports
+what it uses so it can be re-run alone; `D100` because the leading markdown cell
+does the module docstring's job; `D102`/`D105`/`D107` and
+`ANN001`/`ANN003`/`ANN204` because `Trainer`/`Callback`/`Sampler` overrides have
+signatures fixed by upstream. Everything else — including `F821`, which proves
+every cross-cell symbol is actually defined — stays on.
+
+**`black` skips the notebook source and `ruff` skips the generated `.ipynb`.**
+These are two different reasons. black at 90 columns rewrites
+`SMOKE_TEST = False  # comment` into a three-line parenthesised block; in a
+config cell that a human edits at a glance, that is worse than the long line, so
+`force-exclude` (not `exclude`, so the skip holds when pre-commit passes the path
+explicitly) leaves `notebooks/*.py` alone. ruff, conversely, lints `.ipynb`
+natively — which on the *generated* notebook means 309 duplicate findings, since
+its cells are byte-for-byte copies of source that was already linted, and the
+`notebooks/*.py` ignores cannot apply to a `.ipynb` path. So the artefact is in
+ruff's `extend-exclude`. Net effect: each line of notebook code is linted exactly
+once, in the file where it can actually be fixed.
+
+**One notebook, two machines, one switch.** `PHASE = "pilot" | "final"` in Cell 0
+selects a `PHASE_CONFIG` entry (`target_samples`, `per_device_batch_size`,
+`grad_accum_steps`, `train_max_pixels`, `num_epochs`) and nothing else. Only
+Cell 1 (`detect_environment()`), Cell 2 (installs, `drive.mount`, `get_secret`)
+and `WORK_DIR` resolution are environment-aware; from Cell 3 onward `RUNTIME` is
+only ever *read* (to print the VRAM ceiling, to stamp the run summary), never
+branched on. That is the property that makes the file portable, so it is worth
+re-checking after any edit.
+
+## LoRA training notebook — dependencies and data
+
+**`transformers` is pinned to `4.57.6`, `trl` is dropped, `einops` is added.**
+The pin is not caution: the remote code shipped with PaddleOCR-VL calls
+transformers internals whose signatures move between minor releases, and Colab's
+preinstalled version drifts weekly. `trl`'s `SFTTrainer` was removed because the
+prompt/label masking here is bespoke (image-placeholder expansion has to happen
+*after* the pixel budget is known), so `trl` added a dependency and an
+abstraction without doing any of the work. `einops` is imported by the model's
+own remote modelling file and is not a transformers dependency, so it has to be
+installed explicitly or Cell 7 fails on import.
+
+**The notebook owns the resize; the processor is not asked to do it.** Two
+upstream facts force this: per-call `images_kwargs` are ignored by this
+processor, and `min_pixels`/`max_pixels` are process-global attributes rather
+than per-call arguments. So `prepare_image()` resizes to a multiple of
+`patch_size × merge_size = 28` under an explicit budget before the processor sees
+the image, and Cell 5 prints the processor's *real* `min_pixels`/`max_pixels` and
+warns if `train_max_pixels` sits outside them.
+
+**`ON_OVERSIZE = "shrink_image"`, not `"truncate"`.** When image tokens plus
+target tokens exceed `MAX_TOTAL_SEQ_LEN`, the sample's *pixel* budget is lowered
+so the whole transcription survives. Truncating the target would teach the model
+to stop mid-page — the one failure mode that is expensive to detect and fatal in
+an OCR model. Records that cannot fit even at the model's `min_pixels` are
+dropped, logged and counted rather than silently mangled.
+
+**Persian_Pixel granularity comes from the dataset's own `sample_type` /
+config name, not from a heuristic.** An earlier version guessed page-vs-paragraph
+from image aspect ratio and text length. Guessing here would corrupt the
+55:45 paragraph:page mix that the spec asks for, and the metadata is right there.
+
+**Digit-density oversampling is applied in a sampler, not by
+`TrainingArguments`.** `Trainer`'s `group_by_length` materialises `input_ids` for
+the whole dataset to measure lengths — decoding every image once per epoch just
+to sort them. `DigitAwareLengthGroupedSampler` does both jobs on the precomputed
+lengths: multinomial draw by digit-density weight, then length-sorted
+megabatches to cut padding waste. `TrainingArguments.group_by_length` stays
+`False`; the behaviour moved, it was not lost.
+
+## LoRA training notebook — model, LoRA and optimizer
+
+**LoRA targets are matched by full module path, with `visual` and `mlp_AR`
+excluded by prefix.** PaddleOCR-VL's vision tower reuses the names
+`q_proj`/`k_proj`/`v_proj`, so the usual bare-name `target_modules` list would
+silently adapt the frozen SigLIP encoder too — quietly changing what the run is.
+Cell 7 asserts the vision encoder and projector have no trainable parameters
+after wrapping, and prints trainable-vs-total.
+
+**`accepts_loss_kwargs = False` is set on the model.** When `Trainer` detects
+`**loss_kwargs` in `forward`, it hands the model `num_items_in_batch` and skips
+its own `loss / grad_accum` division, expecting the model to normalise. This
+model does not. Left alone, gradients would be 20× too large in the pilot
+config — a bug that looks like a bad learning rate, not like a bug.
+
+**`ALLOW_MULTI_IMAGE_BATCH = False`, with a batch-fold guard in Cell 8.** Under
+`sdpa` the flat `cu_seqlens` vision path lets attention leak across images
+packed into one batch. Rather than accept a subtle correctness bug for
+throughput, per-device batch size above 1 is folded into gradient accumulation
+(same effective batch, same math) and the fold is printed.
+
+**Gradient checkpointing is enabled non-reentrant on the language model only.**
+The vision tower is frozen, so checkpointing it buys no memory that matters and
+costs a second forward pass over the most expensive part of the graph.
+
+**`paged_adamw_8bit` with differential learning-rate param groups.** The 8-bit
+paged optimizer is what keeps the final config inside a T4's 16 GB; the separate
+group for the LoRA `B` matrices follows the usual PEFT practice of letting the
+zero-initialised side move faster.
+
+**dtype follows compute capability: fp16 below 8.0, bf16 on Ampere and up.**
+`TrainingArguments` derives `fp16=(TORCH_DTYPE == "float16")` and
+`bf16=(TORCH_DTYPE == "bfloat16")` from that single value, so T4 and A100 need no
+edit. No autocast wrapper is needed: peft's `lora.Linear`/`lora.Embedding` cast
+their output back to the base layer's dtype, which is why peft is pinned too.
+
+## LoRA training notebook — evaluation and packaging
+
+**The eval prompt is built by splicing image tokens into `PROMPT_TEMPLATE_IDS`,
+not by re-templating.** `prepare_inputs_for_generation` accepts `pixel_values`
+and `image_grid_thw`, so generation can start from exactly the token sequence
+training saw. Any other construction risks a one-token difference between train
+and eval, which shows up as an inexplicable CER floor.
+
+**`use_cache=True` is passed explicitly to `generate()`.** The shipped
+`generation_config.json` sets `use_cache: false`; honouring it makes evaluation
+roughly ten times slower for no benefit.
+
+**Learning-curve JSON is NaN-free by construction.** A validation slice with no
+digits yields a NaN digit-CER, and `json.dump` would happily write a bare `NaN`
+that is not valid JSON — poisoning the accumulated
+`pilot_learning_curve.json` for every later append. `json_safe()` maps
+non-finite values to `null` on the way out and `series()` maps them back to NaN
+for printing and plotting.
+
+**The merged checkpoint gets its remote code copied in.** A `trust_remote_code`
+model saved locally can fail to reload, because `config.auto_map` (and the
+nested `vision_config`/`text_config` maps) point at `.py` modules that are not in
+the folder. `copy_remote_code()` resolves those entries and downloads each
+module next to the weights, so the merged directory is genuinely standalone.
+
+**Hub push is opt-in, private by default, and prints what it is about to
+upload.** Cell 10b is gated on `PUSH_TO_HUB`, creates the repo with
+`private=True`, and prints the source directory, target URL, byte size and file
+list before uploading. Cell 0 asserts that `PUSH_WHAT` has its matching `SAVE_*`
+flag enabled, so a push cannot silently upload nothing.
+
+**Open blocker: `shahriarhd/persian-official-letters-synth` is empty on the
+Hub.** Cell 3 cannot load the admin-letter half of the mix. Rather than fail
+with a stack trace, the notebook prints a labelled BLOCKER banner explaining what
+is missing, and offers `ADMIN_LETTERS_LOCAL_DIR` as an escape hatch for a local
+copy of the export. This needs the dataset pushed before either phase can run.
+
+## Local training on a 4 GB GPU
+
+The modules under [src/fa_ocr_lora/training/](../src/fa_ocr_lora/training/) are a
+second training path, independent of the Colab/A100 notebook: same model, same
+adapter shape, but sized for one RTX 3050 Ti Laptop (4096 MiB) with 16 GB of
+system RAM, reading the corpora straight off local disk. The notebook is
+untouched. Everything below is a decision that differs from it, or from the plan
+that preceded these modules.
+
+### What was measured, and on what
+
+Free VRAM is not total VRAM. On a GNOME desktop with a terminal, a file manager
+and a viewer open, `torch.cuda.mem_get_info()` reported **1984–2182 MiB free of
+3746 MiB visible** across several minutes — the figure moves by ~200 MiB as
+windows open and close. Every budget below is against ~1.98 GiB, not 4 GB, and
+[vram.py](../src/fa_ocr_lora/training/vram.py) holds a 200 MiB margin back for
+exactly that swing.
+
+Resident weights, read from `torch.cuda.memory_allocated()` straight after the
+load:
+
+| Precision | Weights |
+| --- | --- |
+| `nf4` + `quantize_vision: true` | **870 MiB** |
+| `nf4`, vision in bf16 | 1510 MiB |
+| bf16 throughout | ~1730 MiB (estimate — it does not fit here, so it was never measured) |
+
+Peak allocated against sequence length, at `nf4` + vision in bf16:
+
+| Sequence | Peak | Over weights |
+| --- | --- | --- |
+| 1600 | 1794 MiB | 275 MiB |
+| 1900 | 1852 MiB | 333 MiB |
+| 2200 | 1898 MiB | 378 MiB |
+| 2500 | 1943 MiB | 423 MiB |
+| 2800 | OOM | — |
+
+A slope of **148 MiB per 900 tokens**, linear to within a few MiB across that
+range; those two coefficients are what `vram.projected_peak_mib` extrapolates
+from. Note where the wall is: at 2500 tokens the run is 40 MiB from the edge with
+the vision tower unquantised, which is why the default below is what it is.
+
+With the default configuration — `nf4` *and* `quantize_vision: true` — the run was
+measured end to end rather than extrapolated. Over 30 steps on the real 9,197-record
+train split, at effective batch 16 and with sequences drawn from the corpus's own
+length distribution, the allocator peaked at **1287 MiB** against a 2640 MiB
+spendable budget and a 1387 MiB projection; the 2-step smoke run peaked at 1276 MiB.
+The projection is therefore conservative by ~100 MiB, and roughly half the budget
+goes unused — which is what makes `max_total_seq_len: 3072` a real ceiling rather
+than an aspiration.
+
+Throughput, from that same probe: **13.8 s/step, 0.86 s/sample**, so **2.8 h/epoch**
+over the 11,497 samples one epoch expands to, and ~5.5 h for the two epochs the
+config asks for. The plan estimated 0.86 s/sample from token counts alone, which
+turned out to be right. The step time is not flat, though: length-grouped batching
+orders each megabatch longest-first, and the probe's 30 steps ran from 25 s down to
+5 s. Thirty steps taken from the front of a megabatch is a *pessimistic* sample of
+the epoch average, not an optimistic one.
+
+### NF4 by default, not bf16
+
+The plan had bf16 as the default and NF4 as opt-in, on the argument that
+bitsandbytes wheels against torch cu130 on Python 3.13 were unverified. They
+verified fine (bitsandbytes 0.50.1), and the measurements above show bf16 has no
+room: ~1730 MiB of weights plus a 275 MiB floor of activations is already 2005
+MiB against a ~1780 MiB spendable budget. So `quantization: nf4` is the default,
+`none` is the escape hatch for a machine with the display on another GPU, and the
+`quant` extra in [pyproject.toml](../pyproject.toml) is separate precisely so a
+`none` run needs none of it.
+
+### `quantize_vision: true` by default, and what it costs elsewhere
+
+Quantising the *frozen* tower saves **640 MiB** — more than every other lever
+combined, and the difference between 2500-token records fitting and not. It is
+still a real trade: the tower's features change slightly, so an adapter trained
+against a 4-bit tower must be *served* against a 4-bit tower. That coupling is
+the reason
+[modeling.py](../src/fa_ocr_lora/training/modeling.py)'s `_load_base` is shared by
+`load_training_model` and `load_eval_model` rather than duplicated: a CER measured
+at a different quantisation than training is not a measurement of the adapter at
+all, and two copies of that call would let the drift in silently. Phase 3's
+inference loader inherits the same obligation.
+
+### Chunked cross-entropy, not a sliced head module
+
+Both the plan and the notebook wrap the LM head in a `SlicedLMHead` module. What
+is here instead is `SlicedLossModel`, which during its own forward swaps the head
+for `nn.Identity` (restored in a `finally`), then projects **only labelled
+positions** in row-chunks under `torch.utils.checkpoint`. Same purpose — the
+vocab is 103,424 and HF upcasts logits to fp32, so a 1600-token batch would want
+662 MiB for logits and 1.3 GB with the gradient — but two consequences follow that
+the module form does not have:
+
+**Non-reentrant checkpointing is mandatory, not a preference.** The reentrant
+implementation decides whether to build a backward graph by asking whether its
+*inputs* require grad. With a frozen quantised base the decoder's inputs do not,
+so gradients would come back `None` and the loss would never move —
+silently. `use_reentrant=False` is load-bearing.
+
+**`forward` returns hidden states under the key `"logits"`.** With the head as
+Identity, that tensor is `(B, L, 1024)`, not vocab-width. Trainer's evaluation
+loop would accumulate one per record on the GPU, so
+`prediction_loss_only=True` in
+[loop.py](../src/fa_ocr_lora/training/loop.py) is a **requirement**, not an
+optimisation.
+
+`loss_chunk_rows` was swept at 128 / 64 / 32 and gave peaks of 1794 / 1807 / 1807
+MiB — identical within noise. **Lowering it cannot rescue an OOM**; it is exposed
+only because the null result is worth being able to reproduce.
+
+### Trainer assumptions this run breaks
+
+Four, each with its counter in [loop.py](../src/fa_ocr_lora/training/loop.py):
+
+- **`model_accepts_loss_kwargs` is forced to `False`.** `forward(self, *,
+  labels=None, **inputs)` has a `VAR_KEYWORD` parameter, from which Trainer infers
+  that the model accepts loss kwargs — and then switches to sum-of-tokens
+  normalisation *and* passes `num_items_in_batch` through to the base decoder. Our
+  loss is already a mean over supervised tokens, so the classic
+  divide-by-accumulation-steps path is the correct one. Left alone, gradients come
+  out inflated by the accumulation factor.
+- **`_save` writes the adapter and nothing else.** The wrapper is neither a
+  `PreTrainedModel` nor a `PeftModel`, so the default `_save` would write the full
+  1.7 GB base three times over. It also deliberately does not write
+  `training_args.bin`: resume never reads it, and the version-controlled YAML is a
+  better hyperparameter record than a pickled dataclass.
+- **VRAM is injected by overriding `log`, not from a callback.** Callbacks run
+  *after* the `log_history` entry is copied, so a callback mutating `logs` would
+  change neither the printed line nor the recorded history.
+- **The sampler's epoch is advanced by an explicit callback.** Accelerate usually
+  forwards `set_epoch`, but only when the batch sampler nests the way it expects.
+  If that forwarding stops, every epoch replays the identical order — which looks
+  like nothing at all in the logs and quietly halves the value of epoch two.
+
+### The generation config, not the model config, decides the KV cache
+
+`load_eval_model` sets `use_cache` in two places and the second one is what
+actually does the work. `generate` reads `use_cache` off the model's **generation**
+config and passes it into the forward kwargs, where it overrides whatever
+`model.config.use_cache` says — and this model ships `generation_config.json` with
+`use_cache: false`. Setting only `config.use_cache = True`, which is the obvious line
+to write, changes nothing at all.
+
+What that costs is worth stating, because nothing about it looks like a failure: the
+eval completes, every record is scored, and the CER is correct. Measured on one
+validation page with a 1,273-token prompt:
+
+| `generation_config.use_cache` | Marginal cost per generated token |
+| --- | --- |
+| `false` (as the model ships) | **795 ms** |
+| `true` | **14 ms** |
+
+A factor of 57, because without a cache every decode step re-forwards the entire
+prompt *and* re-runs the vision tower over the page. In wall-clock terms, the
+`eval.max_samples: 300` default is ~75 minutes with the cache and most of a day
+without it. The first baseline run made here predated the fix and took 622 s to
+score four records; that figure is recorded only as a warning.
+
+### LoRA targets are full module paths
+
+The vision tower and the decoder both have `q_proj` / `k_proj` / `v_proj`. Passing
+those suffixes to PEFT adapts **both**, which contradicts freezing the tower and
+roughly doubles the adapter. Targets are therefore resolved as full paths under
+`model.layers.` — 126 decoder projections, plus the embedding and head for 128
+adapted modules — and `assert_frozen` fails the run if anything under `visual.` or
+`mlp_AR.` comes back trainable.
+
+### Digit oversampling by index expansion
+
+The metadata block (شماره ثبت / تاریخ / پیوست) is CLAUDE.md §5.2's
+highest-priority field and is almost entirely digits, so digit-dense records are
+oversampled. This is done by **repeating indices** in the sampler's index list,
+not with `WeightedRandomSampler`: repetition composes with length-grouped
+batching, is exactly reproducible from the seed, and makes one epoch a definite
+number of steps. Sampling with replacement gives up all three.
+
+### Manifest details worth knowing
+
+- **`image_path` in `all_features_metadata.csv` is stale** for part of the corpus
+  and is not trusted; paths are rebuilt from the row's own identifiers. Records
+  that still do not resolve are counted and logged.
+- **The pixel CSV must be parsed as CSV.** It is UTF-8 **with BOM**
+  (`encoding="utf-8-sig"`) and its `text` column contains embedded newlines, so
+  any line-by-line read silently corrupts it. `labels.csv` in the same directory
+  is header-only and must not be used.
+- **`crop_type_weights` is a quota, not a probability.** Region types are given
+  shares of the crop budget, unmet shares are redistributed to types that still
+  have candidates, and both the taken and available counts are printed — so
+  "`metadata_field` wanted 900 and the corpus only had 640" is visible rather
+  than inferred from a short manifest.
+- **`_MAX_HOLDOUT_SHARE` caps the validation split** relative to the corpus, so a
+  `--limit 200` smoke build cannot hold out 800 of its 200 records.
+- Splits are grouped by `group_id` — a letter's pages and crops never straddle
+  splits, and neither do rows sharing a source page — because a page seen in
+  training and scored in validation reports a number about memorisation.
+
+### Revision pin
+
+`revision: 2b77538ef936`. The current Hub head (commit `a1e4dc4c`, PR #91)
+requires transformers 5.x; the environment has 4.57.6, which is also the pin the
+notebook uses. Unpinning means the remote code can change under a resumed run —
+between two halves of the same training job.
+
+### The 10,000-record mix, as built
+
+9,197 train / 803 validation across 3,899 groups: letter pages 2,336, letter
+crops 2,337, pixel 4,524. Sequence lengths came out p50 911, p95 1847, p99 2130,
+p100 2758 — every record under the 3,072-token ceiling, so `on_oversize` never
+degrades a sample on this corpus. Both `max_total_seq_len` and the mix are YAML
+knobs; the numbers here are what the defaults produce.
+
+### Two alignments in the metrics, on purpose
+
+Error counts come from `rapidfuzz` (a true minimal edit distance, and jiwer's own
+engine); confusion pairs come from `difflib.SequenceMatcher`, whose opcodes say
+*which* character stood where. The first implementation used difflib for both, and
+it overstated CER: difflib maximises the longest matching block instead of
+minimising the edit script, so 100 identical characters with the first one wrong
+came back as an insert plus a delete — 2 errors where the answer is 1. On
+near-misses, which are exactly what a trained adapter produces, that inflates the
+rate by half. Since the confusion counter reads only equal-length replace spans,
+difflib's non-minimality there cannot invent a pair; it can only decline to report
+one.
+
+### Known rough edge
+
+`skipped_records.log` records 88,808 `crops_excluded_type` lines — by-design
+rejections from the crop quota — among which 274 genuine faults are easy to miss.
+Aggregating the by-design reasons into a count rather than a line each is
+deferred, not forgotten.
+
 ## Tooling
 
 **PEP 8 is enforced by `ruff` and `black`** at `line-length = 90`, declared in
@@ -437,3 +826,41 @@ composited material, and reproduces the logo corpus' per-file licences as
 '.[dev]'`). Where they are unavailable, `compileall` plus a column sweep is the
 fallback — but note that `awk 'length($0) > 90'` counts *bytes* and will
 over-report on Persian source; measure with Python's `len()` on decoded text.
+
+### The base model's Persian baseline: CER 1.22
+
+Scored with `eval.py --no-adapter --max-samples 50` over the pinned validation
+holdout, 584 s at 11.7 s/record, greedy, `max_new_tokens: 1024`:
+
+| Metric | Base model |
+| --- | --- |
+| CER | **1.2220** |
+| WER | **1.6410** |
+| digit CER (47 of 50 records) | **4.2063** |
+| digit exact match | **0.0000** |
+
+A CER above 1.0 is not a reporting bug and is worth explaining, because it is the
+most informative number here. CER is edit distance divided by *reference* length, so
+it exceeds 1.0 when the prediction is longer than the target — which is exactly what
+the model does on Persian: it enters repetition loops and emits far more text than the
+page contains. The digit CER of 4.2 says the same thing more sharply. Latin content on
+the same pages is transcribed correctly and verbatim ("Better Stack", "Hedera Wood &
+Furniture"), so the prompt splice and the image pipeline are right; what fails is
+Persian specifically.
+
+The confusion table names three distinct failure modes rather than one:
+
+| Expected → predicted | Count | What it is |
+| --- | --- | --- |
+| `' '` → `'‌'`, `'‌'` → `' '` | 74, 57 | Space vs. zero-width non-joiner |
+| `'ی'` → `'ي'`, `'ک'` → `'ك'` | 33 | Persian letters emitted in their Arabic forms |
+| `'ا'` → `'ल'`, `'ی'` → `'ं'`, `'گ'` → `'क'` | 18, 12, 10 | Devanagari substituted for Persian |
+
+The first is orthographic and should fall to a small amount of training. The second is
+the model reaching for the wrong language's codepoints for the same glyph shapes. The
+third is a tokenizer-level confusion between two unrelated scripts and is the clearest
+evidence that Persian is genuinely under-served in the base model.
+
+**1.2220 is the number the adapter has to beat**, and the earlier 4-record figure
+(CER 0.9059) should be ignored: it predates the KV-cache fix above and 4 records is
+not a baseline.

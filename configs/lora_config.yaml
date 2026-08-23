@@ -1,0 +1,282 @@
+# PaddleOCR-VL Persian LoRA - local training on one consumer GPU.
+#
+# Loaded by fa_ocr_lora.training.config.load_training_config, which validates
+# every key. An unknown key here is an error, not a silent no-op, so a typo
+# fails at startup rather than after two hours of training - CLAUDE.md 8.
+#
+# Sized for the development target of CLAUDE.md 9: a single consumer GPU with
+# 4 GB of VRAM (RTX 3050 Ti Laptop, compute capability 8.6) and 16 GB of system
+# RAM. Every default below was chosen against a measured memory budget, not a
+# guess; docs/decisions.md records the arithmetic. The knobs that would break
+# that budget if raised carelessly say so in their own comment.
+#
+# Machine-specific paths and secrets do not belong here. Those come from the
+# environment (FA_OCR_TRAIN_*), which overrides this file. Precedence:
+#
+#     CLI flag  >  environment  >  this file  >  dataclass default
+
+# Master seed. Per-record seeds are derived as "{seed}:{purpose}:{index}", the
+# same idiom the synthetic pipeline uses, so a manifest is reproducible from
+# (this config, seed) alone.
+seed: 1337
+
+model:
+  # HuggingFace repo of the base model. Its remote code is required: the
+  # NaViT-style vision tower and the ERNIE-4.5 decoder are not in transformers.
+  model_id: PaddlePaddle/PaddleOCR-VL
+  # Pinned, not "main", and the pin is load-bearing. The repo's remote code was
+  # rewritten in commit a1e4dc4c (Hub PR #91, 2026-03-17) to call
+  # transformers.masking_utils.create_causal_mask(inputs_embeds=...), which only
+  # exists in transformers 5.x; on the 4.57.6 installed here the call raises
+  # TypeError before a single batch runs. This commit is the last one before that
+  # rewrite. It is byte-identical to main in every respect this project depends
+  # on - chat template, image token id, min/max pixels, module tree, vocab size -
+  # all re-verified against it. Moving to main means moving to transformers 5.x,
+  # which is a separate, deliberate migration.
+  revision: 2b77538ef936
+  trust_remote_code: true
+  # sdpa needs no extra wheel and is the fastest attention available here;
+  # flash-attention-2 has no prebuilt wheel for this torch/CUDA pair.
+  attn_implementation: sdpa
+  # "auto" resolves to bfloat16 on compute capability >= 8.0 and float16 below
+  # it. Naming a dtype explicitly overrides the probe.
+  dtype: auto
+  # "nf4" quantizes the decoder, embedding and output head to 4-bit NF4 with
+  # double quantisation. Measured resident weights on this model, read from the
+  # allocator after load rather than estimated from parameter counts:
+  #
+  #     none                       ~1730 MiB   (estimate; does not fit here)
+  #     nf4, vision bf16            1510 MiB
+  #     nf4, vision quantized too    870 MiB
+  #
+  # It is the default because free VRAM here is not the card's 4 GB: a GNOME
+  # session with a file manager, a viewer and a terminal open holds 1.5-1.8 GB,
+  # leaving a measured 1984-2182 MiB that moves by ~200 MiB as windows come and
+  # go. bf16 weights alone would exhaust it.
+  quantization: nf4
+  # Quantise the frozen vision tower as well. On by default, which is a change
+  # from the first draft of this file and the one decision here worth reading
+  # twice, because it trades accuracy for feasibility:
+  #
+  # Against it - the tower is frozen, so 4-bit costs feature quality with no
+  # training to recover it, and it is the tower that does the actual reading.
+  # Inference must then quantise identically, or the adapter meets features it
+  # was not tuned on.
+  #
+  # For it - it saves 640 MiB, measured, which is more than every other lever in
+  # this file combined. With the tower in bf16 the projected peak at the
+  # sequence ceiling is ~1.95 GB against ~2.0 GB free: it fits at a quiet moment
+  # and OOMs when a browser tab opens. Nothing else closes that gap; halving the
+  # image budget does not, because weights are 1.5 GB of that 1.95 GB.
+  #
+  # Set false if you free the GPU first (log out of the desktop session, or run
+  # headless). The startup banner prints measured free VRAM against the
+  # projection, so the choice can be made from numbers rather than from this
+  # comment. docs/decisions.md records the full measurement.
+  quantize_vision: true
+  # Instruction after the image in the user turn, verbatim from the model card.
+  # The base model's other task prompts are "Table Recognition:",
+  # "Formula Recognition:" and "Chart Recognition:"; we train the OCR one, so
+  # inference sends the same string the adapter learned under.
+  task_prompt: "OCR:"
+
+paths:
+  # Letters corpus: one JSONL record per page, `image` relative to this file's
+  # directory, `label` a list of regions with bboxes.
+  letters_manifest: data/dataset/paddle_ocr_vl.jsonl
+  # Persian Pixel corpus. NOT labels.csv - that file is header-only.
+  pixel_metadata: data/persian_pixel/all_features_metadata.csv
+  # Everything the run produces: unified_manifest.parquet, checkpoints,
+  # adapter_only/, skipped_records.log, metrics.
+  output_dir: data/training/local_run
+
+data:
+  # Records drawn from each source. These four sum to the run size; raising any
+  # of them raises wall-clock roughly proportionally. Page records are the
+  # expensive ones (~1280 image tokens); crops are ~4x cheaper.
+  letters_pages: 2500
+  letters_crops: 2500
+  pixel_pages: 5000
+
+  # Validation holdout, isolated before any training and pinned by a hash of
+  # the group id, so the same records are held out on this machine and on a
+  # larger one - a pilot metric stays comparable to a full-run metric.
+  validation_size: 800
+  # Fraction of the remainder kept aside as an untouched test split. 0 disables
+  # it; the local test run does not need one, but the split column is written
+  # so a later run can use it without regenerating the manifest.
+  test_fraction: 0.0
+
+  # Region crops: `label` entries whose text is non-empty. Padding is applied
+  # around the bbox and clipped to the page. The minimums reject slivers that
+  # would carry a label but no legible glyphs.
+  crop_padding_px: 8
+  crop_min_side_px: 16
+  crop_min_area_px: 900
+  # Region types never worth cropping even when they carry text. Container and
+  # decoration boxes are already excluded by the non-empty-text rule; these are
+  # types whose text duplicates a neighbour's.
+  crop_exclude_types:
+    - header_bar
+    - footer_bar
+    - metadata_block
+    - attachments_block
+    - signature_block
+    - signature_image
+    - stamp
+
+  # How the crop budget is divided between region types. The letters corpus is
+  # badly unbalanced - 94k list_item and 60k footer_field regions against 31k
+  # metadata_field - so drawing crops uniformly would spend most of the budget on
+  # list items and repeated boilerplate. Weights are relative shares, not
+  # fractions; a type is capped by how many instances actually exist, and any
+  # unfillable share is redistributed to the types that still have surplus.
+  crop_type_weights:
+    # شماره ثبت / تاریخ / پیوست - the highest-priority field per CLAUDE.md 5.2.
+    metadata_field: 8.0
+    # Numeric and tabular content, where Persian OCR degrades worst.
+    table_cell: 4.0
+    page_number: 2.0
+    footer_field: 2.0
+    # Prose, for general layout and long-line coverage.
+    paragraph: 3.0
+    list_item: 3.0
+    subject: 2.0
+    recipient: 2.0
+    sender: 1.5
+    signatory_title: 1.5
+    heading: 1.0
+    # Boilerplate repeated across thousands of letters. A few hundred crops teach
+    # the glyph shapes; ten thousand teach nothing further.
+    header_company_name: 0.75
+    header_slogan: 0.5
+    religious_opener: 0.5
+    chart: 0.5
+  # Weight for a region type not named above, so a regenerated corpus with new
+  # types still contributes rather than disappearing without a trace.
+  crop_default_weight: 0.5
+
+  # Records shorter than this carry no usable supervision signal.
+  min_text_chars: 2
+  # Guards against a runaway transcription blowing the sequence budget before
+  # the encoder even sees it; p95 of the letters corpus is ~1850 chars.
+  max_text_chars: 6000
+
+  # Digit-density oversampling. Persian OCR fails hardest on numerals, so the
+  # top quartile of digit density is repeated. 1.0 disables the reweighting.
+  digit_oversample_multiplier: 2.0
+
+image:
+  # Effective pixel ceiling per image, in pixels. 1_003_520 = 1280 image tokens
+  # exactly (784 px per token: patch_size 14 squared, times merge_size 2
+  # squared), which is A4 at ~107 DPI. Raising this is the fastest way to OOM
+  # a 4 GB card: cost grows linearly in tokens and the attention term grows
+  # faster than that.
+  max_pixels: 1003520
+  # Floor, matching the processor's own min_pixels. A small crop is upscaled to
+  # it rather than fed as a handful of patches, which is what the base model
+  # was trained to expect.
+  min_pixels: 147384
+  # Clamp max_pixels down when the GPU reports less free memory than this run
+  # assumes - a desktop session on the same card can hold several hundred MiB.
+  # Set false to trust max_pixels exactly as written. Note this is the weakest of
+  # the three memory levers: weights dominate the peak, so clamping keeps a run
+  # alive on a busy desktop but cannot rescue a configuration that never fit.
+  autoprobe_vram: true
+  # Override the projected peak requirement, in MiB. 0 means "use the measured
+  # coefficients in training/vram.py", which is right on this card and this
+  # model. Set a number when running on hardware those measurements do not
+  # describe, so the startup banner and the autoprobe clamp reason from your
+  # figure rather than from one taken on an RTX 3050 Ti.
+  reserved_vram_mib: 0
+
+  # Total prompt+answer sequence length, image placeholders included. Measured
+  # over the built manifest, the corpus reaches p50 911, p95 1847, p99 2130 and
+  # p100 2758, so 3072 is a ceiling nothing actually touches - which is the point:
+  # no sample is degraded by on_oversize, and the budget below is a real bound
+  # rather than an aspiration.
+  max_total_seq_len: 3072
+  # Rows of the vocabulary projection computed at once when scoring the answer.
+  # The output head is 103_424 wide and cross-entropy upcasts its logits to
+  # float32, so materialising a whole answer at once costs more than the
+  # quantised weights; projecting in chunks and recomputing each in backward
+  # makes that cost independent of answer length.
+  #
+  # Do not expect lowering this to rescue an OOM. Measured at 128, 64 and 32 rows
+  # the peak was 1794/1807/1807 MiB at seq 1600 - identical to within noise,
+  # because once the projection is sliced to supervised positions it is no longer
+  # what sets the peak. 128 is kept because it is the fastest of the three.
+  loss_chunk_rows: 128
+  # What to do when a record still does not fit: shrink_image re-resizes to the
+  # largest budget that does fit and keeps the sample, truncate_text cuts the
+  # target, skip drops and logs it. shrink_image loses resolution; the other
+  # two lose supervision, which is worse.
+  on_oversize: shrink_image
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  bias: none
+  # Attention and MLP projections of the ERNIE decoder. Matched by suffix
+  # against decoder module paths only - the vision tower is excluded by path,
+  # not by name, because it uses the same suffixes and must stay frozen.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  # The embedding and output head carry the Persian glyph and digit vocabulary,
+  # so they are adapted too - at a lower learning rate (see optim). Dropping
+  # them shrinks the adapter but costs most of the digit gain.
+  adapt_embeddings: true
+  adapt_lm_head: true
+
+optim:
+  learning_rate: 2.0e-4        # attention and MLP LoRA
+  embed_head_learning_rate: 7.0e-5  # embed_tokens and lm_head, deliberately lower
+  weight_decay: 0.01
+  warmup_ratio: 0.08
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  num_epochs: 2.0
+  # Batch 1 is not a tuning choice on 4 GB: two images of different sizes
+  # cannot share a batch without padding the patch grid, and one A4 page at
+  # 1280 tokens already dominates the activation budget.
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  # "auto" picks paged_adamw_8bit when bitsandbytes imports and
+  # adamw_torch_fused when it does not.
+  optimizer: auto
+  gradient_checkpointing: true
+
+runtime:
+  # 2 workers on 16 GB of RAM: each holds a decoded page (~6 MB) plus the
+  # processor's float32 patch tensor, and the main process needs headroom.
+  dataloader_workers: 2
+  logging_steps: 10
+  save_steps: 200
+  save_total_limit: 3
+  eval_steps: 200
+  resume_from_checkpoint: true
+  # Restrict to a handful of samples and a couple of steps, to prove the wiring
+  # end to end in under a minute. Overridden by --smoke.
+  smoke_test: false
+  smoke_samples: 16
+  smoke_steps: 2
+  # Measure seconds/step and peak VRAM over this many steps, then stop without
+  # training. 0 disables; --probe N sets it from the CLI.
+  probe_steps: 0
+
+eval:
+  # Records scored by eval.py. null means the whole validation split.
+  max_samples: 300
+  max_new_tokens: 1024
+  # Greedy: an OCR target has one correct answer, and sampling would make the
+  # CER depend on the seed.
+  num_beams: 1
+  # How many substitution pairs the confusion summary prints.
+  confusion_top_k: 20

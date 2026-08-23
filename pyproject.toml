@@ -33,6 +33,29 @@ dependencies = [
 text = ["openai>=1.30", "requests>=2.31"]
 # Training and evaluation, installed separately per CLAUDE.md 3.
 train = ["paddlepaddle-gpu>=2.6", "paddlenlp>=3.0"]
+# Local LoRA training on one consumer GPU (src/fa_ocr_lora/training/). Distinct
+# from `train` above: that extra is the PaddlePaddle/ERNIEKit path, this one is
+# the transformers + PEFT path the 4 GB RTX 3050 Ti run actually takes - see
+# docs/decisions.md. torch is intentionally left to a lower bound rather than
+# pinned: the wheel has to match the machine's CUDA build, so install it first
+# (`pip install torch --index-url ...`) and this extra second.
+local-train = [
+    "torch>=2.4",
+    "torchvision>=0.19",     # PaddleOCR-VL's remote processor code imports it
+    "transformers>=4.57,<5",  # 5.x changes the remote-code contract; see the pin
+    "accelerate>=0.34",
+    "peft>=0.13",
+    "safetensors>=0.4",
+    "jiwer>=3.0",            # CER/WER in training/metrics.py
+    "rapidfuzz>=3.0",        # jiwer's own edit-distance engine, used directly
+    "pandas>=2.0",
+    "pyarrow>=15",           # unified_manifest.parquet
+]
+# NF4 quantisation of the base model, which is what brings the weights to
+# 870 MiB and makes 4 GB workable. Separate extra because the wheel is
+# CUDA-specific and a bf16 run needs none of it: `quantization: none` in the YAML
+# skips the import entirely.
+quant = ["bitsandbytes>=0.43"]
 # Google Drive upload for the Colab training handoff (scripts/upload_to_drive.py).
 drive = [
     "google-api-python-client>=2.140",
@@ -55,6 +78,10 @@ dev = [
 [project.scripts]
 fa-ocr-lora = "fa_ocr_lora.inference.predict:main"
 fa-ocr-synth = "fa_ocr_lora.dataset.synth.pipeline:main"
+# The local training path, in the order they are meant to be run.
+fa-ocr-manifest = "fa_ocr_lora.training.prepare_manifest:main"
+fa-ocr-train = "fa_ocr_lora.training.train_lora:main"
+fa-ocr-eval = "fa_ocr_lora.training.eval:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -69,11 +96,24 @@ where = ["src"]
 [tool.black]
 line-length = 90
 target-version = ["py310"]
+# notebooks/*.py are jupytext cell sources, not library modules, and their line
+# layout is deliberate: a config cell is read and edited at a glance, so
+# `SMOKE_TEST = False  # comment` has to stay one line. black at 90 columns
+# rewrites that into a three-line parenthesised block, which reads worse inside a
+# notebook cell than the long line did. ruff still lints these files - see
+# [tool.ruff.lint.per-file-ignores] below. force-exclude rather than exclude, so
+# the skip also holds when the path is passed explicitly (pre-commit does that).
+force-exclude = '^/notebooks/.*\.py$'
 
 [tool.ruff]
 line-length = 90
 target-version = "py310"
 src = ["src", "test"]
+# ruff lints .ipynb natively, but notebooks/*.ipynb is a build artefact generated
+# from notebooks/*.py by scripts/build_training_notebook.py. Its cells are copies
+# of already-linted source, so any finding there is a duplicate of a finding in
+# the .py - and the per-file-ignores below cannot apply, since they key on *.py.
+extend-exclude = ["notebooks/*.ipynb"]
 
 [tool.ruff.lint]
 select = [
@@ -97,6 +137,30 @@ ignore = [
 # noise without adding information.
 "test/*" = ["D100", "D101", "D102", "D103", "ANN"]
 "scripts/*" = ["D100", "D103"]
+# notebooks/*.py are jupytext "percent format" sources: one linear script whose
+# `# %%` blocks become notebook cells (see scripts/build_training_notebook.py).
+# The exemptions below are notebook idiom, not slack:
+#   E501      - cells are written to roughly 110 columns, matching Jupyter's own
+#               editor width rather than the library's 90; the markdown table rows
+#               in the cell headers cannot be wrapped at all without breaking the
+#               table. black is excluded from these files for the same reason.
+#   E402/F811 - every cell re-imports what it uses so it can be re-run alone.
+#   D100      - the module docstring's job is done by the leading markdown cell.
+#   D102/D105/D107, ANN001/ANN003/ANN204 - Trainer/Callback/Sampler overrides
+#               have signatures fixed by upstream (`*args, **kwargs` hooks) and
+#               dunders whose behaviour is stated in the class docstring.
+"notebooks/*.py" = [
+    "E501",
+    "E402",
+    "F811",
+    "D100",
+    "D102",
+    "D105",
+    "D107",
+    "ANN001",
+    "ANN003",
+    "ANN204",
+]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

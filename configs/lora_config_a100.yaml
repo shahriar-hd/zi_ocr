@@ -1,0 +1,240 @@
+# PaddleOCR-VL Persian LoRA - full training run on one A100 40 GB.
+#
+# A sibling of lora_config.yaml, not a replacement. That file is sized for the
+# 4 GB RTX 3050 Ti development target of CLAUDE.md 9 and every default in it is
+# a concession to that budget; this one removes the concessions and trains on
+# the whole corpus. Load it explicitly:
+#
+#     CONFIG=configs/lora_config_a100.yaml scripts/train_local.sh probe
+#
+# or via FA_OCR_TRAIN_CONFIG. The same loader validates both, so an unknown key
+# here is still a startup error rather than a silent no-op (CLAUDE.md 8).
+#
+# The numbers below are REASONED, NOT MEASURED. Every figure in
+# lora_config.yaml was measured on the development card; nothing here has run on
+# an A100, and training/vram.py's coefficients were fitted on the 3050 Ti, so its
+# startup projection does not describe this hardware. Run
+#
+#     CONFIG=configs/lora_config_a100.yaml scripts/train_local.sh probe
+#
+# first. It reports real seconds/step and real peak VRAM in a few minutes, and
+# that number - not this file - should decide the batch size and epoch count.
+
+# Same master seed as the local run, deliberately: the validation holdout is
+# pinned by a hash of the group id, so an unchanged seed and validation_size
+# hold out the same records here as on the laptop and the pilot CER stays
+# directly comparable to the full-run CER.
+seed: 1337
+
+model:
+  model_id: PaddlePaddle/PaddleOCR-VL
+  # Still pinned, and for the same reason: revision a1e4dc4c (Hub PR #91) calls
+  # transformers.masking_utils.create_causal_mask(inputs_embeds=...), which
+  # exists only in transformers 5.x. Unpin this only as part of a deliberate
+  # transformers 5 migration, and on both configs at once.
+  revision: 2b77538ef936
+  trust_remote_code: true
+  # sdpa is kept as the default because it needs no extra wheel. On an A100
+  # flash-attention-2 does have prebuilt wheels and is the one substitution here
+  # worth making if `pip install flash-attn` succeeds - set
+  # attn_implementation: flash_attention_2 and re-probe. The config accepts any
+  # string transformers accepts, so no code change is needed.
+  attn_implementation: sdpa
+  # A100 is compute capability 8.0, so "auto" resolves to bfloat16.
+  dtype: auto
+  # The headline change. NF4 exists in the local config to fit 4 GB, and it is
+  # not free: 4-bit matmuls dequantise on every forward, so it costs throughput,
+  # and the frozen vision tower - the part that does the actual reading - loses
+  # feature quality with no training to recover it. With 40 GB there is no
+  # reason to pay either cost. bf16 weights are ~1.73 GB of a 40 GB card.
+  quantization: none
+  # Moot while quantization is none, but set false explicitly so that flipping
+  # quantization back on for an experiment does not silently also 4-bit the
+  # tower.
+  quantize_vision: false
+  task_prompt: "OCR:"
+
+paths:
+  letters_manifest: data/dataset/paddle_ocr_vl.jsonl
+  pixel_metadata: data/persian_pixel/all_features_metadata.csv
+  # A separate directory from the local run, so a pilot's manifest, checkpoints
+  # and metrics are not overwritten by the full run and the two stay comparable.
+  output_dir: data/training/a100_run
+
+data:
+  # The whole corpus. A quota larger than the supply is capped at what exists
+  # (manifest._allocate takes min(limit, available)), so these are ceilings
+  # rather than assertions about the corpus size:
+  #
+  #     letters_pages   26,848 pages exist (from 10,000 letters)
+  #     letters_crops   200k+ croppable regions exist; 60,000 is a weighted draw
+  #                     that keeps metadata_field over-represented rather than
+  #                     letting 94k list_item regions dominate
+  #     pixel_pages     6,145 rows exist
+  #
+  # ~93k records against the local run's 10k. Wall-clock scales roughly with
+  # this number, which is what the probe is for.
+  letters_pages: 26848
+  letters_crops: 60000
+  pixel_pages: 6145
+
+  # Unchanged from the local config on purpose - see the seed comment above.
+  # Raising it would hold out different records and break the comparison.
+  validation_size: 800
+  # A full run is worth a real untouched test split; the local pilot was not.
+  # Carved from the remainder after validation, so validation is unaffected.
+  test_fraction: 0.05
+
+  crop_padding_px: 8
+  crop_min_side_px: 16
+  crop_min_area_px: 900
+  crop_exclude_types:
+    - header_bar
+    - footer_bar
+    - metadata_block
+    - attachments_block
+    - signature_block
+    - signature_image
+    - stamp
+
+  # Same relative weights as the local config. They are shares, not counts, so
+  # they carry over unchanged to a larger budget: the weights sum to 32.25, so
+  # metadata_field's 8.0 claims ~25% of the crop budget - about 14,900 crops of
+  # the ~31k metadata_field regions that exist, against the ~3% share its natural
+  # frequency would give it.
+  crop_type_weights:
+    metadata_field: 8.0
+    table_cell: 4.0
+    page_number: 2.0
+    footer_field: 2.0
+    paragraph: 3.0
+    list_item: 3.0
+    subject: 2.0
+    recipient: 2.0
+    sender: 1.5
+    signatory_title: 1.5
+    heading: 1.0
+    header_company_name: 0.75
+    header_slogan: 0.5
+    religious_opener: 0.5
+    chart: 0.5
+  crop_default_weight: 0.5
+
+  min_text_chars: 2
+  max_text_chars: 6000
+  digit_oversample_multiplier: 2.0
+
+image:
+  # Full page resolution, which the 4 GB card could not afford. 2,175,600 =
+  # 2775 image tokens exactly (784 px per token), and the corpus's largest page
+  # is 1240x1754 = 2,174,960 px, so every letter now passes through the
+  # processor UNSCALED. The local run downscales A4 to ~107 DPI; this is the
+  # single change most likely to improve CER, because the metadata block's
+  # digits are small glyphs and downscaling is where they are lost.
+  max_pixels: 2175600
+  min_pixels: 147384
+  # Off, not on. Autoprobe exists to rescue a run competing with a desktop
+  # session for 4 GB; on a dedicated 40 GB card there is nothing to clamp for,
+  # and leaving it on would let vram.py's 3050 Ti coefficients silently reduce a
+  # resolution that was chosen deliberately.
+  autoprobe_vram: false
+  # 0 keeps the measured-coefficient projection, which is wrong for this card in
+  # the harmless direction: it under-projects against 40 GB of headroom, so it
+  # never clamps and never warns. Treat the startup banner's "projected" figure
+  # as uncalibrated here and trust the probe's measured peak instead. Set this
+  # to the probe's peak once measured, and the banner becomes meaningful again.
+  reserved_vram_mib: 0
+
+  # Raised to hold the larger image budget. 2775 image tokens leaves ~1300 for
+  # text, against a measured corpus p100 of 2758 total tokens at the old
+  # resolution - so text is not the binding constraint, the image is. The loader
+  # rejects a max_pixels whose token count reaches this value, which is the
+  # check that keeps the two in step.
+  max_total_seq_len: 4096
+  # Raised from 128. The chunking exists to bound the float32 (rows x 103,424)
+  # logit tensor, and at batch 8 a step supervises several thousand positions;
+  # larger chunks mean fewer checkpoint boundaries and less recompute. 1024 rows
+  # of float32 logits is ~400 MiB, trivial here and expensive on 4 GB.
+  loss_chunk_rows: 1024
+  on_oversize: shrink_image
+
+lora:
+  # Adapter shape unchanged. It is not memory-bound on either card - 9.39M
+  # trainable parameters is 1.52% of the model - so there is no reason to widen
+  # it just because the GPU is larger. Widen it only if evaluation shows the
+  # rank is the limit, per CLAUDE.md 6.
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  adapt_embeddings: true
+  adapt_lm_head: true
+
+optim:
+  # Learning rates carry over unchanged BECAUSE the effective batch size does:
+  # 8 x 2 = 16, the same as the local run's 1 x 16. That is the reason for this
+  # particular split rather than batch 16 x 1 - it keeps 2.0e-4 a rate that has
+  # already been observed to train stably rather than an untested guess.
+  learning_rate: 2.0e-4
+  embed_head_learning_rate: 7.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.08
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  num_epochs: 2.0
+  # Real batching, which 4 GB could not do. collate_samples right-pads ids,
+  # labels and mask and concatenates pixel_values along dim 0 with one
+  # image_grid_thw row per image, so the vision tower splits them apart
+  # correctly; and the sliced loss shifts each row before flattening, so no
+  # gradient crosses a sample boundary. Both paths are batch-correct but have
+  # only ever run at batch 1 here - the probe is also what exercises them.
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 2
+  # Named explicitly rather than "auto": auto prefers paged_adamw_8bit whenever
+  # bitsandbytes imports, and paging optimizer state to host RAM buys nothing
+  # against 40 GB while costing PCIe traffic on every step. Fused AdamW over
+  # 9.39M trainable parameters is ~75 MiB of state.
+  optimizer: adamw_torch_fused
+  # Off. Checkpointing trades ~30% throughput for activation memory, which is
+  # the correct trade at 4 GB and the wrong one at 40. Note this only disables
+  # decoder-wide recompute: the loss chunks stay checkpointed unconditionally,
+  # which is cheap and keeps the vocabulary projection bounded.
+  #
+  # This is the first knob to flip back if the probe OOMs.
+  gradient_checkpointing: false
+
+runtime:
+  # An A100 host has the cores and the RAM for real prefetch, and at batch 8 of
+  # full-resolution pages the processor's float32 patch tensors are the bottleneck
+  # to beat - starve the loader and the GPU idles.
+  dataloader_workers: 8
+  logging_steps: 20
+  # ~87.6k training records after the holdout and the test split, ~109.5k samples
+  # per epoch once digit-dense records are repeated, so ~6,800 steps per epoch at
+  # effective batch 16 - against ~720 locally. The local cadence would write a
+  # checkpoint every couple of minutes.
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 500
+  resume_from_checkpoint: true
+  smoke_test: false
+  smoke_samples: 16
+  smoke_steps: 2
+  probe_steps: 0
+
+eval:
+  # The whole 800-record holdout, not a 300-record sample. At the measured 14 ms
+  # per generated token with the KV cache enabled this is minutes on an A100,
+  # and a full-split number is what a released adapter should be quoted at.
+  max_samples: null
+  max_new_tokens: 1024
+  num_beams: 1
+  confusion_top_k: 20
