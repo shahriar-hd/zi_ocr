@@ -864,3 +864,331 @@ evidence that Persian is genuinely under-served in the base model.
 **1.2220 is the number the adapter has to beat**, and the earlier 4-record figure
 (CER 0.9059) should be ignored: it predates the KV-cache fix above and 4 records is
 not a baseline.
+
+## Sensitive-field validation
+
+[src/fa_ocr_lora/validation/](../src/fa_ocr_lora/validation/) exists because the
+baseline above is exactly the kind of number this project cannot be steered by. A
+page is ~700 characters of prose against ~20 characters of شماره ثبت and تاریخ, so
+a model that reads every digit of the metadata block wrong still moves the CER by
+about three points — inside the noise of a prose improvement. CLAUDE.md §5.2 calls
+that block the highest-priority field, and a metric that cannot see it is not a
+metric for this project.
+
+### Four verdicts per field, never averaged into one
+
+Each sensitive field gets four independent answers, and the report keeps them in
+four separate columns:
+
+| Question | Needs the reference | Survives to production |
+| --- | --- | --- |
+| Is the value well formed? | no | yes |
+| Is it internally consistent? | no | yes |
+| How certain was the model? | no | yes |
+| Does it match the truth? | **yes** | no |
+
+Collapsing these into a single per-field score would be the same mistake as CER at
+a smaller scale. They fail for different reasons and are fixed by different work:
+a malformed value is a decoder that lost the field, a calendar-invalid date is a
+misread digit provable with no ground truth, low confidence on a correct value is
+the one signal that tells a human *which page to re-check*, and only the last needs
+a transcription to compare against. Three of the four are the whole point — they
+are what makes an error traceable on a document nobody has ever transcribed.
+
+The reference-based answer is itself reported twice, as `exact` and as
+`digits_equal`. A تاریخ read as `1403/05/12` instead of `۱۴۰۳/۰۵/۱۲` has every
+digit right and the wrong numeral family; that is a normalisation bug, fixed
+nowhere near the vision tower. Folding it in with a genuinely misread digit leaves
+nobody able to tell which of the two problems they have, so it gets its own fault
+name (`script_only`) and its own column.
+
+### No checksums — the corpus has no valid ones to check
+
+The obvious design here is a modulo-11 check on کد ملی and a validation rule for
+شماره ثبت. Neither is in the code, on instruction and on evidence.
+
+The corpus generates `national_id` as a uniformly random 10-digit number. A
+modulo-11 check would therefore condemn ~91% of the **ground truth**, and a metric
+that fires on nine records in ten says something about the generator, not the
+model. The user's direction was explicit — *«اصلا اعتبار کد ملی مهم نیست فقط چک
+کردن یکی بودن اعداد»* — so the checksum code was removed outright rather than left
+behind a flag. What replaces it is what is checkable with no reference: whether the
+value is one digit repeated (`all_digits_identical`), which is the signature of a
+decoder stuck in a loop and the failure this model actually exhibits, per the
+repetition loops in the baseline above.
+
+`شماره ثبت` gets the same treatment for a different reason: there is no national
+standard to match. It is an organisational convention — this corpus emits a bare
+five-digit number — so the "official pattern" the request asks for is a
+**configurable regex** in [field_validation.yaml](../configs/field_validation.yaml)
+rather than a constant in a module (CLAUDE.md §8). Deployments with a real
+registration format edit the YAML; the audit arithmetic does not change.
+
+`جلالی` dates are the one field where a real internal check exists, and it is kept:
+Esfand has 29 days in a common year and 30 in a leap one, so `۱۴۰۲/۱۲/۳۰` is
+provably a misread while `۱۴۰۳/۱۲/۳۰` is a real date. That is a genuine
+reference-free verdict, which is why `jalali_date` is a check and modulo-11 is not.
+
+### Corpus bug this check found: Esfand 30 in a common year
+
+`synthesize_jalali_date` draws `day = rng.randrange(1, 31)` for every month, while
+its own docstring claims *"Day is capped at 30 so the date stays valid in every
+Jalali month"*. It is not: of 1400–1404 only 1403 is leap, so Esfand 30 in the
+other four years is a date that never existed, and ~0.22% of generated dates carry
+one. Small, and it is training the model on impossible dates — the fix belongs in
+the generator, not in the audit, so the audit reports it rather than tolerating it.
+
+Separately, the corpus labels an 11-digit **شناسه ملی** (a legal-entity identifier)
+as **کد ملی** (10-digit, personal). The field patterns accept what the corpus
+actually emits, so the audit measures the model rather than the mislabelling; both
+are recorded here because a regenerated corpus should fix them together.
+
+### Labels are sorted longest-first, globally
+
+`شماره` (letter_number) is a prefix of `شماره ثبت` (registration_number), and
+Python's alternation returns the *first* branch that matches at a position. Sorted
+per field, or not sorted at all, every registration number in the corpus is
+recorded as a letter number — and the highest-priority field reports a perfect
+score it never earned, silently. The ordering is over every label of every field at
+once, and [test_validation_fields.py](../test/test_validation_fields.py) pins it.
+
+The empty separator is load-bearing for the same reason. `vocabulary_fa.yaml` draws
+`":"` 62% of the time, `""` (whitespace alone, as a letterhead aligning values in a
+column does) **20%**, `"ـــــ"` 10% and `"....."` 8%. An extractor that cannot
+cross whitespace reports a fifth of every field in the corpus as "label present, no
+readable value" — a twenty-point malformation rate with no model involvement at
+all. The four separators in the config are exactly those four, and a test asserts
+the set equality in both directions.
+
+### Confidence comes from a `LogitsProcessor`, and only under greedy decoding
+
+`output_scores=True` would answer the same question and cost 103,424 floats per
+step: ~424 MiB of fp32 over a 1,024-token answer, on a card with 4,096 MiB total
+and ~1,980 free. A `LogitsProcessor` reduces each step to four numbers — top
+logprob, entropy, the margin to the runner-up, and the token id — for ~32 bytes per
+step, which is why the audit adds no generation cost and no memory pressure to the
+existing eval.
+
+That measurement is only valid under greedy decoding. The processor sees the
+distribution, not the sampler's draw, so under `do_sample` or beam search the token
+it records as chosen is the argmax while the token actually emitted is something
+else — the reported certainty would describe a reading that never happened.
+`recorder_for` returns `None` for `num_beams != 1` or `do_sample`, and the report
+prints "not recorded" rather than a plausible number. `eval.num_beams: 1` is
+already the default for CER reproducibility; this is a second reason not to raise
+it, and the YAML comment says so.
+
+Two numerical details are deliberate. `log_softmax` runs in `float32` regardless of
+model dtype, because bf16 has ~3 decimal digits of mantissa and can reorder the top
+two candidates — which is precisely what `margin` measures. Entropy uses `nansum`,
+because a masked token contributes `0 * -inf = NaN` whose true contribution is 0,
+and one masked token would otherwise turn a whole page's entropy into NaN.
+
+### The threshold is on the weakest token, not the mean
+
+A registration number is wrong if any single digit is wrong. Averaged over five
+confident digits and one guess, a field the model half-invented reads as confident,
+so `confidence_floor` is compared against `min_logprob` — the weakest token in the
+span. The mean is still reported, because the two together say something neither
+says alone: a high mean with a low minimum is one bad digit, and both low is a
+field the model never had.
+
+`0.5` is a reviewable rate, not a calibrated threshold. Nothing is calibrated until
+a trained run shows where the probability mass actually sits; the flag exists so
+that number can be found.
+
+Mapping a field's character offsets onto the tokens that produced it needs one
+incremental detokenisation per generated token, which is why `LazySpanConfidence`
+defers the whole map until a field is actually queried: a prediction with no fields
+in it — a repetition loop, an empty answer — is exactly the case where the work
+would be wasted. It also makes `normalize_digits` length-preservation load-bearing
+rather than cosmetic; a normalisation that shifted offsets by one character would
+attribute a digit's uncertainty to its neighbour, silently and only on the fields
+that matter most.
+
+### Asymmetric denominators, stated rather than hidden
+
+Extraction rates (`recall`, `exact_rate`, `digit_rate`) are over **reference**
+fields; malformation and low-confidence rates are over **predicted** fields. That
+asymmetry is not an oversight. With `found` as the denominator a model that emits
+only the fields it is sure of would outscore one that attempts them all, so
+omission has to be an error rather than an abstention. Malformation, conversely,
+is a fault that exists in production where there is no reference at all, so its
+natural denominator is what the model produced.
+
+Two consequences worth knowing when reading a report: a field the model located but
+could not read counts as **found** — `recall` measures location, and
+`malformed_rate` is the column that says whether it was readable — and a malformed
+prediction is deliberately *not* also counted as a mismatch, because it cannot
+equal the reference and two findings would double the count. The malformed finding
+carries both sides, so nothing is lost.
+
+### The report embeds the rules that produced it
+
+`FieldAudit.to_dict()` writes the patterns, labels and separators into the saved
+JSON rather than a path to them. A field-validity rate is uninterpretable without
+the pattern that defined validity, and the file on disk may have changed by the
+time anyone reads the number. Findings are capped at `max_findings: 200` for the
+summary JSON — enough to review by hand — but the ones past the cap are **counted**
+(`findings_dropped`) and every fault is in `eval_predictions.jsonl` per record,
+uncapped. A truncated list must never read as a clean run (CLAUDE.md §5.1).
+
+### The package is split so Phase 3 can import it
+
+Everything except [recorder.py](../src/fa_ocr_lora/validation/recorder.py) is free
+of torch and transformers, and `validation/__init__.py` re-exports only that
+torch-free surface. The reason is Phase 3: the inference library has to apply the
+*identical* patterns to production documents, and a rule set that can only be
+imported alongside the training stack would be reimplemented instead — at which
+point the two would drift, and the production audit would stop describing the
+measured one. The report never sees a tokenizer either; it takes a
+`Callable[[int, int], FieldConfidence | None]`, which is what keeps the boundary
+honest rather than merely intended.
+
+### A label is not a field until something field-shaped follows it
+
+The first run of the audit over the reference text of all 10,000 manifest rows
+reported **97.2% of `date` findings as malformed** — on ground truth, where the
+model cannot be at fault. A metric that condemns the corpus it was built to
+measure is worse than no metric: it makes the model's real errors unfindable
+inside its own noise, which defeats the traceability the audit exists for.
+
+Two independent causes, both measured before either was fixed.
+
+**Every label in `configs/field_validation.yaml` is also an ordinary Persian
+word.** `در تاریخ ۱۳۸۹ مبنی بر این موضوع مکاتبه شد` is a sentence; `تاریخ پایان
+پروژه` is a heading; `شماره تماس: ۰۲۱-۷۷۷۷۷۷۷۷` is a phone number that happens to
+begin with the letter-number label. Bucketing the malformed findings by shape put
+**67% of them** in that one category. `require_field_context: true` suppresses
+them, via `_introduces_a_field`, on two signals that both exploit the fact that
+all five audited fields have numeric values: an explicit separator directly after
+the label (somebody wrote `تاریخ:`, so whatever follows is a field attempt and
+junk after it stays a finding), or failing that, the label opening its line *and*
+a digit next — the column-aligned layout the empty separator exists for. Both
+halves of the second signal are needed: prose runs mid-line, and a label followed
+by another *word* is the label used as a word.
+
+What makes the rule safe is where it is consulted: only after the value pattern
+has already failed. A label followed by a well-formed value is a field by
+demonstration and never reaches the rule, so no *readable* field can be
+suppressed. That is a strong enough claim to be worth proving rather than
+asserting — extracting all 10,000 rows with the rule on and off produces
+**identical** well-formed field lists, 7,658 fields on both sides, 0 rows where
+the two differ. If it were wrong the audit would quietly stop measuring real
+fields and report a better score for it.
+
+**The `date` pattern described one of the four forms this corpus writes.** It
+accepted year-first numeric only. Also present: day-first numeric
+(`۲۷/۰۹/۱۴۰۳`), a spelled-out month (`۲۲ مهر ۱۴۰۳`, 11.7% of dated labels), and a
+spelled month punctuated like the numeric form (`۲۷/مهر/۱۴۰۳`). All four are now
+in the pattern and in `parse_jalali_date`, which resolves them to one
+`(year, month, day)` triple — from the values, not by assumption: no Jalali month
+number exceeds 12, so a leading group above it can only be a day, and a
+four-digit group can only be the year. `parse_jalali_date` returning `None` means
+**undecidable, not invalid**; the validity question stays in
+`jalali_date_is_valid`, so an unparseable value is never reported as an
+impossible day.
+
+Reference-side malformation rate, before and after:
+
+| Field | Before | After |
+| --- | --- | --- |
+| `date` | 4732/4866 = **97.2%** | 3/2252 = **0.1%** |
+| `letter_number` | 1054/4414 = 23.9% | 5/3365 = 0.1% |
+| `registration_number` | 137/615 = 22.3% | 1/479 = 0.2% |
+| `national_id` | 31/239 = 13.0% | 7/215 = 3.3% |
+| `amount` | 0/1363 = 0.0% | 0/1363 = 0.0% |
+
+### What the audit now surfaces is a corpus defect, not a rules artefact
+
+The residue is small enough to read by hand, and reading it is the point. All
+seven remaining `national_id` findings are **nine-digit** values (`۲۴۶۷۵۸۱۳۵`,
+`۷۶۲۳۴۵۱۲۳`, …). Neither Iranian identifier has nine digits — کد ملی has ten,
+شناسه ملی eleven — so those are generator faults in the ground truth, which the
+audit found on its first interpretable run. The rest are individually explicable
+and individually genuine: `: ISO‑DJI‑۲۰` (a foreign document number under a
+Persian label), `: ۲۳۷/ج/۱۴۰۳` under شماره ثبت (a registration number written in
+letter-number format), `: ۱,۷۵۰,۰۰۰,` (a تاریخ label followed by an amount), and
+exactly one calendar-invalid date — the known `synthesize_jalali_date` bug that
+draws the day 1–30 for every month.
+
+None of these are fixed here. Correcting the generator invalidates every existing
+annotation, which is the user's call, not a side effect of adding a metric — but
+the findings are now specific enough to act on, which they were not at 97%.
+
+## Offline model loading
+
+`scripts/train_local.sh` exports `HF_HUB_OFFLINE=1` whenever `huggingface.co`
+does not resolve, and honours an explicit `OFFLINE=0`/`OFFLINE=1` override.
+
+The reason is that `model.revision` in `configs/lora_config.yaml` is pinned to a
+commit hash, `2b77538ef936`. A pinned commit is immutable, so the HEAD request
+`huggingface_hub` issues before reading a cached file cannot discover anything -
+it can only confirm what the cache already holds. With DNS down that request does
+not fail fast either: the default policy retries five times per file, so a load
+that takes forty seconds from cache instead spends minutes resolving nothing
+before falling back to exactly the file it would have used.
+
+Detection is `getent hosts huggingface.co` rather than an unconditional
+`HF_HUB_OFFLINE=1`, because the first run on a fresh machine does need the
+network to populate the cache, and a flag that silently prevents that would turn
+a missing download into a confusing `LocalEntryNotFoundError`.
+
+## The 1000-sample adapter, measured
+
+The first real training run: 1,000 records, 378 steps, 2,397 s wall clock
+(6.34 s/step, 0.79 s/sample), peak 1,253 MiB of the 3,745 MiB this GPU has,
+final `train_loss` 1.0357. Evaluated against the *same* base model on the *same*
+20-record validation split, so the two numbers differ only by the adapter:
+
+| | base | adapter | |
+| --- | --- | --- | --- |
+| CER | 0.7770 | **0.1028** | −87% |
+| WER | 0.9664 | **0.1554** | −84% |
+| digit CER | 2.9341 | **0.2916** | −90% |
+| digit exact match | 0.0000 | 0.0526 | |
+
+The 1.2220 baseline recorded earlier is not the comparison — that was 50 records
+of a different split. Re-running the base model on this split is what makes the
+delta attributable.
+
+### The field audit is where the size of the change shows
+
+| Field | recall base → adapter | exact base → adapter |
+| --- | --- | --- |
+| `registration_number` | 0.33 → **1.00** | 0.00 → 0.67 |
+| `letter_number` | 0.52 → **0.93** | 0.15 → 0.63 |
+| `date` | 0.05 → **0.82** | 0.00 → 0.36 |
+| `national_id` | 0.00 → **1.00** | 0.00 → 0.50 |
+| `amount` | 0.00 → **1.00** | 0.00 → 0.14 |
+
+CER moved by a factor of 7; `date` recall moved by a factor of 18. The base model
+was not emitting the metadata block at all — 21 of 22 reference dates missing — and
+CER could not say so, which is the whole argument for §"Four verdicts per field"
+above, now demonstrated rather than argued.
+
+### What the confidence layer caught, and what it did not
+
+Two faults it caught cleanly. `repeated_digits` flagged all seven truncated
+amounts (`۰۰۰,۰۰۰,۰۰۰`) with no reference needed, and the same values are the three
+`spurious` findings — the model inventing an amount where none was. Low confidence
+correctly marked 12 values, mean 0.84 on `amount` against 0.97 on
+`registration_number`, which ranks the fields by how much a human should re-check
+them.
+
+One fault it missed, and the miss is informative. Three dates were read
+`۱۳۹۹ → ۱۴۹۹` — the same substitution three times, at confidence **0.91–0.96**.
+That is not noise, it is a learned prior: almost every date in the training mix is
+`۱۴۰x`, so the adapter overrides the digit it actually saw. Token probability
+cannot flag a systematic bias, because the model is not uncertain — it is
+confidently wrong. Uncertainty display is a filter for misreads, not for bias, and
+a report that treated it as the only traceability signal would have passed all
+three.
+
+`jalali_date_is_valid` did not catch them either: `_YEAR_RANGE` ends at 1499, so
+1499 is the one wrong year that passes. Tightening the upper bound to ~1420 would
+convert all three into reference-free `check_failed` findings, catchable in
+production with no ground truth. Not changed here — the bound decides what gets
+reported as impossible, and per CLAUDE.md §8 it belongs in
+`configs/field_validation.yaml` rather than as a module constant, so both the
+narrowing and the move are flagged for confirmation rather than assumed.

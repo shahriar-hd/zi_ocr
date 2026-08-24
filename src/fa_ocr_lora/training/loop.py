@@ -286,12 +286,23 @@ class LoraTrainer(Trainer):
         run's hyperparameters live in the version-controlled YAML this trainer
         was built from, which is a better record than a pickled dataclass.
 
+        ``save_embedding_layers=False`` is not an optimisation. PEFT's default
+        ``"auto"`` sees ``embed_tokens`` and ``lm_head`` among the LoRA targets,
+        assumes the vocabulary was resized, and writes both full base matrices -
+        404 MiB of frozen weights bit-identical to the base checkpoint, turning a
+        36 MiB adapter into a 461 MiB one. This run never resizes the vocabulary,
+        so those tensors are recoverable from the base model by definition; the
+        trained ``lora_embedding_A``/``lora_embedding_B`` factors are saved either
+        way.
+
         Args:
             output_dir: Destination; defaults to the arguments' output directory.
             state_dict: Ignored, see above.
         """
         target = ensure_dir(Path(output_dir or self.args.output_dir))
-        unwrap_base(self.model).save_pretrained(str(target))
+        unwrap_base(self.model).save_pretrained(
+            str(target), save_embedding_layers=False
+        )
         LOGGER.debug("wrote adapter to %s", target)
 
     def _load_from_checkpoint(
@@ -555,7 +566,10 @@ def run_training(
     adapter_dir: Path | None = None
     if not short_run:
         adapter_dir = ensure_dir(config.paths.adapter_dir)
-        unwrap_base(trainer.model).save_pretrained(str(adapter_dir))
+        # See PeftTrainer._save for why the embedding layers are excluded.
+        unwrap_base(trainer.model).save_pretrained(
+            str(adapter_dir), save_embedding_layers=False
+        )
         loaded.processor.save_pretrained(str(adapter_dir))
         LOGGER.info("adapter written to %s", adapter_dir)
 

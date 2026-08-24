@@ -39,12 +39,22 @@ import json
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 from ..config.base import ConfigError
 from ..dataset.common.io_utils import resolve_repo_path, write_json
+from ..validation import (
+    FieldAudit,
+    FieldAuditor,
+    LazySpanConfidence,
+    extract_fields,
+    load_field_validation_config,
+    summarize_fields,
+)
+from ..validation.recorder import processor_list, recorder_for
 from . import vram
 from .config import TrainingConfig, load_training_config
 from .encoding import IGNORE_INDEX, SampleEncoder, SampleTooLong
@@ -52,13 +62,32 @@ from .manifest import load_manifest, parse_crop_box
 from .metrics import EvalMetrics, MetricAccumulator
 from .modeling import EvalModel, load_eval_model
 
-__all__ = ["main", "parse_args", "score_split"]
+__all__ = ["EvalOutcome", "main", "parse_args", "score_split"]
 
 LOGGER = logging.getLogger("fa_ocr_lora.eval")
 
 #: Predictions written alongside the metrics, so a bad CER can be read rather
 #: than guessed at. One JSON object per line.
 PREDICTIONS_NAME = "eval_predictions.jsonl"
+
+
+@dataclass(frozen=True, slots=True)
+class EvalOutcome:
+    """What one scoring pass produced.
+
+    Two results rather than one because they answer different questions and must
+    not be averaged into each other: CER and WER say how much of the page was
+    read, the audit says whether the شماره ثبت and the تاریخ were read. A page is
+    ~700 characters of prose against ~20 of metadata, so the first number cannot
+    express the second.
+
+    Attributes:
+        metrics: Text, digit and confusion metrics over the whole transcription.
+        audit: Sensitive-field audit, or ``None`` when ``eval.field_audit`` is off.
+    """
+
+    metrics: EvalMetrics
+    audit: FieldAudit | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -112,9 +141,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Metrics JSON destination; defaults to <output_dir>/eval_<split>.json.",
     )
     parser.add_argument(
+        "--field-config",
+        type=Path,
+        default=None,
+        help=(
+            "Sensitive-field rules; overrides eval.field_config_path. Defaults to "
+            "configs/field_validation.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--no-field-audit",
+        action="store_true",
+        help="Skip the sensitive-field audit and report CER/WER alone.",
+    )
+    parser.add_argument(
+        "--confidence-floor",
+        type=float,
+        default=None,
+        help=(
+            "Weakest-token probability below which a predicted field is flagged as "
+            "uncertain; overrides eval.confidence_floor."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Log every prediction as it is scored.",
+        help="Log every prediction as it is scored, and every finding.",
     )
     return parser.parse_args(argv)
 
@@ -151,8 +203,8 @@ def score_split(
     max_samples: int | None = None,
     predictions_path: Path | None = None,
     verbose: bool = False,
-) -> EvalMetrics:
-    """Generate over a split and accumulate metrics.
+) -> EvalOutcome:
+    """Generate over a split, accumulating metrics and the sensitive-field audit.
 
     Failed records are counted and logged, never silently skipped, and they are not
     scored as empty predictions either - a file that will not open says nothing
@@ -171,11 +223,14 @@ def score_split(
         verbose: Log every prediction as it is produced.
 
     Returns:
-        The accumulated metrics.
+        The metrics and, unless ``eval.field_audit`` is off, the field audit.
 
     Raises:
         FileNotFoundError: If the manifest has not been built.
         ValueError: If the split is empty.
+        ConfigError: If ``eval.field_config_path`` names unloadable rules. Raised
+            rather than warned past: an audit that silently stops checking a field
+            reports a perfect score for it.
     """
     frame = load_manifest(config.paths.manifest_path)
     frame = frame[frame["split"] == split].reset_index(drop=True)
@@ -192,6 +247,26 @@ def score_split(
     tokenizer = loaded.processor.tokenizer
     device = next(loaded.model.parameters()).device
     accumulator = MetricAccumulator(confusion_top_k=config.eval.confusion_top_k)
+    auditor: FieldAuditor | None = None
+    if config.eval.field_audit:
+        rules = load_field_validation_config(config.eval.field_config_path)
+        auditor = FieldAuditor(
+            config=rules,
+            confidence_floor=config.eval.confidence_floor,
+            max_findings=config.eval.max_findings,
+        )
+        LOGGER.info(
+            "field audit on: %s (%d field(s))", rules.source_path, len(rules.specs)
+        )
+    # Uncertainty is only recorded under greedy decoding, where the emitted token
+    # is the argmax the recorder sees. Beam search would attribute a probability
+    # to a token that was never produced, so the audit reports it as unavailable.
+    recorder = recorder_for(config.eval.num_beams) if auditor else None
+    processors = processor_list(recorder)
+    if auditor and recorder is None:
+        LOGGER.info(
+            "field confidence off: num_beams=%d is not greedy", config.eval.num_beams
+        )
     failures: dict[str, int] = {}
     handle = predictions_path.open("w", encoding="utf-8") if predictions_path else None
     started = time.perf_counter()
@@ -213,6 +288,8 @@ def score_split(
                 continue
 
             cut = _prompt_length(sample.labels)
+            if recorder is not None:
+                recorder.reset()
             with torch.inference_mode():
                 generated = loaded.model.generate(
                     input_ids=sample.input_ids[:cut].unsqueeze(0).to(device),
@@ -224,9 +301,33 @@ def score_split(
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
+                    logits_processor=processors,
                 )
-            prediction = tokenizer.decode(generated[0][cut:], skip_special_tokens=True)
+            new_tokens = generated[0][cut:]
+            prediction = tokenizer.decode(new_tokens, skip_special_tokens=True)
             accumulator.update(row["text"], prediction)
+
+            audited: tuple[dict[str, object], ...] = ()
+            findings: tuple[object, ...] = ()
+            if auditor is not None:
+                # The lookup decodes prefixes only if a field is actually found, so
+                # an empty or garbage prediction costs nothing to audit.
+                lookup = (
+                    LazySpanConfidence(
+                        tokenizer=tokenizer,
+                        token_ids=new_tokens.tolist(),
+                        steps=tuple(recorder.steps),
+                    )
+                    if recorder is not None
+                    else None
+                )
+                findings = auditor.update(
+                    row["record_id"], row["text"], prediction, confidence=lookup
+                )
+                audited = summarize_fields(extract_fields(prediction, auditor.config))
+                if verbose and findings:
+                    for finding in findings:
+                        LOGGER.debug("  %s", finding.describe())
 
             if verbose:
                 LOGGER.debug("%s -> %r", row["record_id"], prediction[:120])
@@ -238,6 +339,8 @@ def score_split(
                             "source": row["source"],
                             "reference": row["text"],
                             "prediction": prediction,
+                            "fields": list(audited),
+                            "findings": [item.to_dict() for item in findings],
                         },
                         ensure_ascii=False,
                     )
@@ -270,7 +373,10 @@ def score_split(
         accumulator.result().samples,
         time.perf_counter() - started,
     )
-    return accumulator.result()
+    return EvalOutcome(
+        metrics=accumulator.result(),
+        audit=auditor.result() if auditor is not None else None,
+    )
 
 
 def _resolve_adapter(config: TrainingConfig, args: argparse.Namespace) -> Path | None:
@@ -310,11 +416,26 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, FileNotFoundError) as exc:
         LOGGER.error("configuration error: %s", exc)
         return 1
+    overrides: dict[str, object] = {}
     if args.max_new_tokens is not None:
+        overrides["max_new_tokens"] = args.max_new_tokens
+    if args.no_field_audit:
+        overrides["field_audit"] = False
+    if args.field_config is not None:
+        overrides["field_config_path"] = str(args.field_config)
+    if args.confidence_floor is not None:
+        overrides["confidence_floor"] = args.confidence_floor
+    if overrides:
+        # Round-tripped through the loader rather than mutated in place, so a bad
+        # flag is rejected by the same validation the YAML goes through.
         payload = config.to_dict()
         payload.pop("source_path", None)
-        payload["eval"]["max_new_tokens"] = args.max_new_tokens
-        config = TrainingConfig.from_dict(payload, source_path=config.source_path)
+        payload["eval"].update(overrides)
+        try:
+            config = TrainingConfig.from_dict(payload, source_path=config.source_path)
+        except ConfigError as exc:
+            LOGGER.error("invalid override: %s", exc)
+            return 1
 
     if not config.paths.manifest_path.is_file():
         LOGGER.error("no manifest at %s", config.paths.manifest_path)
@@ -341,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        metrics = score_split(
+        outcome = score_split(
             config,
             loaded,
             split=args.split,
@@ -357,23 +478,27 @@ def main(argv: list[str] | None = None) -> int:
             config.eval.max_new_tokens,
         )
         return 1
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+    except (ConfigError, FileNotFoundError, ValueError, RuntimeError) as exc:
         LOGGER.error("evaluation failed: %s", exc)
         return 1
 
-    LOGGER.info("%s", metrics.describe())
-    write_json(
-        destination,
-        {
-            "split": args.split,
-            "adapter_dir": str(adapter_dir) if adapter_dir else None,
-            "quantization": config.model.quantization,
-            "quantize_vision": config.model.quantize_vision,
-            "max_pixels": config.image.max_pixels,
-            "max_new_tokens": config.eval.max_new_tokens,
-            **metrics.to_dict(),
-        },
-    )
+    LOGGER.info("%s", outcome.metrics.describe())
+    payload: dict[str, object] = {
+        "split": args.split,
+        "adapter_dir": str(adapter_dir) if adapter_dir else None,
+        "quantization": config.model.quantization,
+        "quantize_vision": config.model.quantize_vision,
+        "max_pixels": config.image.max_pixels,
+        "max_new_tokens": config.eval.max_new_tokens,
+        **outcome.metrics.to_dict(),
+    }
+    if outcome.audit is not None:
+        LOGGER.info("")
+        LOGGER.info("%s", outcome.audit.describe())
+        # Nested under one key rather than merged, so the field rates cannot be
+        # mistaken for more CER-like numbers by a reader of the JSON.
+        payload["field_audit"] = outcome.audit.to_dict()
+    write_json(destination, payload)
     LOGGER.info("metrics     %s", destination)
     LOGGER.info("predictions %s", predictions_path)
     return 0

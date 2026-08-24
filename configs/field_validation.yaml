@@ -1,0 +1,164 @@
+# Sensitive-field validation rules for Persian administrative letters.
+#
+# CER and WER answer "how much of the page did the model read correctly?". They
+# cannot answer "did it read the شماره ثبت correctly?", because a page is ~700
+# characters of prose against ~20 characters of registration number and date -
+# so a model that mangles every digit of the metadata block still scores a CER
+# around 3%. CLAUDE.md 5.2 makes that block the highest-priority field. This file
+# is what makes it separately measurable, and separately auditable at inference
+# time when there is no ground truth to compare against.
+#
+# Loaded by fa_ocr_lora.validation.config, used by training/eval.py and by the
+# Phase 3 inference layer. Override the path with FA_OCR_FIELD_CONFIG.
+#
+# THE PATTERNS BELOW DESCRIBE THIS CORPUS. They were read off the generators in
+# src/fa_ocr_lora/dataset/synth/, not off a national standard, because no single
+# national standard exists for a شماره ثبت - each organisation has its own. A
+# deployment reading one organisation's letters should narrow these to that
+# organisation's real format, which is the whole reason they are configuration
+# rather than constants. Narrowing them makes the audit stricter and more useful;
+# what must not happen is a pattern drifting looser than the documents, because
+# then a malformed value reads as valid.
+#
+# Every pattern accepts all three numeral families - Persian ۰-۹, Arabic-Indic
+# ٠-٩ and Latin 0-9 - deliberately. Reading a Persian ۵ as a Latin 5 is a real
+# error this adapter exists to remove, but it is a *transcription* error, not a
+# malformed field: the number is right and the script is wrong. Rejecting it here
+# would fold the two failures into one number and make neither diagnosable. The
+# audit reports script-exact and digits-only agreement separately instead.
+
+# Strings that may sit between a label and its value, beyond whitespace. These
+# are exactly the metadata_block.separators pool from configs/vocabulary_fa.yaml,
+# which the generator draws from.
+#
+# THE EMPTY ENTRY IS LOAD-BEARING AND MUST STAY. It is drawn 20% of the time -
+# it is how a letterhead that aligns its values in a column separates them, with
+# whitespace alone. Omitting it does not make the audit stricter, it makes it
+# wrong: a fifth of every field in the corpus reads as "label present, no
+# readable value" and the malformation rate jumps by 20 points for reasons that
+# have nothing to do with the model. Separators are tried longest-first, so the
+# empty one is only reached after every real one has failed to match.
+#
+# A deployment whose letters use another separator should add it here.
+separators: [":", "ـــــ", ".....", ""]
+
+# How far past a label the extractor will look for a value. Twelve characters
+# covers the widest separator above plus generous whitespace; much more and a
+# label at the end of a line starts capturing a number from the next paragraph,
+# which would score a field the model never got wrong.
+max_gap_chars: 12
+
+# Whether a label with no readable value after it must look like a field
+# introduction before the audit calls it a malformed field.
+#
+# THIS DEFENDS AGAINST THE AUDIT'S OWN LABELS. Every label in this file is also
+# an ordinary Persian word. "در تاریخ ۱۳۸۹ مبنی بر ..." is a sentence, and
+# "شماره تماس: ۰۲۱-۷۷۷۷۷۷۷۷" is a phone number that happens to start with the
+# letter_number label - neither is a metadata field, and neither is anything the
+# model did. Measured over the reference text of 10,000 manifest rows, that shape
+# was 67% of every malformed finding produced.
+#
+# When on, a valueless label is reported only if an explicit separator follows it
+# (someone wrote "تاریخ:") or it opens its line with a digit next (the
+# column-aligned layout the empty separator above exists for). It never
+# suppresses a label that IS followed by a well-formed value, so no readable
+# field can be lost - see fa_ocr_lora.validation.fields._introduces_a_field.
+#
+# Set false to get the literal reading of the rules, which is useful for one
+# thing: measuring how much this is suppressing on a new corpus.
+require_field_context: true
+
+fields:
+  # ---------------------------------------------------------------------------
+  # The metadata block: شماره ثبت / تاریخ / پیوست, top-right or top-left of the
+  # page. CLAUDE.md 5.2's first-class target.
+  #
+  # Label ordering across fields is load-bearing but NOT authored here - the
+  # extractor sorts every label from every field by descending length before
+  # matching. That is what stops "شماره" (letter_number) from swallowing the
+  # "شماره" of "شماره ثبت" and reporting every registration number as a letter
+  # number instead.
+  # ---------------------------------------------------------------------------
+
+  registration_number:
+    # From metadata_block.labels.registration_number in vocabulary_fa.yaml.
+    labels: ["شماره ثبت", "شمارهٔ ثبت", "شماره ثبت نامه"]
+    # The generator emits a bare 5-digit number (rng.randrange(10**4, 10**5)),
+    # so 4-6 digits is this corpus's format with one digit of slack either side.
+    # A real deployment almost certainly wants something tighter - e.g.
+    # '۱۴[۰-۹]{2}/[۰-۹]{4,6}' for a year-prefixed scheme.
+    pattern: '[۰-۹٠-٩0-9]{4,6}'
+    check: none
+    description: "4-6 digit registration number, as this corpus generates it"
+
+  letter_number:
+    # From metadata_block.labels.letter_number. "شماره" alone is here, which is
+    # why longest-label-first matching matters.
+    labels: ["شماره اندیکاتور", "شمارهٔ نامه", "شماره نامه", "شماره"]
+    # The generator's synthesize_letter_number builds {3 digits}/{class
+    # letter}/{2 digits}, e.g. ۱۲۳/الف/۰۳. The class letter is one of
+    # الف ب ج د ص ط ک م. A bare number is also accepted, because the letter
+    # number is sometimes printed without the class segment.
+    pattern: '[۰-۹٠-٩0-9]{2,6}(?:/[الفبجدصطکم]+/[۰-۹٠-٩0-9]{2,4})?'
+    check: none
+    description: "NNN/class/YY indicator number, or a bare number"
+
+  date:
+    labels: ["تاریخ نامه", "تاریخ", "مورخ"]
+    # Three written forms, because a letter's choice among them is not the
+    # model's and is not a correctness signal:
+    #
+    #   1. ۱۴۰۳/۰۷/۲۲   year first - what synthesize_jalali_date emits
+    #   2. ۲۷/۰۹/۱۴۰۳   day first  - appears in LLM-drafted letter bodies
+    #   3. ۲۲ مهر ۱۴۰۳  spelled-out month, optionally suffixed ماه
+    #   4. ۲۷/مهر/۱۴۰۳ spelled-out month with numeric separators
+    #
+    # Form 3 is 11.7% of the dated labels in this corpus and forms 1-2 together
+    # are 2.8%; a pattern accepting only form 1 scored 97.2% of every تاریخ in
+    # the *reference* text as malformed, which is a statement about this file and
+    # not about the model. Alef is accepted with and without its madda
+    # (آبان/ابان) because dropping the diacritic is a one-character misread, and
+    # a one-character misread must not also read as a structurally broken field.
+    #
+    # parse_jalali_date resolves all three to (year, month, day) before the
+    # check below runs. Order is decided from the values - a four-digit group is
+    # the year, a leading group above 12 is a day - never assumed.
+    pattern: '(?:[۰-۹٠-٩0-9]{4}[/\-.][۰-۹٠-٩0-9]{1,2}[/\-.][۰-۹٠-٩0-9]{1,2}|[۰-۹٠-٩0-9]{1,2}[/\-.][۰-۹٠-٩0-9]{1,2}[/\-.][۰-۹٠-٩0-9]{4}|[۰-۹٠-٩0-9]{1,2}[\x20\u00a0\u200c/\-.]?(?:اردیبهشت|فروردین|امرداد|شهریور|خرداد|مرداد|اسفند|آبان|ابان|بهمن|تیر|مهر|آذر|اذر|دی)(?:[\x20\u00a0\u200c/\-.]?ماه)?[\x20\u00a0\u200c/\-.]?[۰-۹٠-٩0-9]{4})'
+    # The one field whose correctness is partly decidable with no reference at
+    # all: Esfand has 29 days in a common year, so ۱۴۰۲/۱۲/۳۰ is provably a
+    # misread. See fa_ocr_lora.validation.iran.
+    check: jalali_date
+    description: "Jalali date, numeric either order or spelled-out month, checked against real month lengths"
+
+  national_id:
+    # From metadata_block.labels.national_id. Note the corpus generates شناسه
+    # ملی - the 11-digit legal-entity identifier - not the 10-digit personal
+    # کد ملی. Both label sets are accepted so the same rules work on real
+    # documents, which carry either.
+    labels: ["شناسه ملی شرکت", "شناسهٔ ملی", "شناسه ملی", "کد ملی", "کد ملى"]
+    # 10 digits (personal) or 11 (legal entity). No checksum is applied: the
+    # corpus generates these as uniform random digits, so a modulo-11 check
+    # would flag ~91% of the ground truth as invalid and say nothing about the
+    # model. What is checked is that the digits match the reference, and that
+    # they are not all the same digit - the signature of a repetition loop.
+    pattern: '[۰-۹٠-٩0-9]{10,11}'
+    check: none
+    description: "10-digit کد ملی or 11-digit شناسه ملی, digits compared not checksummed"
+
+  # ---------------------------------------------------------------------------
+  # Amounts. Unlike the four above, these live in table cells under a
+  # مبلغ (ریال) or هزینه header, not in the metadata block - and a flat
+  # transcription has lost the table structure by the time it reaches here. So
+  # this field is found by its value pattern alone, with no label.
+  # ---------------------------------------------------------------------------
+  amount:
+    labels: []
+    # At least one group of exactly three digits after a separator. The
+    # requirement of a thousands separator is what makes a label unnecessary: no
+    # other field in the corpus is digit-grouped, so this cannot collide with a
+    # registration number or a national id. Both the Latin comma the generator
+    # emits (to_persian_digits leaves f"{value:,}" separators alone) and the
+    # Arabic ٬ a real document may use are accepted.
+    pattern: '[۰-۹٠-٩0-9]{1,3}(?:[,٬][۰-۹٠-٩0-9]{3})+'
+    check: none
+    description: "Digit-grouped currency amount, e.g. ۱۲,۰۰۰,۰۰۰"

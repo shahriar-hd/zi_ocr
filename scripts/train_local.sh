@@ -36,6 +36,17 @@ export PYTHONPATH="${REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
 # ~1.9 GiB against ~2.0 GiB free, so a few hundred MiB stranded between blocks is
 # the difference between finishing and an OOM at step 900.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# model.revision is pinned to a commit hash, so there is nothing for the Hub to
+# revalidate once the weights are cached - and with DNS down, huggingface_hub
+# still retries a HEAD request five times per file before falling back to the
+# cache, which turns a 40-second model load into minutes of stalling. Skip the
+# network when the host does not resolve. OFFLINE=1 forces the cache path,
+# OFFLINE=0 forces the network one (needed only for the very first download).
+case "${OFFLINE:-auto}" in
+    1) export HF_HUB_OFFLINE=1 ;;
+    0) ;;
+    *) getent hosts huggingface.co >/dev/null 2>&1 || export HF_HUB_OFFLINE=1 ;;
+esac
 
 CONFIG_ARGS=()
 if [[ -n "${CONFIG:-}" ]]; then

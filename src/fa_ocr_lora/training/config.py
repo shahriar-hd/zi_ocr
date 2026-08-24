@@ -1093,13 +1093,32 @@ class EvalConfig:
         max_samples: Validation records scored; ``None`` means all of them.
         max_new_tokens: Generation cap per record.
         num_beams: Beam count; ``1`` is greedy, which keeps CER seed-independent.
+            Also the only setting under which per-field confidence is recorded, as
+            it is the only one where the emitted token is the argmax - see
+            :mod:`fa_ocr_lora.validation.recorder`.
         confusion_top_k: Substitution pairs printed in the confusion summary.
+        field_audit: Whether to run the sensitive-field audit alongside CER/WER.
+            On by default: the metadata block is CLAUDE.md 5.2's highest-priority
+            field and aggregate error rate cannot see it. It runs on the decoded
+            strings the metrics already need, so it costs no extra generation.
+        field_config_path: Rules for that audit; ``None`` uses
+            ``configs/field_validation.yaml`` or ``FA_OCR_FIELD_CONFIG``. Separate
+            from this file because Phase 3 inference applies the same patterns with
+            no training profile at all.
+        confidence_floor: Weakest-token probability below which a predicted field
+            is reported as uncertain.
+        max_findings: Individual faults retained in the audit report. Those beyond
+            it are counted, never silently dropped.
     """
 
     max_samples: int | None = 300
     max_new_tokens: int = 1024
     num_beams: int = 1
     confusion_top_k: int = 20
+    field_audit: bool = True
+    field_config_path: str | None = None
+    confidence_floor: float = 0.5
+    max_findings: int = 200
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> EvalConfig:
@@ -1123,6 +1142,13 @@ class EvalConfig:
             if raw_max is None
             else _as_int({"max_samples": raw_max}, "max_samples", 300, context, minimum=1)
         )
+        raw_path = payload.get("field_config_path", defaults["field_config_path"])
+        if raw_path is not None and not isinstance(raw_path, str):
+            raise ConfigError(
+                f"{context}.field_config_path: expected a path string or null, "
+                f"got {raw_path!r}"
+            )
+        field_config_path = raw_path.strip() or None if raw_path else None
         return cls(
             max_samples=max_samples,
             max_new_tokens=_as_int(
@@ -1148,6 +1174,26 @@ class EvalConfig:
                 context,
                 minimum=1,
                 maximum=200,
+            ),
+            field_audit=_as_bool(
+                payload, "field_audit", defaults["field_audit"], context
+            ),
+            field_config_path=field_config_path,
+            confidence_floor=_as_float(
+                payload,
+                "confidence_floor",
+                defaults["confidence_floor"],
+                context,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            max_findings=_as_int(
+                payload,
+                "max_findings",
+                defaults["max_findings"],
+                context,
+                minimum=0,
+                maximum=100_000,
             ),
         )
 

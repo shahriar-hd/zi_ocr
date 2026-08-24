@@ -35,6 +35,7 @@ from .images import PIXELS_PER_TOKEN, fit_image, load_region
 
 __all__ = [
     "IGNORE_INDEX",
+    "EncodedPrompt",
     "EncodedSample",
     "SampleEncoder",
     "SampleTooLong",
@@ -82,6 +83,43 @@ class EncodedSample:
 
     def __len__(self) -> int:
         """Sequence length in tokens."""
+        return int(self.input_ids.shape[0])
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedPrompt:
+    """One image and its prompt, encoded for generation.
+
+    The inference-time counterpart of :class:`EncodedSample`, and deliberately not
+    the same type: there is no answer, so there are no labels, and a caller that
+    accidentally fed one of these to the loss would get a silent no-op rather than
+    a type error.
+
+    Attributes:
+        input_ids: Prompt token ids with the image placeholder expanded, shape
+            ``(L,)``. This is the whole generation prompt - unlike the training
+            path, nothing needs slicing off it.
+        pixel_values: Flattened image patches, shape ``(P, 3, 14, 14)``.
+        image_grid_thw: Patch grid as ``(1, 3)``.
+        image_tokens: How many positions the image occupies.
+        width: Width in pixels of the image as fed, after resizing.
+        height: Height in pixels of the image as fed, after resizing.
+        source_width: Width of the region before resizing, so a caller can report
+            coordinates in the units of the file it was handed.
+        source_height: Height of the region before resizing.
+    """
+
+    input_ids: torch.Tensor
+    pixel_values: torch.Tensor
+    image_grid_thw: torch.Tensor
+    image_tokens: int
+    width: int
+    height: int
+    source_width: int
+    source_height: int
+
+    def __len__(self) -> int:
+        """Prompt length in tokens."""
         return int(self.input_ids.shape[0])
 
 
@@ -255,4 +293,83 @@ class SampleEncoder:
             image_tokens=predicted,
             shrunk=shrunk,
             truncated=truncated,
+        )
+
+    def encode_prompt(
+        self,
+        *,
+        image_path: Path,
+        crop_box: tuple[int, int, int, int] | None = None,
+        reserve_tokens: int = 0,
+    ) -> EncodedPrompt:
+        """Encode an image and the prompt alone, for generation.
+
+        :meth:`encode` sizes the image from the tokenised answer, which is the one
+        thing inference cannot know: the answer is what is being asked for. So the
+        caller states how many tokens it intends to generate and the image gets
+        whatever the sequence budget has left over - which at the default
+        ``max_total_seq_len`` and ``eval.max_new_tokens`` is the full
+        ``max_pixels``, so a document is read at the resolution the adapter was
+        trained on.
+
+        The prompt itself comes from the same cached template string, so the model
+        is asked at inference exactly what it was asked during training. That is
+        the reason this lives here beside :meth:`encode` rather than in the
+        inference package: two renderings of one template drift, and the drift is
+        invisible until the character error rate is inexplicably worse in
+        production than it was on the validation split.
+
+        Args:
+            image_path: Document image on disk.
+            crop_box: Region to read, or ``None`` for the whole page.
+            reserve_tokens: Sequence budget to keep free for the generated answer.
+
+        Returns:
+            The encoded prompt.
+
+        Raises:
+            SampleTooLong: If the image at its smallest, plus the prompt, plus the
+                reserved answer, cannot fit ``max_total_seq_len``. Unlike training
+                there is no target to truncate, so the only remedies are the
+                caller's - a smaller ``max_new_tokens`` or a cropped region - and
+                they are named in the message.
+            OSError: If the image cannot be read.
+            ValueError: If the processor's expansion disagrees with the predicted
+                token count, which would mean the sequence budget is unsound.
+        """
+        budget = self._image_budget(reserve_tokens)
+        image = load_region(image_path, crop_box)
+        source_width, source_height = image.width, image.height
+        image, predicted = fit_image(
+            image, min_pixels=self._image.min_pixels, max_pixels=budget
+        )
+
+        total = self.prompt_overhead + predicted + reserve_tokens
+        if total > self._image.max_total_seq_len:
+            raise SampleTooLong(
+                f"{image_path.name}: the prompt and image need "
+                f"{self.prompt_overhead + predicted} tokens and the answer is "
+                f"allowed {reserve_tokens}, which exceeds max_total_seq_len "
+                f"{self._image.max_total_seq_len}; lower max_new_tokens or read a "
+                "region instead of the whole page"
+            )
+
+        batch = self.processor(text=[self.prompt], images=[image], return_tensors="pt")
+        prompt_ids = batch["input_ids"][0]
+        actual = int(prompt_ids.shape[0]) - self.prompt_overhead
+        if actual != predicted:
+            raise ValueError(
+                f"{image_path.name}: predicted {predicted} image tokens but the "
+                f"processor produced {actual}; the pixel budget and the "
+                "processor's resize rule have diverged"
+            )
+        return EncodedPrompt(
+            input_ids=prompt_ids,
+            pixel_values=batch["pixel_values"],
+            image_grid_thw=batch["image_grid_thw"],
+            image_tokens=predicted,
+            width=image.width,
+            height=image.height,
+            source_width=source_width,
+            source_height=source_height,
         )

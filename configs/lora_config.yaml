@@ -276,7 +276,35 @@ eval:
   max_samples: 300
   max_new_tokens: 1024
   # Greedy: an OCR target has one correct answer, and sampling would make the
-  # CER depend on the seed.
+  # CER depend on the seed. It is also the only setting under which per-field
+  # confidence can be recorded, since only there is the emitted token the argmax
+  # the recorder observes - raise this and the audit drops its uncertainty column.
   num_beams: 1
   # How many substitution pairs the confusion summary prints.
   confusion_top_k: 20
+
+  # --- Sensitive-field audit -------------------------------------------------
+  # CER cannot see the metadata block: a page is ~700 characters of prose against
+  # ~20 of شماره ثبت and تاریخ, so mangling every digit of the block still scores
+  # a CER around 3%. CLAUDE.md 5.2 makes that block the highest-priority field, so
+  # it is measured separately - per-field recall, exact match, digit-only match,
+  # malformation rate, calendar validity, and the model's own confidence.
+  #
+  # It runs on the decoded strings the metrics already need, so it adds no
+  # generation. Turn it off with --no-field-audit to compare against a bare
+  # CER/WER run.
+  field_audit: true
+  # Rules for the audit. null uses configs/field_validation.yaml, or whatever
+  # FA_OCR_FIELD_CONFIG names. Deliberately a separate file: Phase 3 inference
+  # applies the same patterns with no training profile at all.
+  field_config_path: null
+  # A predicted field is flagged uncertain when its *weakest* token falls below
+  # this probability - weakest, not mean, because a registration number is wrong
+  # if any single digit is wrong, and a mean over five confident digits and one
+  # guess reads as confident. 0.5 is a reviewable rate, not a calibrated
+  # threshold; tighten it once a trained run shows where the mass actually sits.
+  confidence_floor: 0.5
+  # Individual faults kept in eval_<split>.json. Enough to review by hand; the
+  # rest are counted, never silently dropped. Every fault is also in
+  # eval_predictions.jsonl per record, uncapped.
+  max_findings: 200
