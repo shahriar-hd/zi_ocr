@@ -56,10 +56,20 @@ local-train = [
 # CUDA-specific and a bf16 run needs none of it: `quantization: none` in the YAML
 # skips the import entirely.
 quant = ["bitsandbytes>=0.43"]
-# Google Drive upload for the Colab training handoff (scripts/upload_to_drive.py).
+# Google Drive access, used by two callers: scripts/upload_to_drive.py (the Colab
+# dataset handoff) and training/checkpoint_sync.py (mirroring checkpoints off a
+# rented GPU whose disk dies with the instance). Not optional for an A100 run -
+# see the `a100` extra below. google-auth arrives as a dependency of the API
+# client and is what provides the service-account credential path.
 drive = [
     "google-api-python-client>=2.140",
     "google-auth-oauthlib>=1.2",
+]
+# Everything one rented A100 run needs, in one name. bitsandbytes is deliberately
+# absent: the A100 profile sets `quantization: none`, so bf16 weights at 1,828 MiB
+# are 4.5% of the card and NF4 would cost accuracy to save nothing that matters.
+a100 = [
+    "fa-ocr-lora[local-train,drive]",
 ]
 # HuggingFace export (pipeline --hugging-face): sharded Parquet with the page
 # images embedded. Kept optional and imported lazily, so a machine that only
@@ -82,6 +92,8 @@ fa-ocr-synth = "fa_ocr_lora.dataset.synth.pipeline:main"
 fa-ocr-manifest = "fa_ocr_lora.training.prepare_manifest:main"
 fa-ocr-train = "fa_ocr_lora.training.train_lora:main"
 fa-ocr-eval = "fa_ocr_lora.training.eval:main"
+# Costs a run out before renting the machine to do it. Loads no model.
+fa-ocr-simulate = "fa_ocr_lora.training.simulate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

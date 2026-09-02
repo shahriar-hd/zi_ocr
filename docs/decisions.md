@@ -1192,3 +1192,204 @@ production with no ground truth. Not changed here — the bound decides what get
 reported as impossible, and per CLAUDE.md §8 it belongs in
 `configs/field_validation.yaml` rather than as a module constant, so both the
 narrowing and the move are flagged for confirmation rather than assumed.
+
+## Projecting the A100 run before renting one
+
+`src/fa_ocr_lora/training/simulate.py` models an unrun training job — VRAM, host
+RAM, disk, and wall clock — from tensor shapes and the corpora's real dimensions.
+It loads no model and allocates no CUDA memory, which is the point: the target is a
+rented 40 GB A100 (32 vCPU / 64 GB RAM / 200 GB disk) and every hour of it is paid
+for, so the arithmetic has to be checkable before the card exists.
+
+### What made the numbers non-obvious
+
+**Vision, not the decoder, is the cost.** At the A100 mix's mean patch count the
+tower is **78.8%** of a sample's FLOPs (6.10 of 7.75 TFLOP), because its attention
+is bidirectional — no causal halving — and quadratic in patches. The decoder is
+19.0%, the head 1.7%, the projector 0.6%. Any intuition that a LoRA run is
+dominated by the layers being adapted is wrong here by a factor of four.
+
+**`E[p²] ≠ E[p]²`.** Letter pages are bimodal in size, so a mean patch count
+squared understates the quadratic term badly. `patches_sq` is therefore carried as
+its own accumulated field and `sample_flops` reconstructs `seq_len_sq` from it,
+rather than squaring the mean.
+
+**Backward is ~1.0× forward, not 2×.** The textbook 2× assumes weight gradients.
+With the base frozen, a LoRA backward needs `dX` to propagate but `dW` only for the
+adapter, so `BACKWARD_MULTIPLIER = 1.0`. The frozen tower has no backward at all:
+`pixel_values` takes no gradient, so it builds no autograd graph and its memory is
+transient.
+
+**Peak is reached early and often.** `DigitAwareLengthGroupedSampler` sorts each
+megabatch longest-first (`megabatch_multiplier = 32`), so the first microbatch of
+every 256-sample window holds that window's longest sequences. An OOM shows up in
+the first minutes rather than at 03:00 — a useful property, and the reason the
+projection reports the worst batch rather than the mean.
+
+### Calibrate, then project
+
+A cost model never checked against a real run is a spreadsheet. `calibrate` back-
+solves achieved TFLOPS from `data/training/lora_1000` and uses it as the **floor**
+of the A100 efficiency bracket, since that run used batch 1 and NF4 and the target
+drops both. Two defects surfaced only once it ran against a real summary:
+
+- It divided the whole run's `seconds` by **one epoch's** `epoch_samples`,
+  overstating per-sample cost by the epoch count and understating MFU threefold.
+  The divisor the trainer itself uses is `steps × batch_size`
+  (`loop.TrainingOutcome.samples`), so `loop.py` now records `batch_size` and
+  `samples_consumed` and the summary is no longer ambiguous.
+- `batch_size` must come from the **summary**, never from `config`. The config
+  describes the machine being projected *onto*; the calibration run happened
+  somewhere else at some other batch size. Borrowing the A100's 16 for a run made
+  at 8 halved the measured cost and reported an implausible 45% MFU on a laptop
+  card. Corrected: 0.793 s/sample, 6.9 TFLOPS, **22.6% MFU** — which is a
+  believable floor for batch-1 NF4 with gradient checkpointing.
+
+Raising the floor above a bracket bound now lifts the whole bracket by the same
+offset. Raising only the floor printed a "pessimistic" run faster than the
+"optimistic" one, which is not conservatism but an unreadable table.
+
+### The one assumption, now measured
+
+The projection assumed the NaViT-style tower attends block-diagonally per image.
+It is load-bearing: dense `packed × packed` attention would put peak at **61.6 GiB**
+and OOM step one of a 40 GB card. `scripts/probe_vision_attention.py` settles it by
+measurement rather than by reading the vendor's remote modeling code — it forwards
+one image at batches 1–4 through this project's own encoder and collate, and fits
+the exponent of peak-allocated against batch size:
+
+| batch | packed patches | peak MiB | MiB/image |
+| --- | --- | --- | --- |
+| 1 | 1,024 | 245.4 | 245.4 |
+| 2 | 2,048 | 704.9 | 352.4 |
+| 3 | 3,072 | 1,058.3 | 352.8 |
+| 4 | 4,096 | 1,410.2 | 352.6 |
+
+Flat to within 0.1% across the last three: **exponent 1.00**. Dense attention would
+have doubled cost per image from batch 2 to batch 4. Batch 1 sits off the line
+because it pays one-off workspace and picks different kernel tilings, which is why
+the verdict is fitted between the two largest batches rather than over all four — a
+fit over all points reads 1.27 and looks equivocal when it is not.
+`VISION_ATTENTION_MATERIALISED` stays a named flag so the counterfactual remains
+priceable.
+
+### The projection, and where it is weakest
+
+Corpus 117,845 records (26,845 letter pages, 60,000 crops, 31,000 Persian Pixel
+pages), 7.75 TFLOP/sample, 277,882 samples over 17,366 steps at effective batch 16:
+
+| | | of budget |
+| --- | --- | --- |
+| peak VRAM, worst batch | 30,089 MiB | 73.5% of 40 GiB |
+| host RAM | 11,490 MiB | 17.5% of 64 GiB |
+| disk | 55.2 GiB | 28% of 200 GiB |
+| wall clock, 2 epochs | 4.3–7.7 h (5.5 h expected) | |
+
+Input supply is 329 samples/s against 14.1 demanded, so the run is compute-bound
+with 23× headroom and host→device traffic is 0.4% of PCIe. Nothing about the
+32 vCPU / 64 GB half of the rental is close to binding.
+
+The weakest number is the VRAM one, and it errs safe: against `lora_1000` the same
+model predicted 2,113 MiB where the allocator reported 1,253, a **1.69× residual**.
+Whatever causes that — allocator reuse the model does not credit, or an activation
+term counted twice — 30,089 MiB should be read as a ceiling. `reserved_vram_mib:
+30000` in `configs/lora_config_a100.yaml` records that, and says so.
+
+## Checkpoint mirroring to Google Drive (2026-08-25)
+
+A rented A100 is billed hourly, is not backed up, and takes its disk with it when
+it is reclaimed. The projection above puts two epochs at 5.5 h and 17,366 steps;
+at `save_steps: 500` that is ~35 checkpoints whose only copy would live on storage
+the provider can revoke without notice. So `training/checkpoint_sync.py` mirrors
+every checkpoint into Drive as it is written, and `runtime.resume_from_checkpoint`
+falls back to Drive when the local disk starts empty.
+
+### Why a thread, not a process or a subprocess `rclone`
+
+Uploading is socket I/O, which releases the GIL for its entire duration. A daemon
+thread fed by a queue therefore costs the training loop nothing but a little
+memory bandwidth, while a process pool would have to share an authenticated client
+and a queue across processes for no gain. `enqueue` returns in microseconds, so
+the GPU never waits for the network — which is the requirement, not a nicety: at
+1.5 GB per checkpoint and a 100 Mbit uplink, a synchronous upload would add two
+minutes to every 500th step, i.e. ~70 minutes to the run.
+
+`DriveClient` is thread-safe by construction rather than by lock: `googleapiclient`'s
+underlying `http` object is not safe to share, so the `service` is built per
+calling thread through `threading.local()`.
+
+### The two races, and the mechanism for each
+
+**Remote: a half-uploaded checkpoint must never be resumed from.** Every file of a
+checkpoint uploads first, and only then is a `LATEST` marker rewritten to name it.
+Resume reads the marker, never the directory listing, so an instance that vanishes
+mid-upload leaves the previous *complete* checkpoint as the newest one Drive admits
+to. Without that ordering the failure mode is a truncated `optimizer.pt` that
+looks like a corrupt checkpoint rather than a lost race. The fallback to the
+highest-numbered directory fires only when no marker exists at all, and warns.
+
+**Local: `save_total_limit` deletes checkpoints while they are being read.**
+`Trainer` enforces the limit immediately after writing a new checkpoint, which on
+a slow uplink happens while the uploader is still reading an old one. `enqueue`
+therefore *stages* the checkpoint by hard-linking its files into a sibling
+directory: `os.link` copies no bytes and keeps the inode alive after the trainer
+unlinks the original, so the uploader reads something nothing else touches.
+`shutil.copy2` is the fallback for a filesystem that cannot link at all.
+
+### Credentials on a headless box
+
+`flow.run_local_server(port=0)` — what `scripts/upload_to_drive.py` has always
+used — opens `http://localhost:<port>` and waits for a human to click Google's
+consent screen. On a rented instance there is no browser, so the call blocks until
+the run is killed. `drive.load_credentials` now tries three routes in order:
+
+1. **Service-account key** (`secrets/drive_service_account.json`). No browser, no
+   expiry. The catch is that a service account has **no Drive storage quota of its
+   own**: it can only write into a Shared Drive or a folder shared with its
+   `client_email`. Writing to its own My Drive fails with `storageQuotaExceeded`,
+   which `_is_transient` deliberately does not retry — retrying a quota error six
+   times just delays the message. This is why `drive.folder_id` exists and is
+   required for this route.
+2. **Cached OAuth token** copied up from a machine that has a browser. Works with
+   a personal My Drive; dies if access is revoked.
+3. **Interactive flow**, only when `interactive_auth: true`. False in
+   `lora_config_a100.yaml`, true in `lora_config.yaml`.
+
+With `interactive_auth: false` and no usable credential, the error names which of
+the two files to produce and how — a missing token needs a file copied to the
+instance, whereas a token that cannot refresh has had access revoked and must be
+re-authorised at the source. Those are different fixes, so they get different
+messages.
+
+`drive.file` is the only scope requested, which is why `folder_id` is not
+optional in practice: the scope grants access to files the app created, so a
+folder made by hand in the Drive UI is invisible to it and resolving `folder` by
+name would silently create a second folder beside it.
+
+### Fail fast at startup, never mid-run
+
+`CheckpointSync.start()` authenticates *before* the weights load, so a credential
+problem ends the run in its first second instead of being discovered six hours
+later as an empty Drive folder. The inverse holds for uploads: a failure there is
+counted in `SyncStats` and logged, never raised. Losing one checkpoint copy is
+bad; killing a six-hour run over a transient 503 is worse.
+
+### Remote retention is a separate knob
+
+`save_total_limit` bounds the *instance's* disk, but every checkpoint ever written
+reaches Drive — a 17,000-step run at `save_steps: 200` would leave 86 of them
+there. `drive.keep_remote: 5` deletes the oldest beyond that, bypassing the trash
+because a trashed folder still counts against the account's quota.
+
+### Flagged for confirmation (CLAUDE.md §9)
+
+- **`keep_remote: 5`** on the A100 profile, ≈1.5 GB of adapter plus optimiser
+  state, covering a two-hour rollback. Set `0` to keep every checkpoint.
+- **`upload_optimizer_state: true`.** `optimizer.pt` is roughly twice the adapter;
+  mirroring it is what makes a resume bit-identical rather than merely close.
+- **`drain_timeout_s: 900`.** A bounded wait, because an upload wedged behind a
+  dead network must not keep a billed instance alive. Anything already in Drive
+  stays valid, since the marker only names complete checkpoints.
+- **The final adapter is mirrored with `publish=False`.** It is the deliverable,
+  not a resume point; naming it in `LATEST` would send the next resume at a
+  directory with no trainer state.

@@ -45,22 +45,28 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
-import random
 import sys
-import threading
 import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from fa_ocr_lora.config import ensure_dotenv_loaded, env_path  # noqa: E402
+# The Drive client itself lives in the package, not here, because the training
+# loop uploads checkpoints through the same code (see
+# fa_ocr_lora.training.checkpoint_sync). A second copy in this script would be
+# the one that stops getting fixes.
+from fa_ocr_lora.drive import (  # noqa: E402
+    DEFAULT_CLIENT_SECRET,
+    DEFAULT_TOKEN,
+    DriveClient,
+    DriveError,
+    load_credentials,
+)
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -82,24 +88,6 @@ COMBINED_MANIFEST_NAME = "manifest.csv"
 DRIVE_IMAGE_DIR = "generate/image"
 DRIVE_GENERATE_JSON_DIR = "generate/json"
 DRIVE_TEXT_JSON_DIR = "text/json"
-
-# OAuth. Both files hold credentials, so their location comes from the
-# environment (`.env`) rather than being pinned in source: a shared machine or a
-# CI runner keeps them outside the checkout. The `secrets/` fallback is what a
-# single-developer setup gets.
-ensure_dotenv_loaded()
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-DEFAULT_CLIENT_SECRET = env_path(
-    "GOOGLE_DRIVE_CREDENTIALS", PROJECT_ROOT / "secrets" / "drive_client_secret.json"
-)
-DEFAULT_TOKEN = env_path(
-    "GOOGLE_DRIVE_TOKEN", PROJECT_ROOT / "secrets" / "drive_token.json"
-)
-
-FOLDER_MIME = "application/vnd.google-apps.folder"
-RESUMABLE_THRESHOLD = 8 * 1024 * 1024  # bytes; below this a simple upload wins
-MAX_ATTEMPTS = 6
-RETRY_STATUSES = frozenset({403, 408, 429, 500, 502, 503, 504})
 
 
 @dataclass(frozen=True)
@@ -234,206 +222,6 @@ def build_combined_manifest(
             )
             count += 1
     return count
-
-
-# --------------------------------------------------------------------------- #
-# Google Drive client
-# --------------------------------------------------------------------------- #
-
-
-def _import_google() -> tuple[Any, ...]:
-    """Import the Google client libraries, with an actionable error if absent."""
-    try:
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from googleapiclient.discovery import build
-        from googleapiclient.errors import HttpError
-        from googleapiclient.http import MediaFileUpload
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise SystemExit(
-            "Missing Google client libraries. Install them with:\n"
-            "  pip install google-api-python-client google-auth-oauthlib"
-        ) from exc
-    return Request, Credentials, InstalledAppFlow, build, HttpError, MediaFileUpload
-
-
-def load_credentials(client_secret: Path, token: Path) -> Any:
-    """Return OAuth user credentials, running the consent flow if needed."""
-    Request, Credentials, InstalledAppFlow, _, _, _ = _import_google()
-    creds = None
-    if token.exists():
-        creds = Credentials.from_authorized_user_file(str(token), SCOPES)
-    if creds and creds.valid:
-        return creds
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        if not client_secret.exists():
-            raise SystemExit(
-                f"OAuth client secret not found at {client_secret}.\n"
-                "Create a 'Desktop app' OAuth client in Google Cloud Console "
-                "(with the Drive API enabled), download its JSON, and save it "
-                "there (or pass --credentials)."
-            )
-        flow = InstalledAppFlow.from_client_secrets_file(str(client_secret), SCOPES)
-        creds = flow.run_local_server(port=0)
-    token.parent.mkdir(parents=True, exist_ok=True)
-    token.write_text(creds.to_json(), encoding="utf-8")
-    os.chmod(token, 0o600)
-    return creds
-
-
-def _is_transient(exc: Any) -> bool:
-    """Return whether an ``HttpError`` is worth retrying.
-
-    A 403 is ambiguous in the Drive API: it covers both quota throttling
-    (retry) and hard failures such as a permission error or a full Drive (do
-    not retry), so the reason string in the response body decides.
-    """
-    status = getattr(exc.resp, "status", None)
-    if status == 403:
-        body = getattr(exc, "content", b"") or b""
-        if b"storageQuotaExceeded" in body:
-            return False
-        return b"ateLimitExceeded" in body or b"quotaExceeded" in body
-    return status in RETRY_STATUSES
-
-
-class DriveClient:
-    """Thin, thread-safe-enough wrapper over the Drive v3 files API."""
-
-    def __init__(self, credentials: Any) -> None:
-        """Store credentials and prepare per-thread service objects."""
-        self._credentials = credentials
-        self._local = threading.local()
-        self._folder_cache: dict[tuple[str, str], str] = {}
-        self._folder_lock = threading.Lock()
-        _, _, _, build, http_error, media = _import_google()
-        self._build = build
-        self._http_error = http_error
-        self._media = media
-
-    @property
-    def service(self) -> Any:
-        """Return a Drive service bound to the calling thread."""
-        service = getattr(self._local, "service", None)
-        if service is None:
-            service = self._build(
-                "drive", "v3", credentials=self._credentials, cache_discovery=False
-            )
-            self._local.service = service
-        return service
-
-    def _execute(self, request: Any) -> Any:
-        """Execute a Drive request with exponential backoff on transient errors."""
-        for attempt in range(MAX_ATTEMPTS):
-            try:
-                return request.execute()
-            except self._http_error as exc:
-                if attempt == MAX_ATTEMPTS - 1 or not _is_transient(exc):
-                    raise
-            except (TimeoutError, ConnectionError, OSError):
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise
-            time.sleep(min(2**attempt, 32) + random.random())
-        raise RuntimeError("unreachable")
-
-    def ensure_folder(self, relative_path: str, root_id: str) -> str:
-        """Resolve (creating as needed) a ``a/b/c`` folder path under ``root_id``."""
-        parent = root_id
-        for part in (p for p in relative_path.split("/") if p):
-            key = (parent, part)
-            with self._folder_lock:
-                cached = self._folder_cache.get(key)
-            if cached:
-                parent = cached
-                continue
-            parent = self._find_or_create_folder(part, parent)
-            with self._folder_lock:
-                self._folder_cache[key] = parent
-        return parent
-
-    def _find_or_create_folder(self, name: str, parent_id: str) -> str:
-        """Return the id of the child folder ``name``, creating it if missing."""
-        query = (
-            f"name = '{name}' and mimeType = '{FOLDER_MIME}' "
-            f"and '{parent_id}' in parents and trashed = false"
-        )
-        response = self._execute(
-            self.service.files().list(
-                q=query,
-                spaces="drive",
-                fields="files(id)",
-                pageSize=1,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            )
-        )
-        files = response.get("files", [])
-        if files:
-            return files[0]["id"]
-        created = self._execute(
-            self.service.files().create(
-                body={"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]},
-                fields="id",
-                supportsAllDrives=True,
-            )
-        )
-        return created["id"]
-
-    def list_folder(self, folder_id: str) -> dict[str, tuple[str, int]]:
-        """Return ``{name: (file_id, size_bytes)}`` for one Drive folder."""
-        found: dict[str, tuple[str, int]] = {}
-        page_token = None
-        while True:
-            response = self._execute(
-                self.service.files().list(
-                    q=f"'{folder_id}' in parents and trashed = false",
-                    spaces="drive",
-                    fields="nextPageToken, files(id, name, size)",
-                    pageSize=1000,
-                    pageToken=page_token,
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-            )
-            for item in response.get("files", []):
-                found[item["name"]] = (item["id"], int(item.get("size") or 0))
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                return found
-
-    def upload(
-        self,
-        local_path: Path,
-        drive_name: str,
-        folder_id: str,
-        mime_type: str,
-        existing_id: str | None,
-    ) -> str:
-        """Create or update one file in Drive and return its id."""
-        size = local_path.stat().st_size
-        media = self._media(
-            str(local_path),
-            mimetype=mime_type,
-            resumable=size > RESUMABLE_THRESHOLD,
-        )
-        if existing_id:
-            request = self.service.files().update(
-                fileId=existing_id,
-                media_body=media,
-                fields="id",
-                supportsAllDrives=True,
-            )
-        else:
-            request = self.service.files().create(
-                body={"name": drive_name, "parents": [folder_id]},
-                media_body=media,
-                fields="id",
-                supportsAllDrives=True,
-            )
-        return self._execute(request)["id"]
 
 
 # --------------------------------------------------------------------------- #
@@ -673,7 +461,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ... and {len(items) - 5} more")
         return 0
 
-    client = DriveClient(load_credentials(args.credentials, args.token))
+    try:
+        client = DriveClient(load_credentials(args.credentials, args.token))
+    except DriveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     root_id = args.drive_root_id or client.ensure_folder(args.drive_root, "root")
     print(f"drive root folder id: {root_id}")
 

@@ -70,3 +70,7 @@ weights/
 models/
 data/models/
 data/weights/
+
+# Agents
+.agents/
+.claude/

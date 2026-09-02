@@ -46,6 +46,7 @@ from pathlib import Path
 import torch
 
 from ..config.base import ConfigError
+from ..drive import DriveError
 from . import vram
 from .config import TrainingConfig, load_training_config
 from .loop import TrainingOutcome, run_training
@@ -125,7 +126,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-resume",
         action="store_true",
-        help="Start fresh, ignoring any checkpoint in the output directory.",
+        help="Start fresh, ignoring any checkpoint locally or in Drive.",
+    )
+    drive = parser.add_mutually_exclusive_group()
+    drive.add_argument(
+        "--drive",
+        dest="drive",
+        action="store_true",
+        default=None,
+        help="Mirror every checkpoint and the run log to Google Drive in the "
+        "background. Needs credentials; see configs/lora_config_a100.yaml.",
+    )
+    drive.add_argument(
+        "--no-drive",
+        dest="drive",
+        action="store_false",
+        default=None,
+        help="Keep checkpoints on local disk only, whatever the config says.",
+    )
+    parser.add_argument(
+        "--drive-folder-id",
+        default=None,
+        metavar="ID",
+        help="Upload into this existing Drive folder id (the last segment of the "
+        "folder's URL) instead of resolving drive.folder by name. Required for a "
+        "folder made by hand, or for a Shared Drive when using a service account.",
+    )
+    parser.add_argument(
+        "--drive-run-name",
+        default=None,
+        metavar="NAME",
+        help="Remote subfolder for this run (default: the output directory's name).",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -170,6 +201,12 @@ def _apply_overrides(config: TrainingConfig, args: argparse.Namespace) -> Traini
         payload["model"]["quantize_vision"] = False
     if args.no_resume:
         payload["runtime"]["resume_from_checkpoint"] = False
+    if args.drive is not None:
+        payload["drive"]["enabled"] = args.drive
+    if args.drive_folder_id is not None:
+        payload["drive"]["folder_id"] = args.drive_folder_id
+    if args.drive_run_name is not None:
+        payload["drive"]["run_name"] = args.drive_run_name
     if args.smoke:
         payload["runtime"]["smoke_test"] = True
     if args.probe is not None:
@@ -195,7 +232,7 @@ def _report_oom(config: TrainingConfig, exc: BaseException) -> None:
     LOGGER.error("%s", vram.banner(report, config.model))
     LOGGER.error("levers, largest measured saving first:")
     if config.model.quantization != "nf4":
-        LOGGER.error("  --quantize nf4                 base weights 1730 -> 1510 MiB")
+        LOGGER.error("  --quantize nf4                 base weights 1828 -> 1510 MiB")
     if not config.model.quantize_vision:
         LOGGER.error("  drop --no-quantize-vision      base weights 1510 ->  870 MiB")
     LOGGER.error(
@@ -248,6 +285,13 @@ def main(argv: list[str] | None = None) -> int:
         config.optim.num_epochs,
         config.optim.effective_batch_size,
     )
+    if config.drive.enabled and not (smoke or probe_steps):
+        LOGGER.info(
+            "drive       %s/%s (resume from drive: %s)",
+            config.drive.folder_id or config.drive.folder,
+            config.drive.resolved_run_name(config.paths.output_dir),
+            "yes" if config.drive.resume_from_drive else "no",
+        )
     if args.verbose:
         LOGGER.debug("full configuration: %s", config.to_dict())
 
@@ -257,6 +301,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except torch.OutOfMemoryError as exc:
         _report_oom(config, exc)
+        return 1
+    except DriveError as exc:
+        # Ahead of RuntimeError, which it subclasses: the message is a set of
+        # instructions for fixing credentials, so it should not be prefixed with
+        # "training failed" as though the loop itself broke.
+        LOGGER.error("google drive: %s", exc)
+        LOGGER.error("or pass --no-drive to train without mirroring")
         return 1
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         LOGGER.error("training failed: %s", exc)

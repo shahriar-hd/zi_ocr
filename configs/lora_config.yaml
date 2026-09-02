@@ -45,7 +45,7 @@ model:
   # double quantisation. Measured resident weights on this model, read from the
   # allocator after load rather than estimated from parameter counts:
   #
-  #     none                       ~1730 MiB   (estimate; does not fit here)
+  #     none                       ~1828 MiB   (estimate; does not fit here)
   #     nf4, vision bf16            1510 MiB
   #     nf4, vision quantized too    870 MiB
   #
@@ -308,3 +308,51 @@ eval:
   # rest are counted, never silently dropped. Every fault is also in
   # eval_predictions.jsonl per record, uncapped.
   max_findings: 200
+
+# --- Google Drive checkpoint mirroring --------------------------------------- #
+# Off locally. This machine's disk outlives the process, so mirroring would only
+# spend upstream bandwidth to duplicate files that are not going anywhere. It is
+# on in configs/lora_config_a100.yaml, where the disk dies with the instance.
+#
+# Enable it here to test the plumbing without a rented GPU:
+#   fa-ocr-train --drive --drive-folder-id <id> --probe 0 --limit 64
+drive:
+  enabled: false
+  # Drive folder to hold every run, created on first use. Ignored when folder_id
+  # is set.
+  folder: fa-ocr-lora
+  # An existing folder's id - the last segment of its URL in the browser. Needed
+  # because the drive.file OAuth scope can only see files this code created, so a
+  # folder made by hand in the Drive UI is invisible and resolving `folder` by
+  # name would create a second one beside it.
+  folder_id: ""
+  # Remote subfolder for this run. Empty derives it from paths.output_dir's name,
+  # which is what stops a smoke test from overwriting an overnight run.
+  run_name: ""
+  # Credentials, in the order they are tried. null means the GOOGLE_DRIVE_*
+  # default from fa_ocr_lora.drive (secrets/drive_service_account.json,
+  # secrets/drive_token.json, secrets/drive_client_secret.json).
+  service_account_path: null
+  token_path: null
+  client_secret_path: null
+  # Whether a browser may be opened for consent. False everywhere it matters: on
+  # a headless box run_local_server() binds a port nobody can reach and the run
+  # hangs until it is killed. True only for the one-time local authorisation.
+  interactive_auth: true
+  # Parallel file transfers within one checkpoint. Uploads are socket I/O, so
+  # these are threads and they cost the training loop nothing.
+  workers: 4
+  upload_logs: true
+  # optimizer.pt is roughly twice the adapter. Mirroring it is what makes a resume
+  # bit-identical rather than merely close; drop it to trade that for bandwidth.
+  upload_optimizer_state: true
+  # Download the newest remote checkpoint when the local disk has none.
+  resume_from_drive: true
+  # Remote checkpoints kept, oldest deleted first. Distinct from
+  # runtime.save_total_limit, which only bounds this disk: every checkpoint
+  # reaches Drive, so a long run at save_steps: 200 would otherwise leave dozens.
+  # 0 keeps all of them.
+  keep_remote: 5
+  # Seconds to wait for the last upload once training ends. Bounded on purpose -
+  # an upload wedged behind a dead network must not keep a billed instance alive.
+  drain_timeout_s: 900.0

@@ -28,12 +28,21 @@ The other job of this module is to answer "how long will this take, and will it 
 *before* a night is committed to it: :func:`run_training` with ``probe_steps`` runs a
 handful of real steps and reports measured seconds per step, peak VRAM and a
 projected epoch time.
+
+On a rented GPU there is a third job: surviving the instance. :func:`run_log_file`
+tees every log line to ``<output_dir>/logs/train.log`` so a killed terminal does not
+take the run's history with it, and :class:`DriveSyncCallback` mirrors each checkpoint
+to Google Drive in the background (see
+:mod:`~fa_ocr_lora.training.checkpoint_sync`). Both are inert on a laptop, where
+``drive.enabled`` is false and the disk outlives the process.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -43,11 +52,12 @@ from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
 from torch.utils.data import Sampler
 from transformers import Trainer, TrainerCallback, TrainingArguments
-from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 
 from ..dataset.common.io_utils import ensure_dir, write_json
 from . import vram
-from .config import TrainingConfig
+from .checkpoint_sync import CheckpointSync
+from .config import DriveConfig, TrainingConfig
 from .data import (
     DigitAwareLengthGroupedSampler,
     PersianOcrDataset,
@@ -62,12 +72,14 @@ from .modeling import (
 )
 
 __all__ = [
+    "DriveSyncCallback",
     "EpochSeedCallback",
     "LoraTrainer",
     "TrainingOutcome",
     "build_arguments",
     "build_trainer",
     "find_last_checkpoint",
+    "run_log_file",
     "run_training",
 ]
 
@@ -150,6 +162,124 @@ class TrainingOutcome:
         if self.adapter_dir is not None:
             lines.append(f"adapter    {self.adapter_dir}")
         return "\n".join(lines)
+
+
+@contextmanager
+def run_log_file(output_dir: Path, *, level: int = logging.INFO) -> Iterator[Path]:
+    """Tee the root logger to a file for the duration of a run.
+
+    A rented instance is reached over SSH, and a dropped connection takes the
+    console scrollback with it - including the throughput numbers and the VRAM
+    peak that the run existed to measure. The file handler is attached to the
+    *root* logger rather than this package's, so transformers' own warnings (the
+    ones that explain a stalled dataloader or a skipped checkpoint) land in the
+    same place.
+
+    Opened in append mode: a resumed run continues its predecessor's log instead
+    of truncating the history of the steps it is about to skip over.
+
+    Args:
+        output_dir: The run's output directory; the log goes in ``logs/`` under it.
+        level: Minimum level to record.
+
+    Yields:
+        The path being written, so the caller can hand it to the Drive mirror.
+    """
+    path = ensure_dir(output_dir / "logs") / "train.log"
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    handler.setLevel(level)
+    root = logging.getLogger()
+    # A CLI that never called basicConfig leaves the root logger at WARNING, which
+    # would drop every info line on the floor before the handler ever sees it.
+    if root.level > level or root.level == logging.NOTSET:
+        root.setLevel(level)
+    root.addHandler(handler)
+    LOGGER.info("run log -> %s", path)
+    try:
+        yield path
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+
+
+class DriveSyncCallback(TrainerCallback):
+    """Hands each freshly written checkpoint to the background Drive uploader.
+
+    ``on_save`` is the one hook that covers both triggers: ``Trainer`` calls it
+    after ``_save_checkpoint`` whether the save came from ``save_strategy:
+    steps`` or ``save_strategy: epoch``, so there is no second code path for
+    epoch boundaries.
+
+    The callback does no I/O of its own - :meth:`CheckpointSync.enqueue` hard-links
+    the directory and returns - so the cost to the training loop is a few
+    microseconds per save rather than the minutes an upload takes.
+    """
+
+    def __init__(self, sync: CheckpointSync, checkpoint_root: Path) -> None:
+        """Bind the callback to an already-started mirror.
+
+        Args:
+            sync: The running uploader.
+            checkpoint_root: Trainer output directory holding ``checkpoint-*``.
+        """
+        self._sync = sync
+        self._root = checkpoint_root
+
+    def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        """Queue the checkpoint just written for this step.
+
+        Args:
+            args: Training arguments, unused.
+            state: Trainer state, read for the global step.
+            control: Flow control object, unused.
+            **kwargs: Remaining Trainer callback arguments, unused.
+        """
+        directory = self._root / f"{PREFIX_CHECKPOINT_DIR}-{int(state.global_step)}"
+        if not directory.is_dir():
+            # Reached when Trainer renames or relocates a checkpoint; a missing
+            # directory is worth a line in the log but is not worth failing over.
+            LOGGER.warning("drive sync: no checkpoint at %s to upload", directory)
+            return
+        self._sync.enqueue(directory)
+
+
+def build_checkpoint_sync(
+    drive: DriveConfig,
+    *,
+    output_dir: Path,
+    log_path: Path | None,
+) -> CheckpointSync:
+    """Construct (but do not start) the Drive mirror for a run.
+
+    Args:
+        drive: The run's ``drive`` section.
+        output_dir: The run's output directory, which names the remote folder and
+            holds the local staging area.
+        log_path: Run log to mirror, or ``None`` to mirror checkpoints only.
+
+    Returns:
+        A configured, not-yet-authenticated mirror.
+    """
+    return CheckpointSync(
+        run_name=drive.resolved_run_name(output_dir),
+        output_dir=output_dir,
+        root_folder=drive.folder,
+        root_folder_id=drive.folder_id or None,
+        service_account=drive.service_account_path,
+        token=drive.token_path,
+        client_secret=drive.client_secret_path,
+        interactive=drive.interactive_auth,
+        workers=drive.workers,
+        upload_optimizer_state=drive.upload_optimizer_state,
+        keep_remote=drive.keep_remote,
+        log_path=log_path if drive.upload_logs else None,
+    )
 
 
 class EpochSeedCallback(TrainerCallback):
@@ -300,9 +430,7 @@ class LoraTrainer(Trainer):
             state_dict: Ignored, see above.
         """
         target = ensure_dir(Path(output_dir or self.args.output_dir))
-        unwrap_base(self.model).save_pretrained(
-            str(target), save_embedding_layers=False
-        )
+        unwrap_base(self.model).save_pretrained(str(target), save_embedding_layers=False)
         LOGGER.debug("wrote adapter to %s", target)
 
     def _load_from_checkpoint(
@@ -538,6 +666,39 @@ def run_training(
     Returns:
         What the run measured.
     """
+    with run_log_file(config.paths.output_dir) as log_path:
+        return _run_training(
+            config,
+            log_path=log_path,
+            smoke=smoke,
+            probe_steps=probe_steps,
+            limit=limit,
+        )
+
+
+def _run_training(
+    config: TrainingConfig,
+    *,
+    log_path: Path,
+    smoke: bool,
+    probe_steps: int,
+    limit: int | None,
+) -> TrainingOutcome:
+    """Body of :func:`run_training`, run with the file log already attached.
+
+    Split out only so the ``with`` block does not reindent the whole function;
+    every argument means what it does there, plus:
+
+    Args:
+        config: Loaded training configuration.
+        log_path: The run log, mirrored to Drive alongside each checkpoint.
+        smoke: See :func:`run_training`.
+        probe_steps: See :func:`run_training`.
+        limit: See :func:`run_training`.
+
+    Returns:
+        What the run measured.
+    """
     report = vram.probe_vram(config.model, config.image)
     LOGGER.info("%s", vram.banner(report, config.model))
     if report.clamped:
@@ -545,17 +706,80 @@ def run_training(
             config, image=replace(config.image, max_pixels=report.max_pixels)
         )
 
+    short_run = smoke or probe_steps > 0
+
+    # Authenticated here, before the 1.8 GB of weights load, because a bad
+    # credential must end the run in its first second. Deferring it would turn a
+    # typo in a service-account path into six hours of training whose only
+    # surviving copy dies with the instance - discovered as an empty Drive folder.
+    # Short runs skip it: nothing they produce is worth keeping.
+    sync: CheckpointSync | None = None
+    if config.drive.enabled and not short_run:
+        sync = build_checkpoint_sync(
+            config.drive, output_dir=config.paths.output_dir, log_path=log_path
+        )
+        sync.start()
+    try:
+        return _train(
+            config,
+            sync=sync,
+            short_run=short_run,
+            smoke=smoke,
+            probe_steps=probe_steps,
+            limit=limit,
+        )
+    finally:
+        # Reached on the happy path too, where it is a no-op: _train drains the
+        # queue itself so the summary can report what landed. This is here for
+        # the paths that do not get that far - an OOM, a Ctrl-C - where the
+        # checkpoints already staged are exactly the ones worth waiting for.
+        if sync is not None:
+            sync.close(config.drive.drain_timeout_s)
+
+
+def _train(
+    config: TrainingConfig,
+    *,
+    sync: CheckpointSync | None,
+    short_run: bool,
+    smoke: bool,
+    probe_steps: int,
+    limit: int | None,
+) -> TrainingOutcome:
+    """Load the model, run the loop, save the adapter, write the summary.
+
+    Args:
+        config: Loaded training configuration, already VRAM-clamped.
+        sync: A started Drive mirror, or ``None`` when mirroring is off.
+        short_run: Whether this is a smoke or probe run, which saves nothing.
+        smoke: See :func:`run_training`.
+        probe_steps: See :func:`run_training`.
+        limit: See :func:`run_training`.
+
+    Returns:
+        What the run measured.
+    """
     loaded = load_training_model(config)
     LOGGER.info("%s", loaded.describe())
 
     trainer = build_trainer(
         config, loaded, smoke=smoke, probe_steps=probe_steps, limit=limit
     )
-    short_run = smoke or probe_steps > 0
+    checkpoint_root = Path(trainer.args.output_dir)
 
     resume: Path | None = None
     if config.runtime.resume_from_checkpoint and not short_run:
-        resume = find_last_checkpoint(Path(trainer.args.output_dir))
+        # Local first: a checkpoint on this disk is at least as new as the remote
+        # copy and costs nothing to read. Drive is the fallback for the case the
+        # mirror exists for - a fresh instance whose disk starts empty.
+        resume = find_last_checkpoint(checkpoint_root)
+        if resume is None and sync is not None and config.drive.resume_from_drive:
+            resume = sync.fetch_resume(ensure_dir(checkpoint_root))
+            if resume is not None:
+                LOGGER.info("resuming from Drive checkpoint %s", resume.name)
+
+    if sync is not None:
+        trainer.add_callback(DriveSyncCallback(sync, checkpoint_root))
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -572,6 +796,11 @@ def run_training(
         )
         loaded.processor.save_pretrained(str(adapter_dir))
         LOGGER.info("adapter written to %s", adapter_dir)
+        if sync is not None:
+            # publish=False: this is the deliverable, not a resume point. Naming
+            # it in the LATEST marker would send the next resume at a directory
+            # with no trainer state and break a restart that would have worked.
+            sync.enqueue(adapter_dir, publish=False)
 
     outcome = TrainingOutcome(
         steps=int(trainer.state.global_step),
@@ -594,12 +823,25 @@ def run_training(
     )
     LOGGER.info("%s", outcome.describe())
 
+    if sync is not None:
+        # Drained before the summary so its counters are final rather than a
+        # snapshot of a still-running upload. The caller's finally block calls
+        # this again, where it returns immediately.
+        sync.close(config.drive.drain_timeout_s)
+
     if not short_run:
         write_json(
             config.paths.output_dir / SUMMARY_NAME,
             {
                 "steps": outcome.steps,
+                # Written so a consumer can recover the sample count the timings
+                # are per: `steps * batch_size`, not `epoch_samples`, which is one
+                # pass and not the whole run. training/simulate.py calibrates
+                # against these three and would be off by the epoch count without
+                # this field.
+                "batch_size": outcome.batch_size,
                 "epoch_samples": outcome.epoch_samples,
+                "samples_consumed": outcome.samples,
                 "seconds": round(outcome.seconds, 1),
                 "seconds_per_step": round(outcome.seconds_per_step, 3),
                 "seconds_per_sample": round(outcome.seconds_per_sample, 3),
@@ -608,6 +850,7 @@ def run_training(
                 "peak_vram_mib": round(outcome.peak_mib, 1),
                 "resumed_from": str(resume) if resume else None,
                 "adapter_dir": str(adapter_dir) if adapter_dir else None,
+                "drive": sync.stats.as_dict() if sync is not None else None,
             },
         )
     return outcome

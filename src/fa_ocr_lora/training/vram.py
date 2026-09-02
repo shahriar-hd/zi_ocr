@@ -68,9 +68,12 @@ WEIGHTS_MIB: Final[dict[tuple[str, bool], int]] = {
     ("nf4", True): 870,
     ("nf4", False): 1510,
     # bf16 throughout. Not measured on this machine - it does not fit here - so
-    # this is the parameter-count figure and is flagged as an estimate.
-    ("none", False): 1730,
-    ("none", True): 1730,
+    # this is the parameter-count figure and is flagged as an estimate:
+    # 958,588,736 parameters x 2 bytes = 1,917,177,472 B = 1,828 MiB. An earlier
+    # 1,730 sat here, from a census that summed the four blocks to 868M and so
+    # missed ~90M parameters; it understated the resident cost by ~98 MiB.
+    ("none", False): 1828,
+    ("none", True): 1828,
 }
 
 #: Sequence length the activation measurements are anchored at.
@@ -114,7 +117,7 @@ def projected_peak_mib(
     resident = (
         weights_mib
         if weights_mib is not None
-        else WEIGHTS_MIB.get((model.quantization, model.quantize_vision), 1730)
+        else WEIGHTS_MIB.get((model.quantization, model.quantize_vision), 1828)
     )
     over = ACTIVATION_BASE_MIB + ACTIVATION_PER_TOKEN_MIB * max(
         0, image.max_total_seq_len - BASELINE_SEQ

@@ -66,17 +66,24 @@ data:
   # (manifest._allocate takes min(limit, available)), so these are ceilings
   # rather than assertions about the corpus size:
   #
-  #     letters_pages   26,848 pages exist (from 10,000 letters)
-  #     letters_crops   200k+ croppable regions exist; 60,000 is a weighted draw
-  #                     that keeps metadata_field over-represented rather than
-  #                     letting 94k list_item regions dominate
-  #     pixel_pages     6,145 rows exist
+  #     letters_pages   26,848 pages exist (from 10,000 letters), all local
+  #     letters_crops   328,832 croppable regions exist after the exclusions and
+  #                     size floors; 60,000 is a weighted draw that keeps
+  #                     metadata_field over-represented rather than letting the
+  #                     93,976 list_item regions dominate
+  #     pixel_pages     31,000 is the full sample_type=page set. The local copy
+  #                     is a partial download of 6,145 rows, so on this machine
+  #                     the cap bites and 6,145 is what the manifest gets; on a
+  #                     machine with the complete download it draws 31,000.
+  #                     Left at the full figure deliberately - it is a ceiling,
+  #                     and lowering it would silently shrink the run on a box
+  #                     that does have all the data.
   #
-  # ~93k records against the local run's 10k. Wall-clock scales roughly with
+  # ~118k records against the local run's 10k. Wall-clock scales roughly with
   # this number, which is what the probe is for.
   letters_pages: 26848
   letters_crops: 60000
-  pixel_pages: 6145
+  pixel_pages: 31000
 
   # Unchanged from the local config on purpose - see the seed comment above.
   # Raising it would hold out different records and break the comparison.
@@ -125,12 +132,14 @@ data:
   digit_oversample_multiplier: 2.0
 
 image:
-  # Full page resolution, which the 4 GB card could not afford. 2,175,600 =
-  # 2775 image tokens exactly (784 px per token), and the corpus's largest page
-  # is 1240x1754 = 2,174,960 px, so every letter now passes through the
-  # processor UNSCALED. The local run downscales A4 to ~107 DPI; this is the
-  # single change most likely to improve CER, because the metadata block's
-  # digits are small glyphs and downscaling is where they are lost.
+  # Full page resolution, which the 4 GB card could not afford. 2,175,600 px is
+  # 2,775 image tokens at 784 px each, and the corpus's largest page is
+  # 1240x1754 = 2,174,960 px, so every letter passes through the processor
+  # UNSCALED - it lands on 2,772 tokens, three under the ceiling, because the
+  # processor rounds each side down to a whole 28 px patch. The local run
+  # downscales A4 to ~107 DPI; this is the single change most likely to improve
+  # CER, because the metadata block's digits are small glyphs and downscaling is
+  # where they are lost.
   max_pixels: 2175600
   min_pixels: 147384
   # Off, not on. Autoprobe exists to rescue a run competing with a desktop
@@ -138,18 +147,30 @@ image:
   # and leaving it on would let vram.py's 3050 Ti coefficients silently reduce a
   # resolution that was chosen deliberately.
   autoprobe_vram: false
-  # 0 keeps the measured-coefficient projection, which is wrong for this card in
-  # the harmless direction: it under-projects against 40 GB of headroom, so it
-  # never clamps and never warns. Treat the startup banner's "projected" figure
-  # as uncalibrated here and trust the probe's measured peak instead. Set this
-  # to the probe's peak once measured, and the banner becomes meaningful again.
-  reserved_vram_mib: 0
+  # The projected peak from `fa-ocr-simulate --preset a100_40gb`, so the startup
+  # banner compares against a figure derived for THIS card rather than vram.py's
+  # 3050 Ti coefficients. With --pixel-available 31000 that command reports 30,089
+  # MiB at the worst batch, 73.5% of the card, which this rounds down to.
+  #
+  # It is a modelled number and a conservative one. Against the only run available
+  # to check it - data/training/lora_1000 - the same model predicted 2,113 MiB where
+  # the allocator reported 1,253, so it over-reads by ~1.7x on that case and 30,000
+  # is better read as a ceiling than as a forecast. Replace it with the probe's
+  # reported peak after the first `--probe 30`, which is the only way to make the
+  # banner authoritative.
+  reserved_vram_mib: 30000
 
-  # Raised to hold the larger image budget. 2775 image tokens leaves ~1300 for
-  # text, against a measured corpus p100 of 2758 total tokens at the old
-  # resolution - so text is not the binding constraint, the image is. The loader
-  # rejects a max_pixels whose token count reaches this value, which is the
-  # check that keeps the two in step.
+  # Measured, not inferred. Tokenising all 26,848 pages at the resolution above
+  # gives total sequence lengths of p50 2,953 / p95 3,681 / p99 3,864, so 4,096
+  # covers the corpus with room to spare: only 44 pages (0.16%) have an answer
+  # long enough that _image_budget clamps the image below full resolution, and
+  # on_oversize fires on 2 records in the whole corpus.
+  #
+  # Note which mechanism actually binds. encoding.SampleEncoder gives the image
+  # whatever the tokenised ANSWER leaves over, so a long transcription costs
+  # resolution silently, long before on_oversize is consulted. 4,096 is the value
+  # that keeps that from happening to a meaningful share of pages; raising it
+  # further would pay quadratic decoder attention on every sample to rescue 44.
   max_total_seq_len: 4096
   # Raised from 128. The chunking exists to bound the float32 (rows x 103,424)
   # logit tensor, and at batch 8 a step supervises several thousand positions;
@@ -159,10 +180,11 @@ image:
   on_oversize: shrink_image
 
 lora:
-  # Adapter shape unchanged. It is not memory-bound on either card - 9.39M
-  # trainable parameters is 1.52% of the model - so there is no reason to widen
-  # it just because the GPU is larger. Widen it only if evaluation shows the
-  # rank is the limit, per CLAUDE.md 6.
+  # Adapter shape unchanged. It is not memory-bound on either card - 9,388,032
+  # trainable parameters is 0.98% of the model's 958,588,736 - so there is no
+  # reason to widen it just because the GPU is larger. r: 32 would cost ~19M
+  # parameters and about 70 MiB more VRAM, which this card would not notice;
+  # widen it only if evaluation shows the rank is the limit, per CLAUDE.md 6.
   r: 16
   alpha: 32
   dropout: 0.05
@@ -238,3 +260,55 @@ eval:
   max_new_tokens: 1024
   num_beams: 1
   confusion_top_k: 20
+
+# --- Google Drive checkpoint mirroring --------------------------------------- #
+# On. This is the section that makes a rented A100 survivable: the instance is
+# billed hourly, is not backed up, and takes its disk with it when it is
+# reclaimed. A 6,800-step epoch is hours of work whose only copy would otherwise
+# live on storage the provider can revoke without notice.
+#
+# Uploads run on a background thread, so the GPU never waits for the network -
+# enqueueing a checkpoint hard-links it and returns in microseconds. A LATEST
+# marker is written only after every file of a checkpoint has landed, so an
+# instance that disappears mid-upload leaves the previous complete checkpoint as
+# the newest one resume will pick.
+#
+# Credentials, one of these two, before starting a long run:
+#
+#   * Service account (recommended headless). Create a key in Google Cloud
+#     Console, save it to secrets/drive_service_account.json, and share the
+#     destination folder with the key's client_email. Note a service account has
+#     NO Drive storage quota of its own: it must write into a Shared Drive or a
+#     folder someone shared with it, and folder_id below must name that folder.
+#     Writing to its own My Drive fails with storageQuotaExceeded.
+#
+#   * Copied OAuth token. Run `python scripts/upload_to_drive.py --dry-run` once
+#     on a machine with a browser, then scp secrets/drive_token.json to the
+#     instance. Works with a personal My Drive; expires if access is revoked.
+drive:
+  enabled: true
+  folder: fa-ocr-lora
+  # Fill this in. Required for a service account (see above) and for any folder
+  # not created by this code. Also settable per-machine without editing the file:
+  #   export FA_OCR_TRAIN_DRIVE_FOLDER_ID=<id>
+  folder_id: ""
+  # Empty derives it from paths.output_dir's name, so an a100 run and a laptop
+  # run never write into the same remote folder.
+  run_name: ""
+  service_account_path: null
+  token_path: null
+  client_secret_path: null
+  # False: there is no browser here. The run fails in its first second with
+  # instructions rather than hanging on a consent page nobody can answer.
+  interactive_auth: false
+  # 32 vCPUs and a datacentre uplink; the ceiling is the network, not the host.
+  workers: 8
+  upload_logs: true
+  upload_optimizer_state: true
+  # The whole point on a fresh instance: an empty local disk falls back to Drive
+  # rather than restarting from step 0.
+  resume_from_drive: true
+  # ~14 checkpoints per epoch at save_steps: 500. Keeping 5 is ~1.5 GB of adapter
+  # plus optimiser state and covers a rollback of two hours.
+  keep_remote: 5
+  drain_timeout_s: 900.0

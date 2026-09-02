@@ -42,6 +42,7 @@ __all__ = [
     "PIXELS_PER_TOKEN",
     "QUANTIZATION_CHOICES",
     "DataConfig",
+    "DriveConfig",
     "EvalConfig",
     "ImageConfig",
     "LoraConfig",
@@ -1086,6 +1087,133 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DriveConfig:
+    """Mirroring checkpoints and the run log to Google Drive.
+
+    Off by default, because a local run has nothing to gain from it. It exists
+    for the rented-GPU case: an instance that is reclaimed takes its disk with
+    it, so the only durable copy of a long run's checkpoints is a remote one.
+    :mod:`fa_ocr_lora.training.checkpoint_sync` does the work, on a background
+    thread, so enabling this does not slow a step down.
+
+    The three credential paths are alternatives, tried in the order the module
+    documents: service account, cached token, then the interactive flow. On a
+    headless server only the first two can work, which is why
+    ``interactive_auth`` defaults to ``False`` - a consent flow there would block
+    on a browser that will never open, and a run that hangs at startup is worse
+    than one that says why it cannot authenticate.
+
+    Attributes:
+        enabled: Whether to mirror at all.
+        folder: Drive folder path holding every run, resolved by name.
+        folder_id: An explicit Drive folder id, which wins over ``folder``.
+            Required to write into a folder created outside this code, since the
+            ``drive.file`` scope cannot see one by name and would silently make a
+            second folder beside it.
+        run_name: Remote subfolder for this run. Empty derives it from
+            ``paths.output_dir``, so two runs writing to different output
+            directories never mix their checkpoints.
+        service_account_path: Service-account key JSON. ``null`` falls back to
+            the module default, and then to the other two routes.
+        token_path: Cached OAuth token JSON. ``null`` uses the module default.
+        client_secret_path: OAuth client secret. ``null`` uses the default.
+        interactive_auth: Permit opening a browser for consent.
+        workers: Parallel file transfers within one checkpoint.
+        upload_logs: Mirror the run log next to the checkpoints.
+        upload_optimizer_state: Include ``optimizer.pt`` and friends. They are
+            the bulk of a checkpoint; excluding them makes the mirror much
+            faster but means a resumed run restarts its optimiser state.
+        resume_from_drive: When resuming and no local checkpoint exists, pull the
+            newest complete remote one.
+        keep_remote: Remote checkpoints retained, oldest deleted first. ``0``
+            keeps every one, which over a 17,000-step run at ``save_steps: 200``
+            means 86 of them.
+        drain_timeout_s: Seconds to wait for queued uploads once training ends.
+    """
+
+    enabled: bool = False
+    folder: str = "fa-ocr-lora"
+    folder_id: str = ""
+    run_name: str = ""
+    service_account_path: Path | None = None
+    token_path: Path | None = None
+    client_secret_path: Path | None = None
+    interactive_auth: bool = False
+    workers: int = 4
+    upload_logs: bool = True
+    upload_optimizer_state: bool = True
+    resume_from_drive: bool = True
+    keep_remote: int = 5
+    drain_timeout_s: float = 900.0
+
+    @classmethod
+    def parse(cls, payload: Mapping[str, Any]) -> DriveConfig:
+        """Build the section from YAML.
+
+        Args:
+            payload: The ``drive`` mapping.
+
+        Returns:
+            The validated section.
+
+        Raises:
+            ConfigError: On an unknown key or an out-of-range value.
+        """
+        context = "drive"
+        defaults = _defaults(cls)
+        _reject_unknown(payload, defaults, context)
+
+        def optional_path(key: str) -> Path | None:
+            """Read a path that may be ``null``, meaning "use the default"."""
+            raw = payload.get(key, defaults[key])
+            if raw is None:
+                return None
+            text = str(raw).strip()
+            return resolve_repo_path(text) if text else None
+
+        folder = str(payload.get("folder", defaults["folder"])).strip()
+        if not folder:
+            raise ConfigError(f"{context}.folder: must not be empty")
+        return cls(
+            enabled=_as_bool(payload, "enabled", False, context),
+            folder=folder,
+            folder_id=str(payload.get("folder_id", defaults["folder_id"])).strip(),
+            run_name=str(payload.get("run_name", defaults["run_name"])).strip(),
+            service_account_path=optional_path("service_account_path"),
+            token_path=optional_path("token_path"),
+            client_secret_path=optional_path("client_secret_path"),
+            interactive_auth=_as_bool(payload, "interactive_auth", False, context),
+            workers=_as_int(
+                payload, "workers", defaults["workers"], context, minimum=1, maximum=16
+            ),
+            upload_logs=_as_bool(payload, "upload_logs", True, context),
+            upload_optimizer_state=_as_bool(
+                payload, "upload_optimizer_state", True, context
+            ),
+            resume_from_drive=_as_bool(payload, "resume_from_drive", True, context),
+            keep_remote=_as_int(
+                payload, "keep_remote", defaults["keep_remote"], context, minimum=0
+            ),
+            drain_timeout_s=_as_float(
+                payload,
+                "drain_timeout_s",
+                defaults["drain_timeout_s"],
+                context,
+                minimum=0.0,
+            ),
+        )
+
+    def resolved_run_name(self, output_dir: Path) -> str:
+        """Return the remote folder name for a run writing to ``output_dir``.
+
+        Deriving it from the output directory rather than defaulting to a fixed
+        string is what keeps a smoke test from overwriting an overnight run's
+        checkpoints in Drive.
+        """
+        return self.run_name or output_dir.name
+
+
+@dataclass(frozen=True, slots=True)
 class EvalConfig:
     """Scoring settings for :mod:`~fa_ocr_lora.training.eval`.
 
@@ -1211,6 +1339,7 @@ class TrainingConfig:
         lora: Adapter shape.
         optim: Learning schedule.
         runtime: Loop mechanics.
+        drive: Google Drive checkpoint mirroring.
         eval: Scoring settings.
         source_path: File this was loaded from, for the run's README.
     """
@@ -1223,6 +1352,7 @@ class TrainingConfig:
     lora: LoraConfig = LoraConfig()
     optim: OptimConfig = OptimConfig()
     runtime: RuntimeConfig = RuntimeConfig()
+    drive: DriveConfig = DriveConfig()
     eval: EvalConfig = EvalConfig()
     source_path: Path | None = None
 
@@ -1251,6 +1381,7 @@ class TrainingConfig:
             "lora",
             "optim",
             "runtime",
+            "drive",
             "eval",
         }
         unknown = sorted(set(payload) - known)
@@ -1268,6 +1399,7 @@ class TrainingConfig:
             lora=LoraConfig.parse(_section(payload, "lora")),
             optim=OptimConfig.parse(_section(payload, "optim")),
             runtime=RuntimeConfig.parse(_section(payload, "runtime")),
+            drive=DriveConfig.parse(_section(payload, "drive")),
             eval=EvalConfig.parse(_section(payload, "eval")),
             source_path=source_path,
         )
@@ -1298,6 +1430,7 @@ class TrainingConfig:
             "lora",
             "optim",
             "runtime",
+            "drive",
             "eval",
         ):
             section = getattr(self, name)
@@ -1314,7 +1447,8 @@ def _env_overrides(config: TrainingConfig) -> TrainingConfig:
     Applied after the YAML is parsed, so a bad value from the environment hits
     the same validators a bad value in the file would and the error names the
     same field. Only the settings that genuinely differ per machine are
-    exposed - paths, the memory budget, and the run-shortening switches.
+    exposed - paths, the memory budget, the run-shortening switches, and where
+    Drive mirroring writes.
 
     Args:
         config: Configuration as loaded from YAML.
@@ -1356,6 +1490,32 @@ def _env_overrides(config: TrainingConfig) -> TrainingConfig:
         merged = {f.name: getattr(config.image, f.name) for f in fields(ImageConfig)}
         merged.update(image_payload)
         changes["image"] = ImageConfig.parse(merged)
+
+    # Drive mirroring is per-machine by nature: the same config file is read on
+    # the laptop, which has no reason to upload, and on the rented box, which
+    # does. The credential *paths* are deliberately not here - those come from
+    # GOOGLE_DRIVE_* (see fa_ocr_lora.drive), keeping secrets on one convention.
+    drive_payload: dict[str, Any] = {}
+    enabled = os.environ.get(f"{ENV_PREFIX}DRIVE_ENABLED", "").strip()
+    if enabled:
+        if enabled.lower() not in {"0", "1", "true", "false", "yes", "no"}:
+            raise ConfigError(
+                f"{ENV_PREFIX}DRIVE_ENABLED: expected a boolean, got {enabled!r}"
+            )
+        drive_payload["enabled"] = enabled.lower() in {"1", "true", "yes"}
+    for variable, key in (
+        (f"{ENV_PREFIX}DRIVE_FOLDER_ID", "folder_id"),
+        (f"{ENV_PREFIX}DRIVE_RUN_NAME", "run_name"),
+    ):
+        raw = os.environ.get(variable, "").strip()
+        if raw:
+            drive_payload[key] = raw
+    if drive_payload:
+        merged_drive = {
+            f.name: getattr(config.drive, f.name) for f in fields(DriveConfig)
+        }
+        merged_drive.update(drive_payload)
+        changes["drive"] = DriveConfig.parse(merged_drive)
 
     quantization = os.environ.get(f"{ENV_PREFIX}QUANTIZATION", "").strip()
     if quantization:
