@@ -151,6 +151,31 @@ class Hardware:
 #: The A100 entry describes the rented configuration this simulation was written
 #: for: 40 GB of VRAM exposed, 32 vCPU, 64 GB RAM, 200 GB disk. Its 312 TFLOPS is
 #: the vendor's dense bf16 tensor-core peak.
+#:
+#: The L40S entry describes machine 24733 on vast.ai (Türkiye), rented as the
+#: single-GPU SKU. Its figures are quoted from the provider's own offer record and
+#: from NVIDIA's datasheet, because two of them are not what a reader would guess:
+#:
+#: * ``bf16_tflops = 362.05`` is the **dense** tensor-core rate from NVIDIA's L40S
+#:   datasheet ("BFLOAT16 Tensor Core TFLOPS: 362.05 | 733*", the starred figure
+#:   being structured sparsity, which nothing here uses). The same datasheet gives
+#:   FP16 Tensor Core as 362.05/733 and FP32 as 91.6. This is Ada, compute
+#:   capability 8.9, so the projector's ``dtype: auto`` still resolves to
+#:   bfloat16 exactly as it does on the A100.
+#:
+#: * ``vram_gib = 44.99`` is the **rented** slice, not the silicon's 48 GB. The
+#:   offer reports ``gpu_ram`` 46,068 MiB, which is 44.99 GiB. Pricing it at the
+#:   nominal 48 GiB would overstate the headroom by 3 GiB on a projection whose
+#:   whole purpose is deciding whether step one fits.
+#:
+#: * ``vcpus = 12`` and ``ram_gib = 126`` are equally the **whole-machine**
+#:   specification divided by the GPU count: the host is 96 cores and 1,032 GB
+#:   across 8 GPUs, and the single-GPU SKU exposes ``cpu_cores_effective`` 12.0 and
+#:   ``cpu_ram`` 128,971 MiB. The A100 preset can use its host's full 32 cores;
+#:   this one cannot, and the input-pipeline check below depends on knowing that.
+#:
+#: * ``pcie_gbps = 25.7`` is the provider's measured host-to-device bandwidth for
+#:   this machine (PCIe 4.0 x16), not the card's bidirectional 64 GB/s link.
 HARDWARE_PRESETS: Final[dict[str, Hardware]] = {
     "a100_40gb": Hardware(
         name="A100 40 GB (rented: 32 vCPU / 64 GB RAM / 200 GB disk)",
@@ -159,6 +184,19 @@ HARDWARE_PRESETS: Final[dict[str, Hardware]] = {
         vcpus=32,
         ram_gib=64.0,
         storage_gib=200.0,
+    ),
+    "l40s_45gb": Hardware(
+        name=(
+            "L40S 45 GB (vast.ai machine 24733, TR: 12 vCPU / 126 GB RAM / "
+            "497 GB disk)"
+        ),
+        vram_gib=46068.0 / 1024.0,
+        bf16_tflops=362.05,
+        vcpus=12,
+        ram_gib=128971.0 / 1024.0,
+        storage_gib=497.375,
+        # The provider's measured host-to-device rate for this machine.
+        pcie_gbps=25.7,
     ),
     "rtx_3050ti": Hardware(
         name="RTX 3050 Ti Laptop 4 GB (the development card)",

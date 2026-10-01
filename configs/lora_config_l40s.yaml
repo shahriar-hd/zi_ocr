@@ -1,0 +1,366 @@
+# PaddleOCR-VL Persian LoRA - full training run on one rented L40S 45 GB.
+#
+# A sibling of lora_config_a100.yaml, not a replacement. The two configs are
+# deliberately IDENTICAL in every training-relevant setting, because the point of
+# this file is to move the same run onto a different card rather than to change
+# the run. What moves is the hardware description, the startup VRAM banner, and
+# the dataloader worker count - the one setting the L40S host genuinely cannot
+# match. Load it explicitly:
+#
+#     CONFIG=configs/lora_config_l40s.yaml scripts/train_a100.sh probe
+#
+# or via FA_OCR_TRAIN_CONFIG. The same loader validates both, so an unknown key
+# here is still a startup error rather than a silent no-op (CLAUDE.md 8).
+#
+# The target machine is vast.ai machine 24733 (Turkiye), single-GPU SKU:
+#
+#     GPU        L40S, compute capability 8.9 (Ada), 350 W
+#     VRAM       46,068 MiB = 44.99 GiB as rented, of 48 GB nominal
+#     bf16       362.05 TFLOPS dense tensor core (NVIDIA datasheet; 733 sparse)
+#     host       12 effective cores of a 96-core EPYC 9474F, 128,971 MiB RAM
+#     disk       497 GB NVMe, 4,471 MB/s
+#     PCIe       4.0 x16, 25.7 GB/s measured host-to-device
+#     price      $0.5348/h (plus bandwidth)
+#
+# Two consequences worth stating before the numbers below:
+#
+#   1. The L40S is 1.16x the A100's dense bf16 rate (362.05 vs 312), so the same
+#      run should be about 14% quicker, not slower. What it is NOT is a 1.16x
+#      card in practice: its 625 GB/s of memory bandwidth is 0.9x the A100's
+#      1,555 GB/s, and a LoRA run at batch 8 spends much of its step streaming
+#      frozen weights rather than multiplying them. Treat 1.16x as an upper bound
+#      on the speedup and re-probe before trusting either figure.
+#
+#   2. The rented SKU exposes only 12 cores, against the A100 profile's 32. That
+#      is the single compute-side setting that is not a copy: dataloader_workers
+#      drops from 8 to 6, since WORKER_RSS_MIB is charged per worker and the
+#      input-pipeline check in `fa-ocr-simulate --preset l40s_45gb` is what
+#      decides whether 12 cores can still out-supply the GPU.
+#
+# The numbers below are REASONED, NOT MEASURED. Nothing here has run on an L40S.
+# Run
+#
+#     CONFIG=configs/lora_config_l40s.yaml scripts/train_a100.sh probe
+#
+# first. It reports real seconds/step and real peak VRAM in a few minutes, and
+# that number - not this file - should decide the batch size and epoch count.
+
+# Same master seed as the local run, deliberately: the validation holdout is
+# pinned by a hash of the group id, so an unchanged seed and validation_size
+# hold out the same records here as on the laptop and the pilot CER stays
+# directly comparable to the full-run CER.
+seed: 1337
+
+model:
+  model_id: PaddlePaddle/PaddleOCR-VL
+  # Still pinned, and for the same reason: revision a1e4dc4c (Hub PR #91) calls
+  # transformers.masking_utils.create_causal_mask(inputs_embeds=...), which
+  # exists only in transformers 5.x. Unpin this only as part of a deliberate
+  # transformers 5 migration, and on both configs at once.
+  revision: 2b77538ef936
+  trust_remote_code: true
+  # sdpa is kept as the default because it needs no extra wheel. On an A100
+  # flash-attention-2 does have prebuilt wheels and is the one substitution here
+  # worth making if `pip install flash-attn` succeeds - set
+  # attn_implementation: flash_attention_2 and re-probe. The config accepts any
+  # string transformers accepts, so no code change is needed.
+  attn_implementation: sdpa
+  # L40S is compute capability 8.9, so "auto" resolves to bfloat16 just as it
+  # does on the A100 (8.0) - the same branch of modeling._resolve_dtype.
+  dtype: auto
+  # Unchanged, and for the same reason as on the A100: the L40S's 45 GB makes
+  # NF4 pointless. Its 4-bit matmuls would cost throughput and cost the frozen
+  # vision tower feature quality, to save memory this card does not need. bf16
+  # weights are ~1.83 GB of a 45 GB card.
+  quantization: none
+  # Moot while quantization is none, but set false explicitly so that flipping
+  # quantization back on for an experiment does not silently also 4-bit the
+  # tower.
+  quantize_vision: false
+  task_prompt: "OCR:"
+
+paths:
+  letters_manifest: data/dataset/paddle_ocr_vl.jsonl
+  pixel_metadata: data/persian_pixel/all_features_metadata.csv
+  # A separate directory from both the local run and the A100 run, so a manifest,
+  # a set of checkpoints or a metrics file is never overwritten by a run on a
+  # different card - which is what keeps the three directly comparable.
+  output_dir: data/training/l40s_run
+
+data:
+  # The whole corpus. A quota larger than the supply is capped at what exists
+  # (manifest._allocate takes min(limit, available)), so these are ceilings
+  # rather than assertions about the corpus size:
+  #
+  #     letters_pages   26,848 pages exist (from 10,000 letters), all local
+  #     letters_crops   328,832 croppable regions exist after the exclusions and
+  #                     size floors; 60,000 is a weighted draw that keeps
+  #                     metadata_field over-represented rather than letting the
+  #                     93,976 list_item regions dominate
+  #     pixel_pages     31,000 is the full sample_type=page set. The local copy
+  #                     is a partial download of 6,145 rows, so on this machine
+  #                     the cap bites and 6,145 is what the manifest gets; on a
+  #                     machine with the complete download it draws 31,000.
+  #                     Left at the full figure deliberately - it is a ceiling,
+  #                     and lowering it would silently shrink the run on a box
+  #                     that does have all the data.
+  #
+  # ~118k records against the local run's 10k. Wall-clock scales roughly with
+  # this number, which is what the probe is for.
+  letters_pages: 26848
+  letters_crops: 60000
+  pixel_pages: 31000
+
+  # Unchanged from the local config on purpose - see the seed comment above.
+  # Raising it would hold out different records and break the comparison.
+  validation_size: 800
+  # A full run is worth a real untouched test split; the local pilot was not.
+  # Carved from the remainder after validation, so validation is unaffected.
+  test_fraction: 0.05
+
+  crop_padding_px: 8
+  crop_min_side_px: 16
+  crop_min_area_px: 900
+  crop_exclude_types:
+    - header_bar
+    - footer_bar
+    - metadata_block
+    - attachments_block
+    - signature_block
+    - signature_image
+    - stamp
+
+  # Same relative weights as the local config. They are shares, not counts, so
+  # they carry over unchanged to a larger budget: the weights sum to 32.25, so
+  # metadata_field's 8.0 claims ~25% of the crop budget - about 14,900 crops of
+  # the ~31k metadata_field regions that exist, against the ~3% share its natural
+  # frequency would give it.
+  crop_type_weights:
+    metadata_field: 8.0
+    table_cell: 4.0
+    page_number: 2.0
+    footer_field: 2.0
+    paragraph: 3.0
+    list_item: 3.0
+    subject: 2.0
+    recipient: 2.0
+    sender: 1.5
+    signatory_title: 1.5
+    heading: 1.0
+    header_company_name: 0.75
+    header_slogan: 0.5
+    religious_opener: 0.5
+    chart: 0.5
+  crop_default_weight: 0.5
+
+  min_text_chars: 2
+  max_text_chars: 6000
+  digit_oversample_multiplier: 2.0
+
+image:
+  # Full page resolution, which the 4 GB card could not afford. 2,175,600 px is
+  # 2,775 image tokens at 784 px each, and the corpus's largest page is
+  # 1240x1754 = 2,174,960 px, so every letter passes through the processor
+  # UNSCALED - it lands on 2,772 tokens, three under the ceiling, because the
+  # processor rounds each side down to a whole 28 px patch. The local run
+  # downscales A4 to ~107 DPI; this is the single change most likely to improve
+  # CER, because the metadata block's digits are small glyphs and downscaling is
+  # where they are lost.
+  max_pixels: 2175600
+  min_pixels: 147384
+  # Off, not on. Autoprobe exists to rescue a run competing with a desktop
+  # session for 4 GB; on a dedicated 40 GB card there is nothing to clamp for,
+  # and leaving it on would let vram.py's 3050 Ti coefficients silently reduce a
+  # resolution that was chosen deliberately.
+  autoprobe_vram: false
+  # The projected peak from `fa-ocr-simulate --config configs/lora_config_l40s.yaml
+  # --preset l40s_45gb`, so the startup banner compares against a figure derived
+  # for THIS card rather than vram.py's 3050 Ti coefficients. With
+  # --pixel-available 31000 that command reports 30,089 MiB at the worst batch,
+  # 65.3% of the rented 44.99 GiB, which this rounds down to.
+  #
+  # Note the peak is IDENTICAL to the A100 config's, and deliberately so: nothing
+  # in the memory model scales with the card. The same batch, the same sequence
+  # lengths and the same frozen weights cost the same MiB wherever they run. Only
+  # the FRACTION moves, 73.5% of 40 GiB there against 65.3% of 45 GiB here - which
+  # is the whole of the L40S's memory advantage, and the reason this config keeps
+  # batch 8 rather than raising it. There is room for per_device_batch_size 10 on
+  # paper (100.8% of budget at 12, so no: 10 projects to 36.0 GiB, 80.0%); the
+  # probe is what should settle it, not this arithmetic.
+  #
+  # It is a modelled number and a conservative one. Against the only run available
+  # to check it - data/training/lora_1000 - the same model predicted 2,113 MiB where
+  # the allocator reported 1,253, so it over-reads by ~1.7x on that case and 30,000
+  # is better read as a ceiling than as a forecast. Replace it with the probe's
+  # reported peak after the first `--probe 30`, which is the only way to make the
+  # banner authoritative.
+  reserved_vram_mib: 30000
+
+  # Measured, not inferred. Tokenising all 26,848 pages at the resolution above
+  # gives total sequence lengths of p50 2,953 / p95 3,681 / p99 3,864, so 4,096
+  # covers the corpus with room to spare: only 44 pages (0.16%) have an answer
+  # long enough that _image_budget clamps the image below full resolution, and
+  # on_oversize fires on 2 records in the whole corpus.
+  #
+  # Note which mechanism actually binds. encoding.SampleEncoder gives the image
+  # whatever the tokenised ANSWER leaves over, so a long transcription costs
+  # resolution silently, long before on_oversize is consulted. 4,096 is the value
+  # that keeps that from happening to a meaningful share of pages; raising it
+  # further would pay quadratic decoder attention on every sample to rescue 44.
+  max_total_seq_len: 4096
+  # Raised from 128. The chunking exists to bound the float32 (rows x 103,424)
+  # logit tensor, and at batch 8 a step supervises several thousand positions;
+  # larger chunks mean fewer checkpoint boundaries and less recompute. 1024 rows
+  # of float32 logits is ~400 MiB, trivial here and expensive on 4 GB.
+  loss_chunk_rows: 1024
+  on_oversize: shrink_image
+
+lora:
+  # Adapter shape unchanged. It is not memory-bound on either card - 9,388,032
+  # trainable parameters is 0.98% of the model's 958,588,736 - so there is no
+  # reason to widen it just because the GPU is larger. r: 32 would cost ~19M
+  # parameters and about 70 MiB more VRAM, which this card would not notice;
+  # widen it only if evaluation shows the rank is the limit, per CLAUDE.md 6.
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  adapt_embeddings: true
+  adapt_lm_head: true
+
+optim:
+  # Learning rates carry over unchanged BECAUSE the effective batch size does:
+  # 8 x 2 = 16, the same as the local run's 1 x 16 and the A100 run's 8 x 2. That
+  # is the reason for this particular split rather than batch 16 x 1 - it keeps
+  # 2.0e-4 a rate that has already been observed to train stably rather than an
+  # untested guess, and it keeps an L40S run directly comparable to an A100 one.
+  learning_rate: 2.0e-4
+  embed_head_learning_rate: 7.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.08
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  num_epochs: 2.0
+  # Real batching, which 4 GB could not do. collate_samples right-pads ids,
+  # labels and mask and concatenates pixel_values along dim 0 with one
+  # image_grid_thw row per image, so the vision tower splits them apart
+  # correctly; and the sliced loss shifts each row before flattening, so no
+  # gradient crosses a sample boundary. Both paths are batch-correct but have
+  # only ever run at batch 1 here - the probe is also what exercises them.
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 2
+  # Named explicitly rather than "auto": auto prefers paged_adamw_8bit whenever
+  # bitsandbytes imports, and paging optimizer state to host RAM buys nothing
+  # against 40 GB while costing PCIe traffic on every step. Fused AdamW over
+  # 9.39M trainable parameters is ~75 MiB of state.
+  optimizer: adamw_torch_fused
+  # Off. Checkpointing trades ~30% throughput for activation memory, which is
+  # the correct trade at 4 GB and the wrong one at 40. Note this only disables
+  # decoder-wide recompute: the loss chunks stay checkpointed unconditionally,
+  # which is cheap and keeps the vocabulary projection bounded.
+  #
+  # This is the first knob to flip back if the probe OOMs.
+  gradient_checkpointing: false
+
+runtime:
+  # THE ONE SETTING THAT IS NOT A COPY OF THE A100 CONFIG. The rented single-GPU
+  # SKU of machine 24733 exposes 12 effective cores, not the host's 96, because
+  # the machine is sold in 1/2/4/8-GPU slices and the cores are divided with it.
+  # The A100 profile asks for 8; asking for 8 here would still work - the
+  # simulator caps supply at vcpus - 1 whatever the config says, so the extra two
+  # workers would simply contend for the same 11 cores - but 6 keeps the worker
+  # count honest about the machine it is on and leaves a core for the training
+  # process itself.
+  #
+  # 6 workers is still comfortably clear of the projected demand: the same
+  # arithmetic that supplies 297 samples/s on 32 cores supplies over 100 on 12,
+  # against a GPU demand near 12-14 samples/s. The input pipeline is not the
+  # constraint on either card; this is a tidiness change, not a fix.
+  dataloader_workers: 6
+  logging_steps: 20
+  # ~87.6k training records after the holdout and the test split, ~109.5k samples
+  # per epoch once digit-dense records are repeated, so ~6,800 steps per epoch at
+  # effective batch 16 - against ~720 locally. The local cadence would write a
+  # checkpoint every couple of minutes.
+  #
+  # At the projected ~0.7-1.1 s/step this is a checkpoint every 6-9 minutes,
+  # which is the right order for a rented instance that can be reclaimed: a lost
+  # spot of work costs a few minutes, and the Drive mirror in the section below
+  # runs on a background thread so the GPU never waits for it.
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 500
+  resume_from_checkpoint: true
+  smoke_test: false
+  smoke_samples: 16
+  smoke_steps: 2
+  probe_steps: 0
+
+eval:
+  # The whole 800-record holdout, not a 300-record sample. At the measured 14 ms
+  # per generated token with the KV cache enabled this is minutes on an A100,
+  # and a full-split number is what a released adapter should be quoted at.
+  max_samples: null
+  max_new_tokens: 1024
+  num_beams: 1
+  confusion_top_k: 20
+
+# --- Google Drive checkpoint mirroring --------------------------------------- #
+# On. This is the section that makes a rented A100 survivable: the instance is
+# billed hourly, is not backed up, and takes its disk with it when it is
+# reclaimed. A 6,800-step epoch is hours of work whose only copy would otherwise
+# live on storage the provider can revoke without notice.
+#
+# Uploads run on a background thread, so the GPU never waits for the network -
+# enqueueing a checkpoint hard-links it and returns in microseconds. A LATEST
+# marker is written only after every file of a checkpoint has landed, so an
+# instance that disappears mid-upload leaves the previous complete checkpoint as
+# the newest one resume will pick.
+#
+# Credentials, one of these two, before starting a long run:
+#
+#   * Service account (recommended headless). Create a key in Google Cloud
+#     Console, save it to secrets/drive_service_account.json, and share the
+#     destination folder with the key's client_email. Note a service account has
+#     NO Drive storage quota of its own: it must write into a Shared Drive or a
+#     folder someone shared with it, and folder_id below must name that folder.
+#     Writing to its own My Drive fails with storageQuotaExceeded.
+#
+#   * Copied OAuth token. Run `python scripts/upload_to_drive.py --dry-run` once
+#     on a machine with a browser, then scp secrets/drive_token.json to the
+#     instance. Works with a personal My Drive; expires if access is revoked.
+drive:
+  enabled: true
+  folder: fa-ocr-lora
+  # Fill this in. Required for a service account (see above) and for any folder
+  # not created by this code. Also settable per-machine without editing the file:
+  #   export FA_OCR_TRAIN_DRIVE_FOLDER_ID=<id>
+  folder_id: ""
+  # Empty derives it from paths.output_dir's name, so an a100 run and a laptop
+  # run never write into the same remote folder.
+  run_name: ""
+  service_account_path: null
+  token_path: null
+  client_secret_path: null
+  # False: there is no browser here. The run fails in its first second with
+  # instructions rather than hanging on a consent page nobody can answer.
+  interactive_auth: false
+  # 32 vCPUs and a datacentre uplink; the ceiling is the network, not the host.
+  workers: 8
+  upload_logs: true
+  upload_optimizer_state: true
+  # The whole point on a fresh instance: an empty local disk falls back to Drive
+  # rather than restarting from step 0.
+  resume_from_drive: true
+  # ~14 checkpoints per epoch at save_steps: 500. Keeping 5 is ~1.5 GB of adapter
+  # plus optimiser state and covers a rollback of two hours.
+  keep_remote: 5
+  drain_timeout_s: 900.0
