@@ -1,0 +1,355 @@
+# PaddleOCR-VL Persian LoRA - full training run on an NVIDIA RTX PRO 6000
+# Blackwell (96 GB) inside a molab notebook session.
+#
+# A sibling of lora_config.yaml, not a replacement. That file is sized for the
+# 4 GB RTX 3050 Ti development target and every default in it is a concession to
+# that budget; this one removes the concessions and trains on the whole corpus.
+# Load it explicitly - scripts/train_a100.sh is the stage driver, and CONFIG is
+# how it is pointed at a different profile:
+#
+#     CONFIG=configs/lora_config_rtx6000pro.yaml bash scripts/train_a100.sh probe
+#
+# or via FA_OCR_TRAIN_CONFIG. The same loader validates both, so an unknown key
+# here is still a startup error rather than a silent no-op.
+#
+# Hardware this file assumes:
+#
+#   GPU   NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, compute capability 12.0
+#         (sm_120). Needs torch >= 2.7 from the cu128 index; the cu124 and cu126
+#         builds carry no sm_120 kernels and die at import with "no kernel image
+#         is available for execution on the device". flash-attention-2 has no
+#         prebuilt sm_120 wheel either, so attn_implementation stays sdpa.
+#   Host  molab gives 4 vCPU / 32 GB RAM by default, a 12 h session, and kills an
+#         idle kernel after 90 minutes. Everything under data/ is scratch and is
+#         wiped on teardown - only source files, .env and sub-1 GB uploads come
+#         back next session - which is why drive.enabled is on and why the
+#         molab notebook re-downloads the corpora every time it starts.
+#
+# The numbers below are REASONED, NOT MEASURED. Every figure in
+# lora_config.yaml was measured on the development card; nothing here has run on
+# this card, and training/vram.py's coefficients were fitted on the 3050 Ti, so
+# its startup projection does not describe this hardware either. Run
+#
+#     CONFIG=configs/lora_config_rtx6000pro.yaml bash scripts/train_a100.sh probe
+#
+# first. It reports real seconds/step and real peak VRAM in a few minutes, and
+# that number - not this file - should decide the batch size and epoch count.
+
+# Same master seed as the local run, deliberately: the validation holdout is
+# pinned by a hash of the group id, so an unchanged seed and validation_size
+# hold out the same records here as on the laptop and the pilot CER stays
+# directly comparable to the full-run CER.
+seed: 1337
+
+model:
+  model_id: PaddlePaddle/PaddleOCR-VL
+  # Still pinned, and for the same reason: revision a1e4dc4c (Hub PR #91) calls
+  # transformers.masking_utils.create_causal_mask(inputs_embeds=...), which
+  # exists only in transformers 5.x. Unpin this only as part of a deliberate
+  # transformers 5 migration, and on both configs at once.
+  revision: 2b77538ef936
+  trust_remote_code: true
+  # sdpa, not flash-attention-2: there is no prebuilt wheel for sm_120, and
+  # building flash-attn from source inside a 12 h session is not a good use of an
+  # hour. sdpa needs no extra wheel and PyTorch dispatches it through its own
+  # flash kernel on Blackwell anyway. If a wheel ever appears, set
+  # attn_implementation: flash_attention_2 and re-probe. The config accepts any
+  # string transformers accepts, so no code change is needed.
+  attn_implementation: sdpa
+  # Blackwell is compute capability 12.0 and supports bfloat16 natively, so
+  # "auto" resolves to bfloat16 - which is what stage_check asserts.
+  dtype: auto
+  # The headline change. NF4 exists in the local config to fit 4 GB, and it is
+  # not free: 4-bit matmuls dequantise on every forward, so it costs throughput,
+  # and the frozen vision tower - the part that does the actual reading - loses
+  # feature quality with no training to recover it. With 96 GB there is no
+  # reason to pay either cost. bf16 weights are ~1.73 GB of a 96 GB card.
+  quantization: none
+  # Moot while quantization is none, but set false explicitly so that flipping
+  # quantization back on for an experiment does not silently also 4-bit the
+  # tower.
+  quantize_vision: false
+  task_prompt: "OCR:"
+
+paths:
+  letters_manifest: data/dataset/paddle_ocr_vl.jsonl
+  pixel_metadata: data/persian_pixel/all_features_metadata.csv
+  # A separate directory from both the local run and any A100 run, so the
+  # manifest, checkpoints and metrics of one profile never overwrite another's
+  # and the runs stay comparable. drive.run_name derives from this name, so the
+  # Drive side folder is distinct too.
+  output_dir: data/training/rtx6000pro_run
+
+data:
+  # The whole corpus. A quota larger than the supply is capped at what exists
+  # (manifest._allocate takes min(limit, available)), so these are ceilings
+  # rather than assertions about the corpus size:
+  #
+  #     letters_pages   26,848 pages exist (from 10,000 letters); the notebook
+  #                     downloads them from shahriarhd/persian-official-letters-
+  #                     synth. Its "subset" mode pulls 3 shards instead of 18,
+  #                     which is enough for check/manifest/smoke/probe/baseline
+  #                     and makes the cap bite - a partial corpus is still a
+  #                     working corpus, because sources.py skips rows whose image
+  #                     is missing rather than failing.
+  #     letters_crops   328,832 croppable regions exist after the exclusions and
+  #                     size floors; 60,000 is a weighted draw that keeps
+  #                     metadata_field over-represented rather than letting the
+  #                     93,976 list_item regions dominate
+  #     pixel_pages     31,000 is the full sample_type=page set of
+  #                     Omarrran/Persian_Pixel. The laptop copy is a partial
+  #                     download of 6,145 rows so the cap bites there; the
+  #                     notebook downloads the full 31,108-row set.
+  #                     Left at the full figure deliberately - it is a ceiling,
+  #                     and lowering it would silently shrink the run on a box
+  #                     that does have all the data.
+  #
+  # ~118k records against the local run's 10k. Wall-clock scales roughly with
+  # this number, which is what the probe is for.
+  letters_pages: 26848
+  letters_crops: 60000
+  pixel_pages: 31000
+
+  # Unchanged from the local config on purpose - see the seed comment above.
+  # Raising it would hold out different records and break the comparison.
+  validation_size: 800
+  # A full run is worth a real untouched test split; the local pilot was not.
+  # Carved from the remainder after validation, so validation is unaffected.
+  test_fraction: 0.05
+
+  crop_padding_px: 8
+  crop_min_side_px: 16
+  crop_min_area_px: 900
+  crop_exclude_types:
+    - header_bar
+    - footer_bar
+    - metadata_block
+    - attachments_block
+    - signature_block
+    - signature_image
+    - stamp
+
+  # Same relative weights as the local config. They are shares, not counts, so
+  # they carry over unchanged to a larger budget: the weights sum to 32.25, so
+  # metadata_field's 8.0 claims ~25% of the crop budget - about 14,900 crops of
+  # the ~31k metadata_field regions that exist, against the ~3% share its natural
+  # frequency would give it.
+  crop_type_weights:
+    metadata_field: 8.0
+    table_cell: 4.0
+    page_number: 2.0
+    footer_field: 2.0
+    paragraph: 3.0
+    list_item: 3.0
+    subject: 2.0
+    recipient: 2.0
+    sender: 1.5
+    signatory_title: 1.5
+    heading: 1.0
+    header_company_name: 0.75
+    header_slogan: 0.5
+    religious_opener: 0.5
+    chart: 0.5
+  crop_default_weight: 0.5
+
+  min_text_chars: 2
+  max_text_chars: 6000
+  digit_oversample_multiplier: 2.0
+
+image:
+  # Full page resolution, which the 4 GB card could not afford. 2,175,600 px is
+  # 2,775 image tokens at 784 px each, and the corpus's largest page is
+  # 1240x1754 = 2,174,960 px, so every letter passes through the processor
+  # UNSCALED - it lands on 2,772 tokens, three under the ceiling, because the
+  # processor rounds each side down to a whole 28 px patch. The local run
+  # downscales A4 to ~107 DPI; this is the single change most likely to improve
+  # CER, because the metadata block's digits are small glyphs and downscaling is
+  # where they are lost.
+  max_pixels: 2175600
+  min_pixels: 147384
+  # Off, not on. Autoprobe exists to rescue a run competing with a desktop
+  # session for 4 GB; on a dedicated 96 GB card there is nothing to clamp for,
+  # and leaving it on would let vram.py's 3050 Ti coefficients silently reduce a
+  # resolution that was chosen deliberately.
+  autoprobe_vram: false
+  # A deliberate override, not a measurement. image.reserved_vram_mib REPLACES
+  # the whole projection (vram.projected_peak_mib returns it verbatim), and with
+  # autoprobe_vram off nothing consumes it except the startup banner, which
+  # compares it against free VRAM less the safety margin. 30,000 is carried over
+  # from the A100 profile because it is a known-safe ceiling for this workload at
+  # batch 16, not because it describes a 96 GB card - vram.py's coefficients were
+  # fitted on a 3050 Ti and describe neither.
+  #
+  # It is a modelled number and a conservative one. Against the only run available
+  # to check it - data/training/lora_1000 - the same model predicted 2,113 MiB where
+  # the allocator reported 1,253, so it over-reads by ~1.7x on that case and 30,000
+  # is better read as a ceiling than as a forecast. Replace it with the probe's
+  # reported peak after the first `--probe 30`, which is the only way to make the
+  # banner authoritative.
+  reserved_vram_mib: 30000
+
+  # Measured, not inferred. Tokenising all 26,848 pages at the resolution above
+  # gives total sequence lengths of p50 2,953 / p95 3,681 / p99 3,864, so 4,096
+  # covers the corpus with room to spare: only 44 pages (0.16%) have an answer
+  # long enough that _image_budget clamps the image below full resolution, and
+  # on_oversize fires on 2 records in the whole corpus.
+  #
+  # Note which mechanism actually binds. encoding.SampleEncoder gives the image
+  # whatever the tokenised ANSWER leaves over, so a long transcription costs
+  # resolution silently, long before on_oversize is consulted. 4,096 is the value
+  # that keeps that from happening to a meaningful share of pages; raising it
+  # further would pay quadratic decoder attention on every sample to rescue 44.
+  max_total_seq_len: 4096
+  # Raised from 128. The chunking exists to bound the float32 (rows x 103,424)
+  # logit tensor, and at batch 16 a step supervises several thousand positions;
+  # larger chunks mean fewer checkpoint boundaries and less recompute. 1024 rows
+  # of float32 logits is ~400 MiB, trivial here and expensive on 4 GB.
+  loss_chunk_rows: 1024
+  on_oversize: shrink_image
+
+lora:
+  # Adapter shape unchanged. It is not memory-bound on any of these cards -
+  # 9,388,032 trainable parameters is 0.98% of the model's 958,588,736 - so
+  # there is no reason to widen it just because the GPU is larger. r: 32 would
+  # cost ~19M parameters and about 70 MiB more VRAM, which this card would not
+  # notice; widen it only if evaluation shows the rank is the limit.
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  adapt_embeddings: true
+  adapt_lm_head: true
+
+optim:
+  # Learning rates carry over unchanged BECAUSE the effective batch size does:
+  # 16 x 1 = 16, the same as the local run's 1 x 16. That is the reason for this
+  # particular split - it keeps 2.0e-4 a rate that has already been observed to
+  # train stably rather than an untested guess. The A100 profile reaches 16 as
+  # 8 x 2 because 40 GB could not afford 16 full-resolution pages in one forward;
+  # 96 GB can, and one optimiser step per 16 samples is strictly cheaper than
+  # two forwards and one all-reduce for the same numbers.
+  #
+  # Per-device, not global: molab attaches exactly one GPU, so these two are the
+  # whole batch. If the probe OOMs, the first knob is gradient_accumulation_steps
+  # back to 2 with per_device_batch_size at 8 - effective batch stays 16 and not
+  # one other number in this file has to move.
+  learning_rate: 2.0e-4
+  embed_head_learning_rate: 7.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.08
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  num_epochs: 2.0
+  # Real batching, which 4 GB could not do. collate_samples right-pads ids,
+  # labels and mask and concatenates pixel_values along dim 0 with one
+  # image_grid_thw row per image, so the vision tower splits them apart
+  # correctly; and the sliced loss shifts each row before flattening, so no
+  # gradient crosses a sample boundary. Both paths are batch-correct; the probe
+  # is what exercises them on this card before hours are spent on them.
+  per_device_batch_size: 16
+  gradient_accumulation_steps: 1
+  # Named explicitly rather than "auto": auto prefers paged_adamw_8bit whenever
+  # bitsandbytes imports, and paging optimizer state to host RAM buys nothing
+  # against 96 GB while costing PCIe traffic on every step. Fused AdamW over
+  # 9.39M trainable parameters is ~75 MiB of state.
+  optimizer: adamw_torch_fused
+  # Off. Checkpointing trades ~30% throughput for activation memory, which is
+  # the correct trade at 4 GB and the wrong one at 96. Note this only disables
+  # decoder-wide recompute: the loss chunks stay checkpointed unconditionally,
+  # which is cheap and keeps the vocabulary projection bounded.
+  #
+  # This is the first knob to flip back if the probe OOMs.
+  gradient_checkpointing: false
+
+runtime:
+  # 4 vCPU, not the 32 of a rented training box: molab's default host. Batch 16
+  # of full-resolution pages makes the processor's float32 patch tensors the
+  # bottleneck, so prefetch still matters, but more workers than cores would
+  # only queue behind the GIL and the 32 GB memory limit.
+  dataloader_workers: 4
+  logging_steps: 20
+  # ~87.6k training records after the holdout and the test split, ~109.5k samples
+  # per epoch once digit-dense records are repeated, so ~6,800 steps per epoch at
+  # effective batch 16 - against ~720 locally. The local cadence would write a
+  # checkpoint every couple of minutes.
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 500
+  resume_from_checkpoint: true
+  smoke_test: false
+  smoke_samples: 16
+  smoke_steps: 2
+  probe_steps: 0
+
+eval:
+  # The whole 800-record holdout, not a 300-record sample. At the measured 14 ms
+  # per generated token with the KV cache enabled this is minutes on this card,
+  # and a full-split number is what a released adapter should be quoted at.
+  max_samples: null
+  max_new_tokens: 1024
+  num_beams: 1
+  confusion_top_k: 20
+
+# --- Google Drive checkpoint mirroring --------------------------------------- #
+# On. This is the section that makes a molab session survivable: the session is
+# capped at 12 hours, is not backed up, and takes its disk with it when it ends -
+# nothing over 1 GB and none of data/ comes back next time. A 6,800-step epoch is
+# hours of work whose only copy would otherwise live on storage that is cleared
+# without notice.
+#
+# Uploads run on a background thread, so the GPU never waits for the network -
+# enqueueing a checkpoint hard-links it and returns in microseconds. A LATEST
+# marker is written only after every file of a checkpoint has landed, so a
+# session that ends mid-upload leaves the previous complete checkpoint as the
+# newest one resume will pick.
+#
+# Credentials, one of these two, before starting a long run:
+#
+#   * Service account (recommended headless). Create a key in Google Cloud
+#     Console, save it to secrets/drive_service_account.json, and share the
+#     destination folder with the key's client_email. Note a service account has
+#     NO Drive storage quota of its own: it must write into a Shared Drive or a
+#     folder someone shared with it, and folder_id below must name that folder.
+#     Writing to its own My Drive fails with storageQuotaExceeded.
+#
+#   * Copied OAuth token. Mint one with scripts/mint_drive_token.py, put the
+#     DRIVE_TOKEN_B64 line it prints in molab's Secrets panel, and let the
+#     notebook's first cell decode it to secrets/drive_token.json. Works with a
+#     personal My Drive; expires if access is revoked.
+drive:
+  enabled: true
+  folder: fa-ocr-lora
+  # Fill this in. Required for a service account (see above) and for any folder
+  # not created by this code. Also settable per-machine without editing the file:
+  #   export FA_OCR_TRAIN_DRIVE_FOLDER_ID=<id>
+  folder_id: ""
+  # Empty derives it from paths.output_dir's name, so an rtx6000pro run, an a100
+  # run and a laptop run never write into the same remote folder.
+  run_name: ""
+  service_account_path: null
+  token_path: null
+  client_secret_path: null
+  # False: there is no browser here. The run fails in its first second with
+  # instructions rather than hanging on a consent page nobody can answer.
+  interactive_auth: false
+  # 4 vCPU; uploads are network-bound, so the ceiling is the uplink rather than
+  # the host, and four threads are enough to keep it saturated while training
+  # holds the GIL elsewhere.
+  workers: 4
+  upload_logs: true
+  upload_optimizer_state: true
+  # The whole point on a fresh session: an empty local disk falls back to Drive
+  # rather than restarting from step 0.
+  resume_from_drive: true
+  # ~14 checkpoints per epoch at save_steps: 500. Keeping 5 is ~1.5 GB of adapter
+  # plus optimiser state and covers a rollback of two hours.
+  keep_remote: 5
+  drain_timeout_s: 900.0

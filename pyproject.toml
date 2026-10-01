@@ -173,6 +173,12 @@ ignore = [
     "ANN003",
     "ANN204",
 ]
+# notebooks/molab_train.py is a marimo notebook, not a jupytext percent source:
+# `marimo convert` writes every cell as `def _():` or `def _(deps):` and every
+# `return` as marimo's name-collection tuple, so a return annotation would
+# describe the framework's protocol rather than the cell's value. The signatures
+# are the tool's output, not code written here.
+"notebooks/molab_train.py" = ["ANN202"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
