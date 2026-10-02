@@ -207,6 +207,7 @@ def _(REPO_DIR, sh, sys, torch_version):
         "-e",
         ".[local-train,drive,hf,hub]",
         "datasets",
+        "sentencepiece",
         cwd=REPO_DIR,
     )
     datasets_version = sh(

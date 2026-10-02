@@ -50,6 +50,8 @@ local-train = [
     "rapidfuzz>=3.0",        # jiwer's own edit-distance engine, used directly
     "pandas>=2.0",
     "pyarrow>=15",           # unified_manifest.parquet
+    "sentencepiece>=0.2.0",   # PaddleOCR-VL declares tokenizer_class: LlamaTokenizer,
+                             # which transformers builds from its slow, sentencepiece class
 ]
 # NF4 quantisation of the base model, which is what brings the weights to
 # 870 MiB and makes 4 GB workable. Separate extra because the wheel is

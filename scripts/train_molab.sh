@@ -197,6 +197,11 @@ assert torch.cuda.is_bf16_supported(), 'bf16 unsupported; the rtx6000pro profile
 print('bf16         yes')
 from transformers import Trainer  # noqa: F401 - the import every stage depends on
 print('transformers Trainer imports cleanly')
+try:
+    import sentencepiece
+except ImportError:
+    raise SystemExit('sentencepiece is missing - run: pip install sentencepiece')
+print('sentencepiece', sentencepiece.__version__)
 "
   banner "disk"
   # A subset pass needs ~15 GB, the full corpus ~55 GB, and a session's disk is
