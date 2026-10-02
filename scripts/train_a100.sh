@@ -40,6 +40,13 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # base weights are 1.8 GB and the processor's remote code caches beside them.
 export HF_HOME="${HF_HOME:-${ROOT}/.cache/huggingface}"
 
+# The snippets below import transformers, which imports its TensorFlow stack as
+# soon as TF is importable - and the image's Keras 3 is not supported by it
+# ("please install tf-keras"). Nothing in this project uses TensorFlow, so pin
+# the framework before any python starts, subprocesses inherit these.
+export USE_TORCH=1
+export USE_TF=0
+
 banner() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 # Asked for lazily rather than at script startup: a broken config should surface

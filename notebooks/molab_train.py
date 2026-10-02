@@ -30,7 +30,8 @@ def _(mo):
     **Before you start**
 
     - Attach the NVIDIA RTX PRO 6000 Blackwell in the notebook specs button.
-      Nothing here runs on CPU: `stage_check` asserts CUDA and bf16.
+      Nothing here runs on CPU: the environment cells and `check` assert CUDA and
+      bf16.
     - Open the Secrets panel (`Ctrl`/`Cmd` + `J`) and add three variables:
       `GH_TOKEN` (repo read), `HF_TOKEN` (Persian_Pixel is a gated dataset) and
       `DRIVE_TOKEN_B64` (from `scripts/mint_drive_token.py`).
@@ -155,6 +156,13 @@ def _(mo):
     `sm_120` has no kernels in the cu124/cu126 builds, so torch comes from the
     **cu128** index before anything else is installed. Skip this cell only if
     `torch.__version__` already ends in `+cu128`.
+
+    The image also ships TensorFlow with Keras 3, which transformers 4.57 refuses
+    ("please install tf-keras") and cannot import `Trainer` past. The project-extras
+    cell below therefore ends with `scripts/train_molab.sh tf`, which gives
+    transformers a matching `tf-keras` - or, if that cannot be installed, sets
+    `USE_TF=0` - then proves `from transformers import Trainer` imports. TensorFlow
+    is never uninstalled, and `FA_OCR_TF=torch` skips the install altogether.
     """)
     return
 
@@ -185,6 +193,7 @@ def _(sh, sys):
     ).stdout.strip()
     print("torch", torch_version)
     assert "cu128" in torch_version.split("|")[0], f"Blackwell needs the cu128 build, got {torch_version}"
+
     return (torch_version,)
 
 
@@ -205,6 +214,16 @@ def _(REPO_DIR, sh, sys, torch_version):
     ).stdout.strip()
     print("project editable in", REPO_DIR)
     print("python", sys.version.split()[0], "| torch", torch_version.split("|")[0].strip(), "| datasets", datasets_version)
+
+    # TensorFlow + Keras 3, reconciled by the driver rather than here: `tf` installs
+    # the tf-keras matching the installed TensorFlow, or falls back to USE_TF=0, and
+    # only returns once `from transformers import Trainer` actually imports. It needs
+    # no GPU, so this cell stays runnable on a bare session.
+    compat = sh("bash", "scripts/train_molab.sh", "tf", cwd=REPO_DIR, capture=True, check=False)
+    print(compat.stdout, end="")
+    if compat.returncode:
+        print(compat.stderr, end="")
+        raise SystemExit("tensorflow/keras could not be reconciled - see the output above")
     return (datasets_version,)
 
 
@@ -259,7 +278,7 @@ def _(Path, REPO_DIR, git_head, sh):
     for _name in ('manifest.csv', 'paddle_farmer.jsonl', 'paddle_ocr_vl.jsonl'):
         _local = hf_hub_download(LETTERS_REPO, _name, repo_type='dataset', local_dir=letters_root)
         print(f'{_name:24} {Path(_local).stat().st_size / 1000000.0:7.1f} MB')
-    pages = sum((1 for line in letters_manifest.open(encoding='utf-8') if line.strip()))
+    pages = sum(1 for line in letters_manifest.open(encoding='utf-8') if line.strip())
     print(f'{pages} pages of text and labels ready (commit {git_head})')
     return LETTERS_REPO, hf_hub_download, letters_manifest, letters_root
 
@@ -396,18 +415,30 @@ def _(mo):
     mo.md(r"""
     ## 4 · Stages
 
-    `scripts/train_a100.sh` is the stage driver — it exports `PYTHONPATH`,
-    `HF_HOME` and `PYTORCH_CUDA_ALLOC_CONF` itself, and honours `CONFIG`.
+    `scripts/train_molab.sh` is the stage driver — it exports `PYTHONPATH`,
+    `HF_HOME` and `PYTORCH_CUDA_ALLOC_CONF` itself, honours `CONFIG`, and reconciles
+    TensorFlow/Keras before any stage runs.
     Run them in order the first time; `train` alone is all a restart needs.
+
+    Two cells below are for the run that is already going: `status` prints the
+    console tail, GPU utilisation and free disk, and `stop` ends the detached
+    process (checkpoints already in Drive stay valid).
     """)
     return
 
 
 @app.cell
-def _(CONFIG, REPO_DIR, os, sh):
+def _(CONFIG, REPO_DIR, os, sh, token_path):
+    # `check` authenticates against Drive, so the token from section 1 must exist
+    # before the first stage runs. Naming it in the signature is what makes marimo
+    # execute that cell first - nothing in the body would otherwise pull it in.
+    assert token_path.is_file(), (
+        "Drive token missing - run the cell in section 1 that writes "
+        "secrets/drive_token.json"
+    )
     stage_env = {**os.environ, "CONFIG": CONFIG}
     for stage in ("check", "manifest", "smoke", "probe", "baseline"):
-        result = sh("bash", "scripts/train_a100.sh", stage, cwd=REPO_DIR, env=stage_env, check=False)
+        result = sh("bash", "scripts/train_molab.sh", stage, cwd=REPO_DIR, env=stage_env, check=False)
         if result.returncode:
             raise SystemExit(f"stage '{stage}' exited {result.returncode} - fix it before continuing")
     return (stage_env,)
@@ -418,7 +449,7 @@ def _(REPO_DIR, sh, stage_env, token_path):
     assert token_path.is_file(), "Drive token missing - run the cell that writes secrets/drive_token.json"
     # `train` is nohup'd by the script: this cell returns in a second while the run
     # keeps going in the background, resumable after a crash or a session change.
-    sh("bash", "scripts/train_a100.sh", "train", cwd=REPO_DIR, env=stage_env, check=False)
+    sh("bash", "scripts/train_molab.sh", "train", cwd=REPO_DIR, env=stage_env, check=False)
     return
 
 
@@ -452,10 +483,26 @@ def _(REPO_DIR, profile, sh):
 
 @app.cell
 def _(REPO_DIR, sh, stage_env):
+    # One-shot version of the loop above: pid, console tail, GPU utilisation, free
+    # disk. Cheap enough to press whenever you wonder if the run is still going.
+    sh("bash", "scripts/train_molab.sh", "status", cwd=REPO_DIR, env=stage_env, check=False)
+    return
+
+
+@app.cell
+def _(REPO_DIR, sh, stage_env):
+    # Ends the detached run. Checkpoints already mirrored to Drive stay valid, and
+    # the next `train` resumes from the newest complete one.
+    sh("bash", "scripts/train_molab.sh", "stop", cwd=REPO_DIR, env=stage_env, check=False)
+    return
+
+
+@app.cell
+def _(REPO_DIR, sh, stage_env):
     # Run this once checkpoints exist (every `save_steps: 500`). It reports trained
     # CER/WER plus the sensitive-field audit; run the `baseline` stage first to have
     # an untrained number to compare against.
-    sh("bash", "scripts/train_a100.sh", "eval", cwd=REPO_DIR, env=stage_env, check=False)
+    sh("bash", "scripts/train_molab.sh", "eval", cwd=REPO_DIR, env=stage_env, check=False)
     return
 
 
