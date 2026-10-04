@@ -35,9 +35,10 @@ def _(mo):
     - Open the Secrets panel (`Ctrl`/`Cmd` + `J`) and add three variables:
       `GH_TOKEN` (repo read), `HF_TOKEN` (Persian_Pixel is a gated dataset) and
       `DRIVE_TOKEN_B64` (from `scripts/mint_drive_token.py`).
-    - `DATA_MODE = "subset"` in the constants cell pulls ~15 GB so the whole
-      pipeline can be proven in minutes. Set it to `"full"` before a real `train`
-      stage.
+    - `DATA_MODE = "tiny"` in the constants cell pulls ~0.6 GB - 1% of each
+      corpus - so the whole pipeline through `train` and `eval` finishes in
+      minutes. `"subset"` is a wider ~15 GB dry run; set `"full"` before a real
+      `train` stage.
     - Sessions die after 12 h, and an **idle** kernel after 90 min — keep the
       monitor cell running while the detached `train` process works.
 
@@ -73,11 +74,36 @@ def _():
     REPO_URL = "https://github.com/shahriar-hd/zilber_ocr.git"
     CONFIG = "configs/lora_config_rtx6000pro.yaml"
 
-    # "subset" proves the pipeline cheaply; "full" is what a real run needs.
-    DATA_MODE = "subset"
-    LETTERS_TRAIN_SHARDS = 3 if DATA_MODE == "subset" else 18
-    LETTERS_TEST_SHARDS = 1 if DATA_MODE == "subset" else 3
-    PIXEL_SHARDS = 2 if DATA_MODE == "subset" else 56
+    # "tiny" is ~1% of each corpus: check -> manifest -> smoke -> probe -> baseline
+    # -> train -> eval all finish in minutes, which is the point of it. "subset" is
+    # a wider dry run (~20%), "full" is what a real run needs.
+    DATA_MODE = "tiny"
+
+    # Which letters image shards to fetch. test-00002 is the smallest file in the
+    # dataset - 164 pages in 226 MB, against 1,364 pages in 2 GB for a train shard
+    # - so a tiny run costs a tenth of the download for what it actually uses.
+    LETTERS_SHARDS = {
+        "tiny": ["test-00002-of-00003"],
+        "subset": [f"train-{i:05d}-of-00018" for i in range(3)] + ["test-00000-of-00003"],
+        "full": [f"train-{i:05d}-of-00018" for i in range(18)]
+        + [f"test-{i:05d}-of-00003" for i in range(3)],
+    }[DATA_MODE]
+    # Persian Pixel shards; each holds ~554 rows.
+    PIXEL_SHARDS = {"tiny": 1, "subset": 2, "full": 56}[DATA_MODE]
+
+    # Ceilings handed to `manifest`, so a tiny run stays tiny even when an earlier
+    # subset run left its images on disk: the builder takes min(quota, available),
+    # so these bind before the files do. Empty = the config's own ceilings. Each is
+    # 1% of the figure in configs/lora_config_rtx6000pro.yaml, and the holdout has
+    # to come down with them or it would leave almost nothing to train on.
+    MANIFEST_ARGS: tuple[str, ...] = ()
+    if DATA_MODE == "tiny":
+        MANIFEST_ARGS = (
+            "--letters-pages", "268",
+            "--letters-crops", "600",
+            "--pixel-pages", "310",
+            "--validation-size", "100",
+        )
 
     REPO_DIR = Path(REPO).resolve()
     os.environ.setdefault("HF_HOME", str(REPO_DIR / ".cache" / "huggingface"))
@@ -97,8 +123,8 @@ def _():
     return (
         CONFIG,
         DATA_MODE,
-        LETTERS_TEST_SHARDS,
-        LETTERS_TRAIN_SHARDS,
+        LETTERS_SHARDS,
+        MANIFEST_ARGS,
         PIXEL_SHARDS,
         Path,
         REPO,
@@ -263,6 +289,11 @@ def _(mo):
 
     Rows whose image is missing are skipped by the manifest rather than failing,
     so a partial download still runs.
+
+    `tiny` fetches `test-00002` (164 pages, 226 MB) plus one pixel shard, and the
+    stage cell hands `manifest` ceilings of 1% of every quota - so the corpus comes
+    out at 1% of the config even when an earlier `subset` run left more images on
+    disk. `subset` and `full` take no ceilings and use the config's own.
     """)
     return
 
@@ -287,8 +318,7 @@ def _(Path, REPO_DIR, git_head, sh):
 @app.cell
 def _(
     LETTERS_REPO,
-    LETTERS_TEST_SHARDS,
-    LETTERS_TRAIN_SHARDS,
+    LETTERS_SHARDS,
     hf_hub_download,
     letters_root,
     os,
@@ -296,8 +326,7 @@ def _(
     import pyarrow.parquet as pq
     letters_images = letters_root / 'images'
     letters_images.mkdir(parents=True, exist_ok=True)
-    shards = [f'train-{i:05d}-of-00018' for i in range(LETTERS_TRAIN_SHARDS)]
-    shards += [f'test-{i:05d}-of-00003' for i in range(LETTERS_TEST_SHARDS)]
+    shards = LETTERS_SHARDS
     # Size > 0: a shard that died mid-write must be fetched again.
     have = {f'images/{p.name}' for p in letters_images.glob('*.png') if p.stat().st_size > 0}
     print(f'{len(have)} images already local; {len(shards)} shard(s) to visit')
@@ -429,7 +458,7 @@ def _(mo):
 
 
 @app.cell
-def _(CONFIG, REPO_DIR, os, sh, token_path):
+def _(CONFIG, MANIFEST_ARGS, REPO_DIR, os, sh, token_path):
     # `check` authenticates against Drive, so the token from section 1 must exist
     # before the first stage runs. Naming it in the signature is what makes marimo
     # execute that cell first - nothing in the body would otherwise pull it in.
@@ -439,7 +468,12 @@ def _(CONFIG, REPO_DIR, os, sh, token_path):
     )
     stage_env = {**os.environ, "CONFIG": CONFIG}
     for stage in ("check", "manifest", "smoke", "probe", "baseline"):
-        result = sh("bash", "scripts/train_molab.sh", stage, cwd=REPO_DIR, env=stage_env, check=False)
+        # Only `manifest` takes the data ceilings; the rest read its output.
+        extra = MANIFEST_ARGS if stage == "manifest" else ()
+        result = sh(
+            "bash", "scripts/train_molab.sh", stage, *extra,
+            cwd=REPO_DIR, env=stage_env, check=False,
+        )
         if result.returncode:
             raise SystemExit(f"stage '{stage}' exited {result.returncode} - fix it before continuing")
     return (stage_env,)
