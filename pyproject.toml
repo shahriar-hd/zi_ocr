@@ -42,9 +42,18 @@ train = ["paddlepaddle-gpu>=2.6", "paddlenlp>=3.0"]
 local-train = [
     "torch>=2.4",
     "torchvision>=0.19",     # PaddleOCR-VL's remote processor code imports it
-    "transformers>=4.57,<5",  # 5.x changes the remote-code contract; see the pin
-    "accelerate>=0.34",
-    "peft>=0.13",
+    # PaddleOCR-VL-1.6 is native to 5 and has no 4.x path, so the floor moves
+    # with it. The original release's remote-code machinery survived the major
+    # bump, but its own revision was written for 4.x and is unverified on 5 -
+    # see the revision comment in configs/lora_config_rtx6000pro.yaml. The pin
+    # now follows the profile, not the past.
+    "transformers>=5,<6",
+    # The floor transformers 5 declares for its own torch extra; below it, pip
+    # resolves a pair transformers never tested.
+    "accelerate>=1.1",
+    # 0.20 is the lowest version exercised against transformers 5 here (its
+    # metadata pins no upper bound, and 0.21.2 is what molab installs today).
+    "peft>=0.20",
     "safetensors>=0.4",
     "jiwer>=3.0",            # CER/WER in training/metrics.py
     "rapidfuzz>=3.0",        # jiwer's own edit-distance engine, used directly

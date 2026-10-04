@@ -33,6 +33,7 @@ from ..config.base import ConfigError
 from ..dataset.common.io_utils import DEFAULT_SEED, resolve_repo_path
 
 __all__ = [
+    "AUTO_CLASS_CHOICES",
     "DEFAULT_TRAINING_CONFIG_PATH",
     "DTYPE_CHOICES",
     "ENV_PREFIX",
@@ -71,6 +72,14 @@ MERGE_SIZE: Final[int] = 2
 #: whole number of tokens is silently rounded down by the processor - the run
 #: would then train at a resolution nobody chose.
 PIXELS_PER_TOKEN: Final[int] = (PATCH_SIZE * MERGE_SIZE) ** 2
+
+#: Which ``AutoModel*`` class the loader uses. ``causal_lm`` is the remote-code
+#: path: the original checkpoint's ``auto_map`` publishes only an
+#: ``AutoModelForCausalLM`` entry and needs the repository's own modeling file.
+#: ``image_text_to_text`` is how the PaddleOCR-VL-1.6 card loads that release,
+#: which transformers 5 carries natively - passing ``trust_remote_code`` there
+#: would reach for remote code that is not what the card uses.
+AUTO_CLASS_CHOICES: Final[frozenset[str]] = frozenset({"causal_lm", "image_text_to_text"})
 
 #: Weight precisions the loader accepts. ``auto`` probes compute capability.
 DTYPE_CHOICES: Final[frozenset[str]] = frozenset(
@@ -316,7 +325,10 @@ class ModelConfig:
         model_id: HuggingFace repo of the base model.
         revision: Git revision to pin, so a Hub update cannot silently change
             the weights under a resumed run.
-        trust_remote_code: Required for this model; its vision tower and
+        auto_class: ``AutoModel*`` class that loads the weights; see
+            :data:`AUTO_CLASS_CHOICES`. Must be ``causal_lm`` unless the model is
+            native to transformers, which 1.6 is.
+        trust_remote_code: Required for the original release; its vision tower and
             decoder are not in ``transformers``.
         attn_implementation: Attention kernel passed to ``from_pretrained``.
         dtype: ``auto`` resolves by compute capability at load time.
@@ -330,6 +342,7 @@ class ModelConfig:
 
     model_id: str = "PaddlePaddle/PaddleOCR-VL"
     revision: str = "main"
+    auto_class: str = "causal_lm"
     trust_remote_code: bool = True
     attn_implementation: str = "sdpa"
     dtype: str = "auto"
@@ -359,6 +372,13 @@ class ModelConfig:
         return cls(
             model_id=model_id,
             revision=str(payload.get("revision", defaults["revision"])).strip() or "main",
+            auto_class=_as_choice(
+                payload,
+                "auto_class",
+                defaults["auto_class"],
+                context,
+                AUTO_CLASS_CHOICES,
+            ),
             trust_remote_code=_as_bool(payload, "trust_remote_code", True, context),
             attn_implementation=str(
                 payload.get("attn_implementation", defaults["attn_implementation"])

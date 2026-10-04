@@ -72,7 +72,7 @@ def _():
 
     REPO = "zilber_ocr"
     REPO_URL = "https://github.com/shahriar-hd/zilber_ocr.git"
-    CONFIG = "configs/lora_config_rtx6000pro.yaml"
+    CONFIG = "configs/lora_config_rtx6000pro_16.yaml"
 
     # "tiny" is ~1% of each corpus: check -> manifest -> smoke -> probe -> baseline
     # -> train -> eval all finish in minutes, which is the point of it. "subset" is

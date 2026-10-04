@@ -27,7 +27,7 @@
 #   scripts/train_molab.sh train --epochs 2
 #
 # Environment:
-#   CONFIG      training YAML   (default: configs/lora_config_rtx6000pro.yaml)
+#   CONFIG      training YAML   (default: configs/lora_config_rtx6000pro_16.yaml)
 #   PY          interpreter      (default: first of python/python3/uv venv that has torch)
 #   FA_OCR_TF   auto|keras|torch (default: auto - see below)
 #
@@ -48,7 +48,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # Exported, not just set: the python snippets below read these from the environment.
-export CONFIG="${CONFIG:-configs/lora_config_rtx6000pro.yaml}"
+export CONFIG="${CONFIG:-configs/lora_config_rtx6000pro_16.yaml}"
 export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 # Trims allocator fragmentation: at batch 16 with variable-resolution pages the
 # block sizes differ every step, and stranding memory is what ends a long run.

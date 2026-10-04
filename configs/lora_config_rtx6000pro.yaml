@@ -43,10 +43,13 @@ seed: 1337
 
 model:
   model_id: PaddlePaddle/PaddleOCR-VL
-  # Still pinned, and for the same reason: revision a1e4dc4c (Hub PR #91) calls
-  # transformers.masking_utils.create_causal_mask(inputs_embeds=...), which
-  # exists only in transformers 5.x. Unpin this only as part of a deliberate
-  # transformers 5 migration, and on both configs at once.
+  # Still pinned: revision a1e4dc4c (Hub PR #91) calls
+  # transformers.masking_utils.create_causal_mask(inputs_embeds=...), which exists
+  # only in transformers 5.x - and pyproject now requires 5.x, for
+  # PaddleOCR-VL-1.6 (see configs/lora_config_rtx6000pro_16.yaml). This revision's
+  # own remote code was written for 4.x and is UNVERIFIED on 5, so on a current
+  # install the 1.6 profile is the supported path and scoring this model's
+  # adapter may need an environment still on transformers 4.
   revision: 2b77538ef936
   trust_remote_code: true
   # sdpa, not flash-attention-2: there is no prebuilt wheel for sm_120, and

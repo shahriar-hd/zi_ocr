@@ -39,6 +39,7 @@ to Google Drive in the background (see
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from collections.abc import Iterator
@@ -511,6 +512,25 @@ def build_arguments(
         The arguments object.
     """
     optim, runtime = config.optim, config.runtime
+    # Three of these keywords live on one side of the 4.x -> 5.x line only, so
+    # ask the installed version which spelling it takes rather than forking the
+    # function: transformers 5 merged warmup_ratio into warmup_steps (a float
+    # below 1 is still this share of the run, an integer is exact steps), always
+    # writes safetensors, and dropped group_by_length - whose False is its
+    # default, so leaving it out changes nothing while our own sampler, working
+    # from precomputed manifest lengths, keeps length-based batching off.
+    accepts = inspect.signature(TrainingArguments.__init__).parameters
+    warmup_key = "warmup_ratio" if "warmup_ratio" in accepts else "warmup_steps"
+    if optim.warmup_ratio >= 1.0 and warmup_key != "warmup_ratio":
+        raise ValueError(
+            f"optim.warmup_ratio {optim.warmup_ratio} cannot be expressed on this "
+            "transformers version: 5.x reads warmup_steps below 1 as a ratio, so "
+            "the configured value must be < 1"
+        )
+    version_specific: dict[str, Any] = {warmup_key: float(optim.warmup_ratio)}
+    for name, value in (("save_safetensors", True), ("group_by_length", False)):
+        if name in accepts:
+            version_specific[name] = value
     return TrainingArguments(
         output_dir=str(config.paths.output_dir / "checkpoints"),
         per_device_train_batch_size=optim.per_device_batch_size,
@@ -519,7 +539,7 @@ def build_arguments(
         learning_rate=optim.learning_rate,
         weight_decay=optim.weight_decay,
         max_grad_norm=optim.max_grad_norm,
-        warmup_ratio=optim.warmup_ratio,
+        **version_specific,
         lr_scheduler_type=optim.lr_scheduler_type,
         num_train_epochs=optim.num_epochs,
         max_steps=max_steps,
@@ -547,7 +567,6 @@ def build_arguments(
         save_strategy="steps" if save else "no",
         save_steps=runtime.save_steps,
         save_total_limit=runtime.save_total_limit,
-        save_safetensors=True,
         eval_strategy="steps" if evaluate else "no",
         eval_steps=runtime.eval_steps,
         # Mandatory, not tuning: forward() returns decoder hidden states under the
@@ -560,9 +579,6 @@ def build_arguments(
         report_to=[],
         seed=config.seed,
         data_seed=config.seed,
-        # Our own sampler does the grouping, over precomputed manifest lengths
-        # rather than by tokenising every target up front.
-        group_by_length=False,
     )
 
 

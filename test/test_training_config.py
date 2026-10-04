@@ -35,6 +35,8 @@ from fa_ocr_lora.training.config import (
 )
 
 _A100_CONFIG_PATH = "configs/lora_config_a100.yaml"
+_RTX_CONFIG_PATH = "configs/lora_config_rtx6000pro.yaml"
+_16_CONFIG_PATH = "configs/lora_config_rtx6000pro_16.yaml"
 
 
 def test_pixels_per_token_matches_the_processors_own_arithmetic():
@@ -359,3 +361,53 @@ def test_the_a100_profile_actually_removes_the_4gb_concessions():
     # Full page resolution: the corpus's largest page is 1240x1754 = 2,174,960 px,
     # so nothing is downscaled.
     assert a100.image.max_pixels >= 1240 * 1754
+
+
+def test_auto_class_defaults_to_the_original_releases_path():
+    """Adding the field must not move a profile that already worked.
+
+    The original checkpoint is loaded through its ``auto_map`` entry for
+    ``AutoModelForCausalLM``, which only works with the repository's own remote
+    code, so every profile that does not say otherwise stays on that path.
+    """
+    for path in (_A100_CONFIG_PATH, "configs/lora_config.yaml"):
+        config = load_training_config(path, apply_env=False)
+        assert config.model.auto_class == "causal_lm"
+        assert config.model.trust_remote_code is True
+
+
+def test_the_1_6_profile_loads_the_native_class():
+    """1.6 has no transformers 4 path, so the profile states it in both fields."""
+    config = load_training_config(_16_CONFIG_PATH, apply_env=False)
+    sibling = load_training_config(_RTX_CONFIG_PATH, apply_env=False)
+    assert config.model.model_id == "PaddlePaddle/PaddleOCR-VL-1.6"
+    assert config.model.auto_class == "image_text_to_text"
+    assert config.model.trust_remote_code is False
+    # Same corpus rules as its sibling - same seed, same holdout - but never the
+    # same directory: a checkpoint of one base must not resume under the other.
+    assert config.seed == sibling.seed
+    assert config.data.validation_size == sibling.data.validation_size
+    assert config.paths.output_dir != sibling.paths.output_dir
+
+
+def test_an_unknown_auto_class_is_rejected():
+    """A misspelling would otherwise fall back to the causal path silently."""
+    with pytest.raises(ConfigError, match="auto_class"):
+        ModelConfig.parse({"auto_class": "vision2seq"})
+
+
+def test_the_1_6_pixel_budget_is_the_processors_own_ceiling():
+    """Why ``max_pixels`` cannot be raised on 1.6: the processor clamps anyway.
+
+    Its ``smart_resize`` resizes whatever it is handed to at most 28*28*1280 px,
+    so a larger budget makes ``fit_image`` predict one token count while the
+    processor returns another, and ``SampleEncoder`` refuses the sample instead
+    of training on a wrong budget. The sibling profile asks for 2,175,600 px -
+    which is exactly why that file cannot be copied unchanged.
+    """
+    config = load_training_config(_16_CONFIG_PATH, apply_env=False)
+    assert config.image.max_pixels == 28 * 28 * 1280
+    assert config.image.max_image_tokens == 1280
+    # Our floor also has to stay above the processor's own (112,896 px), or it
+    # would upscale what we hand it and the same disagreement reappears.
+    assert config.image.min_pixels > 112_896

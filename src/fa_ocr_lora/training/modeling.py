@@ -54,6 +54,7 @@ __all__ = [
     "LoadedModel",
     "SlicedLossModel",
     "assert_frozen",
+    "auto_model_class",
     "load_eval_model",
     "load_training_model",
     "lora_target_paths",
@@ -629,6 +630,30 @@ class LoadedModel:
         )
 
 
+def auto_model_class(model: ModelConfig) -> Any:
+    """Pick the ``AutoModel*`` class that loads this profile's weights.
+
+    The original checkpoint publishes only an ``AutoModelForCausalLM`` entry in
+    its ``auto_map`` and needs the repository's own modeling file, so it loads as
+    causal language modelling with ``trust_remote_code`` on. PaddleOCR-VL-1.6 is
+    native to transformers 5 and its card loads it as image-text-to-text with no
+    remote code at all. ``model.auto_class`` states which of the two a profile
+    is, so a wrong choice fails at startup instead of silently loading a
+    different class than the one the adapter will later be attached to.
+
+    Args:
+        model: The profile's ``model`` section.
+
+    Returns:
+        The transformers auto class to call ``from_pretrained`` on.
+    """
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+    if model.auto_class == "image_text_to_text":
+        return AutoModelForImageTextToText
+    return AutoModelForCausalLM
+
+
 def _load_base(config: TrainingConfig) -> tuple[Any, Any, torch.dtype, bool]:
     """Load the processor and the raw base model.
 
@@ -645,7 +670,7 @@ def _load_base(config: TrainingConfig) -> tuple[Any, Any, torch.dtype, bool]:
     Returns:
         ``(base_model, processor, dtype, quantized)``.
     """
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoProcessor
 
     dtype = resolve_dtype(config.model)
     quant = quantization_config(config.model, dtype)
@@ -660,7 +685,7 @@ def _load_base(config: TrainingConfig) -> tuple[Any, Any, torch.dtype, bool]:
         revision=config.model.revision,
         trust_remote_code=config.model.trust_remote_code,
     )
-    base = AutoModelForCausalLM.from_pretrained(
+    base = auto_model_class(config.model).from_pretrained(
         config.model.model_id,
         revision=config.model.revision,
         trust_remote_code=config.model.trust_remote_code,
