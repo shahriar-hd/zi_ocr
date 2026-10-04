@@ -302,7 +302,7 @@ def _(mo):
 def _(Path, REPO_DIR, git_head, sh):
     from huggingface_hub import hf_hub_download
     # A subset pass needs ~15 GB: torch + the base model + these images.
-    sh('df', '-sh', str(REPO_DIR.parent), check=False)
+    sh('df', '-h', str(REPO_DIR.parent), check=False)
     LETTERS_REPO = 'shahriarhd/persian-official-letters-synth'
     letters_root = REPO_DIR / 'data' / 'dataset'
     letters_root.mkdir(parents=True, exist_ok=True)
@@ -388,7 +388,7 @@ def _(PIXEL_SHARDS, REPO_DIR, hf_hub_download, os, pq, secrets):
                 writer.writerow(pixel_rows[key])
         print(f'{_name}: {len(pixel_rows)} rows total')
     print(f'pixel: {len(pixel_rows)} rows, {pixel_csv}')
-    return pixel_csv, pixel_root
+    return csv, pixel_csv, pixel_root
 
 
 @app.cell(hide_code=True)
@@ -410,6 +410,7 @@ def _(
     DATA_MODE,
     REPO_DIR,
     capability,
+    csv,
     git_head,
     letters_images,
     letters_manifest,
@@ -418,6 +419,8 @@ def _(
     sh,
     torch,
 ):
+    import json
+
     import yaml
 
     config_path = REPO_DIR / CONFIG
@@ -426,8 +429,18 @@ def _(
         "or upload it through the file browser"
     )
     profile = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    letters_pages = sum(1 for line in letters_manifest.open(encoding="utf-8") if line.strip())
-    pixel_pages = sum(1 for _ in pixel_csv.open(encoding="utf-8-sig")) - 1
+    # Count what can actually be trained on. The JSONL describes all 26,848 pages
+    # whether or not their PNG is on disk, and a CSV row's text can contain
+    # newlines - counting physical lines reported 3,138 pixel pages for 531 rows.
+    letters_pages = 0
+    for _line in letters_manifest.open(encoding="utf-8"):
+        if not _line.strip():
+            continue
+        image = json.loads(_line).get("image", "")
+        if image and (letters_manifest.parent / image).is_file():
+            letters_pages += 1
+    with pixel_csv.open(encoding="utf-8-sig", newline="") as _handle:
+        pixel_pages = sum(1 for _ in csv.DictReader(_handle))
 
     print(f"device       sm_{capability[0]}{capability[1]} ({torch.cuda.get_device_name(0)})")
     print(f"config       {config_path.name} @ {git_head}")
@@ -453,6 +466,12 @@ def _(mo):
     Two cells below are for the run that is already going: `status` prints the
     console tail, GPU utilisation and free disk, and `stop` ends the detached
     process (checkpoints already in Drive stay valid).
+
+    Three cells answer "how did it do", each narrowing the question: `baseline`
+    (in the stages loop) scores the untrained base, `eval` scores the trained
+    adapter, and `compare` scores **both** over the same split and prints the
+    difference per dataset, so an improvement on letters cannot hide a regression
+    on Persian Pixel.
     """)
     return
 
@@ -489,7 +508,7 @@ def _(REPO_DIR, sh, stage_env, token_path):
 
 
 @app.cell
-def _(REPO_DIR, profile, sh):
+def _(REPO_DIR, os, profile, sh):
     import time
 
     run_dir = REPO_DIR / profile["paths"]["output_dir"]
@@ -499,7 +518,9 @@ def _(REPO_DIR, profile, sh):
     print("console:", console)
 
     # One iteration a minute: the loop is also what keeps the kernel busy, which is
-    # how the 90-minute idle shutdown is avoided while the detached run trains.
+    # how the 90-minute idle shutdown is avoided while the detached run trains. It
+    # stops the moment the run does, so a finished run is not re-printed for the
+    # remaining minutes of the loop.
     for _ in range(60):
         if console.exists():
             for line in console.read_text(errors="replace").splitlines()[-12:]:
@@ -512,6 +533,18 @@ def _(REPO_DIR, profile, sh):
             capture=True,
         )
         print(time.strftime("%H:%M:%S"), "gpu", (gpu.stdout or "").strip())
+        running = False
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text().strip()), 0)  # signal 0 = existence
+                running = True
+            except ProcessLookupError:
+                running = False
+            except (ValueError, PermissionError):
+                running = True
+        if not running:
+            print("train is no longer running - monitor done; next: eval")
+            break
         time.sleep(60)
     return
 
@@ -534,10 +567,24 @@ def _(REPO_DIR, sh, stage_env):
 
 @app.cell
 def _(REPO_DIR, sh, stage_env):
-    # Run this once checkpoints exist (every `save_steps: 500`). It reports trained
-    # CER/WER plus the sensitive-field audit; run the `baseline` stage first to have
-    # an untrained number to compare against.
+    # Run this once the adapter exists: checkpoints land every `save_steps: 500`
+    # and one final checkpoint plus `adapter_only` are written when the run ends.
+    # It reports trained CER/WER plus the sensitive-field audit; `baseline` (in the
+    # stages cell) is the untrained number to compare against.
     sh("bash", "scripts/train_molab.sh", "eval", cwd=REPO_DIR, env=stage_env, check=False)
+    return
+
+
+@app.cell
+def _(REPO_DIR, sh, stage_env):
+    # Base against the trained adapter over the same test records, broken down per
+    # dataset (letters / Persian Pixel) as well as overall - the answer to "did the
+    # adapter help" that one CER cannot give. `--split validation` scores the
+    # holdout instead; `--max-samples` caps a full-corpus pass.
+    sh(
+        "bash", "scripts/train_molab.sh", "compare", "--split", "test",
+        cwd=REPO_DIR, env=stage_env, check=False,
+    )
     return
 
 

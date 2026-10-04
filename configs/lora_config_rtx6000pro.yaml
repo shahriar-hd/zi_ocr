@@ -172,21 +172,23 @@ image:
   # and leaving it on would let vram.py's 3050 Ti coefficients silently reduce a
   # resolution that was chosen deliberately.
   autoprobe_vram: false
-  # A deliberate override, not a measurement. image.reserved_vram_mib REPLACES
+  # A deliberate override, not a modelled number: image.reserved_vram_mib REPLACES
   # the whole projection (vram.projected_peak_mib returns it verbatim), and with
-  # autoprobe_vram off nothing consumes it except the startup banner, which
-  # compares it against free VRAM less the safety margin. 30,000 is carried over
-  # from the A100 profile because it is a known-safe ceiling for this workload at
-  # batch 16, not because it describes a 96 GB card - vram.py's coefficients were
-  # fitted on a 3050 Ti and describe neither.
+  # autoprobe_vram off nothing consumes it except the startup banner, which compares
+  # it against free VRAM less the safety margin. vram.py's coefficients were fitted
+  # on a 3050 Ti, so the value has to come from a measurement on this card - which
+  # is what the first `--probe 30` provides.
   #
-  # It is a modelled number and a conservative one. Against the only run available
-  # to check it - data/training/lora_1000 - the same model predicted 2,113 MiB where
-  # the allocator reported 1,253, so it over-reads by ~1.7x on that case and 30,000
-  # is better read as a ceiling than as a forecast. Replace it with the probe's
-  # reported peak after the first `--probe 30`, which is the only way to make the
-  # banner authoritative.
-  reserved_vram_mib: 30000
+  # Measured on the RTX PRO 6000 (96 GB): probe peak 93,559 MiB, train peak 93,643
+  # MiB over 144 steps, nvidia-smi 95,210 of 97,887 while training. The 30,000
+  # carried over from the A100 profile understated this workload by 3x, so the
+  # banner passed while the card was already at 96% of its memory.
+  #
+  # ~2.2 GB of headroom against a full run's spendable 95,938 MiB. Batch 16 of
+  # full-resolution pages is what costs it: if a run ever OOMs, the first knob is
+  # per_device_batch_size 8 + gradient_accumulation_steps 2 (effective batch stays
+  # 16), then re-probe and update this figure.
+  reserved_vram_mib: 93700
 
   # Measured, not inferred. Tokenising all 26,848 pages at the resolution above
   # gives total sequence lengths of p50 2,953 / p95 3,681 / p99 3,864, so 4,096

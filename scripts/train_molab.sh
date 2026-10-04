@@ -17,6 +17,7 @@
 #   baseline   base-model CER/WER, so training has a target
 #   train      the run itself (nohup'd, resumable, mirrored to Drive)
 #   eval       trained CER/WER + sensitive-field audit
+#   compare    base vs adapter on one split, broken down per dataset
 #   status     pid, last lines of the console, GPU, free disk
 #   stop       kill the run - checkpoints already in Drive stay valid
 #   all        check -> manifest -> smoke -> probe -> train
@@ -272,6 +273,13 @@ stage_eval() {
   $PY -m fa_ocr_lora.training.eval --config "$CONFIG" "$@"
 }
 
+stage_compare() {
+  banner "compare (base vs adapter)"
+  # Both variants are scored over the same records, so the delta isolates the
+  # adapter rather than a difference in which rows were sampled.
+  $PY -m fa_ocr_lora.training.compare_eval --config "$CONFIG" "$@"
+}
+
 stage_baseline() {
   banner "baseline eval (no adapter)"
   $PY -m fa_ocr_lora.training.eval --config "$CONFIG" --no-adapter --max-samples 100 "$@"
@@ -358,7 +366,7 @@ print(load_training_config(os.environ["CONFIG"]).paths.output_dir)
 EOF
 }
 
-usage() { sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # status/stop do not import transformers, so they stay usable when the interpreter
 # is broken - which is exactly when you want them.
@@ -379,6 +387,7 @@ case "${1:-}" in
   baseline) shift; stage_baseline "$@" ;;
   train)    shift; stage_train "$@" ;;
   eval)     shift; stage_eval "$@" ;;
+  compare)  shift; stage_compare "$@" ;;
   status)   shift; stage_status "$@" ;;
   stop)     shift; stage_stop "$@" ;;
   all)
