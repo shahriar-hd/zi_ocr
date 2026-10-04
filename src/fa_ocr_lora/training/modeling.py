@@ -52,12 +52,15 @@ __all__ = [
     "FROZEN_PREFIXES",
     "EvalModel",
     "LoadedModel",
+    "ModelLayout",
     "SlicedLossModel",
     "assert_frozen",
     "auto_model_class",
     "load_eval_model",
     "load_training_model",
     "lora_target_paths",
+    "model_layout",
+    "on_text_path",
     "parameter_groups",
     "resolve_dtype",
     "resolve_optimizer",
@@ -80,6 +83,85 @@ EMBED_PATH: Final[str] = "model.embed_tokens"
 
 #: Path of the output projection, adapted when ``lora.adapt_lm_head`` is set.
 HEAD_PATH: Final[str] = "lm_head"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLayout:
+    """Where a checkpoint keeps the parts LoRA has to reach.
+
+    The original release puts the decoder at ``model.layers`` with the input
+    embedding at ``model.embed_tokens`` and its tower at the top level;
+    PaddleOCR-VL-1.6 nests both under ``model`` and splits the decoder further
+    off as ``model.language_model`` (``model.language_model.layers``,
+    ``model.language_model.embed_tokens``, ``model.visual``,
+    ``model.projector``). These paths decide which parameters LoRA adapts, which
+    two get the embed/head learning rate, and - by exclusion - which are frozen,
+    so they are read off the loaded model rather than assumed from one layout.
+
+    Attributes:
+        decoder_owner: The module that owns the decoder - ``model`` on the
+            original release, ``model.language_model`` on 1.6. Everything under
+            it is text, including parts no config names (the final norm), which
+            is what keeps the freezing rule from reading a decoder parameter as
+            something that has to stay frozen.
+        decoder_prefix: Path of the decoder's layer list, ``<owner>.layers.``.
+        embed_path: Path of the input embedding table.
+        head_path: Path of the output projection.
+    """
+
+    decoder_owner: str
+    decoder_prefix: str
+    embed_path: str
+    head_path: str
+
+
+def model_layout(model: nn.Module) -> ModelLayout:
+    """Read the decoder layout off a loaded checkpoint.
+
+    The input embedding names the decoder: whichever module owns ``embed_tokens``
+    also owns ``layers``. That single read is what separates the two releases,
+    and getting it wrong is not a clean failure either way - no path matching
+    raises (which is loud), while a frozen-path prefix that matches nothing
+    quietly leaves the vision tower trainable (which is not).
+
+    Args:
+        model: A loaded model, wrapped by PEFT or not.
+
+    Returns:
+        The paths for this checkpoint, or the original release's constants when
+        no embedding can be found, so an error message still names a real path
+        instead of an empty string.
+    """
+    names = [_strip_peft(name) for name, _ in model.named_modules()]
+    embed = next((n for n in names if n.rsplit(".", 1)[-1] == "embed_tokens"), None)
+    if embed is None:
+        return ModelLayout("model", DECODER_PREFIX, EMBED_PATH, HEAD_PATH)
+    owner = embed.rsplit(".", 1)[0]
+    head = next((n for n in names if n.rsplit(".", 1)[-1] == "lm_head"), HEAD_PATH)
+    prefix = f"{owner}.layers." if owner else "layers."
+    return ModelLayout(owner, prefix, embed, head)
+
+
+def on_text_path(name: str, layout: ModelLayout) -> bool:
+    """Whether a parameter belongs to the text side of the model.
+
+    Args:
+        name: Parameter path, PEFT wrapper segments allowed.
+        layout: Layout of the checkpoint the path came from.
+
+    Returns:
+        ``True`` for anything under the decoder's owner - layers, input
+        embedding and the final norm alike - and for the output head.
+        Everything else, the vision tower and the projector under whichever
+        nesting this release uses, is what has to stay frozen.
+    """
+    stripped = _strip_peft(name)
+    if not layout.decoder_owner:
+        # An embedding at the root leaves no owner directory to recognise by.
+        on_embedding = stripped.startswith(layout.embed_path)
+        return on_embedding or stripped.startswith(layout.head_path)
+    under_decoder = stripped.startswith(f"{layout.decoder_owner}.")
+    return under_decoder or stripped.startswith(layout.head_path)
 
 
 def resolve_dtype(model: ModelConfig) -> torch.dtype:
@@ -195,9 +277,10 @@ def freeze_vision(model: nn.Module) -> tuple[int, int]:
     Returns:
         ``(frozen_parameters, remaining_trainable_parameters)``.
     """
+    layout = model_layout(model)
     frozen = 0
     for name, parameter in model.named_parameters():
-        if name.startswith(FROZEN_PREFIXES):
+        if not on_text_path(name, layout):
             parameter.requires_grad_(False)
             frozen += parameter.numel()
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -219,10 +302,11 @@ def assert_frozen(model: nn.Module) -> None:
         AssertionError: If any parameter under :data:`FROZEN_PREFIXES` requires
             grad.
     """
+    layout = model_layout(unwrap_base(model))
     leaked = [
         name
         for name, parameter in unwrap_base(model).named_parameters()
-        if parameter.requires_grad and _strip_peft(name).startswith(FROZEN_PREFIXES)
+        if parameter.requires_grad and not on_text_path(name, layout)
     ]
     if leaked:
         raise AssertionError(
@@ -269,22 +353,24 @@ def lora_target_paths(model: nn.Module, lora: LoraSection) -> list[str]:
             layout changed and the configured names are stale.
     """
     wanted = set(lora.target_modules)
+    layout = model_layout(model)
     paths = [
         name
         for name, module in model.named_modules()
-        if name.startswith(DECODER_PREFIX)
+        if name.startswith(layout.decoder_prefix)
         and isinstance(module, nn.Linear)
         and name.rsplit(".", 1)[-1] in wanted
     ]
     if not paths:
         raise ValueError(
             f"none of the configured target_modules {sorted(wanted)} matched a "
-            f"Linear under {DECODER_PREFIX!r}; the checkpoint layout has changed"
+            f"Linear under {layout.decoder_prefix!r}; the checkpoint layout has "
+            "changed"
         )
     if lora.adapt_embeddings:
-        paths.append(EMBED_PATH)
+        paths.append(layout.embed_path)
     if lora.adapt_lm_head:
-        paths.append(HEAD_PATH)
+        paths.append(layout.head_path)
     return paths
 
 
@@ -562,13 +648,15 @@ def parameter_groups(model: nn.Module, optim: OptimConfig) -> list[dict[str, Any
     Raises:
         ValueError: If no parameter requires grad, which means injection failed.
     """
+    layout = model_layout(unwrap_base(model))
     fast: list[nn.Parameter] = []
     slow: list[nn.Parameter] = []
     for name, parameter in unwrap_base(model).named_parameters():
         if not parameter.requires_grad:
             continue
         stripped = _strip_peft(name)
-        target = slow if stripped.startswith((EMBED_PATH, HEAD_PATH)) else fast
+        head_or_embed = stripped.startswith((layout.embed_path, layout.head_path))
+        target = slow if head_or_embed else fast
         target.append(parameter)
     if not fast and not slow:
         raise ValueError("no trainable parameters; LoRA injection produced nothing")
