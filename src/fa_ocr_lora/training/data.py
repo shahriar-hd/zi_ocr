@@ -121,6 +121,8 @@ class CollatedBatch:
         pixel_values: Patches of every image in the batch, concatenated along
             dim 0, shape ``(sum(P_i), 3, 14, 14)``.
         image_grid_thw: One row per image, shape ``(B, 3)``.
+        mm_token_type_ids: Modality ids per token, shape ``(B, L)``, or ``None``
+            where no sample carried them.
     """
 
     input_ids: torch.Tensor
@@ -128,20 +130,28 @@ class CollatedBatch:
     labels: torch.Tensor
     pixel_values: torch.Tensor
     image_grid_thw: torch.Tensor
+    mm_token_type_ids: torch.Tensor | None = None
 
     def to_kwargs(self) -> dict[str, torch.Tensor]:
         """Return the batch as model ``forward`` keyword arguments.
 
+        The modality ids ride along only when a sample carried them: omitting
+        the key keeps the older checkpoint's ``forward`` untouched, while
+        transformers 5's native 1.6 raises if it receives the grid without them.
+
         Returns:
             A mapping ready to splat into the model call.
         """
-        return {
+        kwargs = {
             "input_ids": self.input_ids,
             "attention_mask": self.attention_mask,
             "labels": self.labels,
             "pixel_values": self.pixel_values,
             "image_grid_thw": self.image_grid_thw,
         }
+        if self.mm_token_type_ids is not None:
+            kwargs["mm_token_type_ids"] = self.mm_token_type_ids
+        return kwargs
 
 
 class PersianOcrDataset(Dataset[dict[str, torch.Tensor]]):
@@ -302,12 +312,17 @@ class PersianOcrDataset(Dataset[dict[str, torch.Tensor]]):
                 LOGGER.warning("skipping %s: %s", row["record_id"], exc)
             else:
                 self.stats.note(sample)
-                return {
+                record: dict[str, torch.Tensor] = {
                     "input_ids": sample.input_ids,
                     "labels": sample.labels,
                     "pixel_values": sample.pixel_values,
                     "image_grid_thw": sample.image_grid_thw,
                 }
+                # Present exactly when the encoder's processor returns it - absent
+                # for older checkpoints, whose records stay byte-identical.
+                if sample.mm_token_type_ids is not None:
+                    record["mm_token_type_ids"] = sample.mm_token_type_ids
+                return record
         raise RuntimeError(
             f"{MAX_ADVANCE} consecutive records failed to encode from position "
             f"{position}; the corpus or the manifest is unusable "
@@ -357,6 +372,15 @@ def collate_samples(
         labels[row, :length] = item["labels"]
         attention_mask[row, :length] = 1
 
+    mm_token_type_ids = None
+    if "mm_token_type_ids" in features[0]:
+        # Padding with 0 (text): the model filters masked rows before the RoPE
+        # pass, so what sits under the mask carries no position either way.
+        first = features[0]["mm_token_type_ids"]
+        mm_token_type_ids = torch.zeros((batch, width), dtype=first.dtype)
+        for row, item in enumerate(features):
+            mm_token_type_ids[row, : lengths[row]] = item["mm_token_type_ids"]
+
     collated = CollatedBatch(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -365,6 +389,7 @@ def collate_samples(
             dtype
         ),
         image_grid_thw=torch.cat([item["image_grid_thw"] for item in features], dim=0),
+        mm_token_type_ids=mm_token_type_ids,
     )
     return collated.to_kwargs()
 

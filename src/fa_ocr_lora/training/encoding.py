@@ -68,6 +68,10 @@ class EncodedSample:
         supervised_tokens: How many positions carry a real label. The chunked
             loss head sizes its work from this, and the run log reports it.
         image_tokens: How many positions the image occupies.
+        mm_token_type_ids: Per-token modality ids (text 0, image 1, video 2)
+            for models that compute multimodal RoPE from them, aligned with
+            ``input_ids``. ``None`` on models whose processor does not return
+            them, which read position from the grid alone.
         shrunk: Whether the image budget was reduced to make the record fit.
         truncated: Whether the target was cut to make the record fit.
     """
@@ -78,6 +82,7 @@ class EncodedSample:
     image_grid_thw: torch.Tensor
     supervised_tokens: int
     image_tokens: int
+    mm_token_type_ids: torch.Tensor | None = None
     shrunk: bool = False
     truncated: bool = False
 
@@ -102,6 +107,8 @@ class EncodedPrompt:
         pixel_values: Flattened image patches, shape ``(P, 3, 14, 14)``.
         image_grid_thw: Patch grid as ``(1, 3)``.
         image_tokens: How many positions the image occupies.
+        mm_token_type_ids: The processor's per-token modality ids, aligned with
+            ``input_ids``, or ``None`` where the processor returns none.
         width: Width in pixels of the image as fed, after resizing.
         height: Height in pixels of the image as fed, after resizing.
         source_width: Width of the region before resizing, so a caller can report
@@ -117,6 +124,7 @@ class EncodedPrompt:
     height: int
     source_width: int
     source_height: int
+    mm_token_type_ids: torch.Tensor | None = None
 
     def __len__(self) -> int:
         """Prompt length in tokens."""
@@ -284,6 +292,17 @@ class SampleEncoder:
         answer = torch.tensor(answer_ids, dtype=prompt_ids.dtype)
         input_ids = torch.cat([prompt_ids, answer])
         labels = torch.cat([torch.full_like(prompt_ids, IGNORE_INDEX), answer])
+        processor_mm = batch.get("mm_token_type_ids")
+        if processor_mm is not None:
+            # Same layout as the prompt, which is exactly what the ids align
+            # to; the answer positions are produced text, and the padded region
+            # the collator adds keeps the same value because the model masks it
+            # before the RoPE pass.
+            mm_token_type_ids = torch.cat(
+                [processor_mm[0], torch.zeros(len(answer), dtype=processor_mm.dtype)]
+            )
+        else:
+            mm_token_type_ids = None
         return EncodedSample(
             input_ids=input_ids,
             labels=labels,
@@ -291,6 +310,7 @@ class SampleEncoder:
             image_grid_thw=batch["image_grid_thw"],
             supervised_tokens=len(answer_ids),
             image_tokens=predicted,
+            mm_token_type_ids=mm_token_type_ids,
             shrunk=shrunk,
             truncated=truncated,
         )
@@ -363,11 +383,13 @@ class SampleEncoder:
                 f"processor produced {actual}; the pixel budget and the "
                 "processor's resize rule have diverged"
             )
+        prompt_mm = batch.get("mm_token_type_ids")
         return EncodedPrompt(
             input_ids=prompt_ids,
             pixel_values=batch["pixel_values"],
             image_grid_thw=batch["image_grid_thw"],
             image_tokens=predicted,
+            mm_token_type_ids=prompt_mm[0] if prompt_mm is not None else None,
             width=image.width,
             height=image.height,
             source_width=source_width,

@@ -290,12 +290,21 @@ def score_split(
             cut = _prompt_length(sample.labels)
             if recorder is not None:
                 recorder.reset()
+            extra: dict[str, torch.Tensor] = {}
+            if sample.mm_token_type_ids is not None:
+                # transformers 5's native 1.6 needs per-token modality ids for
+                # M-RoPE and raises without them; the older checkpoint reads
+                # position from the grid alone and never looks at this key.
+                extra["mm_token_type_ids"] = (
+                    sample.mm_token_type_ids[:cut].unsqueeze(0).to(device)
+                )
             with torch.inference_mode():
                 generated = loaded.model.generate(
                     input_ids=sample.input_ids[:cut].unsqueeze(0).to(device),
                     attention_mask=torch.ones((1, cut), dtype=torch.long, device=device),
                     pixel_values=sample.pixel_values.to(device, loaded.dtype),
                     image_grid_thw=sample.image_grid_thw.to(device),
+                    **extra,
                     max_new_tokens=config.eval.max_new_tokens,
                     num_beams=config.eval.num_beams,
                     do_sample=False,

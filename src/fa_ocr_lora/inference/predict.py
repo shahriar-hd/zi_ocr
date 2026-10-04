@@ -293,12 +293,18 @@ def read_document(
     # Uncertainty is only sound under greedy decoding, where the emitted token is
     # the argmax the recorder sees - the same condition evaluation applies.
     recorder = recorder_for(config.eval.num_beams) if reader.rules else None
+    extra: dict[str, torch.Tensor] = {}
+    if prompt.mm_token_type_ids is not None:
+        # Same contract as scoring: required by the native 1.6 model, ignored
+        # by the older checkpoint.
+        extra["mm_token_type_ids"] = prompt.mm_token_type_ids.unsqueeze(0).to(device)
     with torch.inference_mode():
         generated = reader.model.generate(
             input_ids=prompt.input_ids.unsqueeze(0).to(device),
             attention_mask=torch.ones((1, cut), dtype=torch.long, device=device),
             pixel_values=prompt.pixel_values.to(device, reader.dtype),
             image_grid_thw=prompt.image_grid_thw.to(device),
+            **extra,
             max_new_tokens=config.eval.max_new_tokens,
             num_beams=config.eval.num_beams,
             do_sample=False,
