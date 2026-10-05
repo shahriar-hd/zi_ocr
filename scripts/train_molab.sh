@@ -309,6 +309,27 @@ stage_train() {
   echo "  note    : keep a cell printing every minute or marimo kills the idle kernel"
 }
 
+# Is the detached run still a process? `kill -0` is not enough: the run is
+# orphaned when this script exits, and a container that does not reap leaves the
+# finished run in the table as a zombie - the pid answers `kill -0` forever, so
+# `status` called a run that had ended "alive" and the monitor cell kept polling
+# it instead of evaluating the adapter. The state field of /proc settles it, read
+# through the same helper the notebook imports, so the two never disagree.
+pid_state() {
+  $PY - "$1" <<'EOF'
+import sys
+
+from fa_ocr_lora.utils.process import pid_state
+
+try:
+    pid = int(sys.argv[1])
+except ValueError:
+    print("gone")
+else:
+    print(pid_state(pid))
+EOF
+}
+
 stage_status() {
   local log_dir console pidfile pid
   log_dir="$(output_dir)"
@@ -317,11 +338,11 @@ stage_status() {
   banner "run"
   if [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile")"
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "pid      : $pid (alive)"
-    else
-      echo "pid      : $pid (not running)"
-    fi
+    case "$(pid_state "$pid" || true)" in
+      alive) echo "pid      : $pid (alive)" ;;
+      zombie) echo "pid      : $pid (exited, never reaped - the run is over)" ;;
+      *) echo "pid      : $pid (not running)" ;;
+    esac
   else
     echo "pid      : none recorded - the train stage has not been started"
   fi
@@ -344,12 +365,18 @@ stage_stop() {
     return 0
   fi
   pid="$(cat "$pidfile")"
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid"
-    echo "sent TERM to $pid (checkpoints already in Drive stay valid)"
-  else
-    echo "pid $pid was not running"
-  fi
+  case "$(pid_state "$pid" || true)" in
+    alive)
+      kill "$pid"
+      echo "sent TERM to $pid (checkpoints already in Drive stay valid)"
+      ;;
+    zombie)
+      echo "pid $pid had already exited - nothing to stop"
+      ;;
+    *)
+      echo "pid $pid was not running"
+      ;;
+  esac
   rm -f "$pidfile"
 }
 

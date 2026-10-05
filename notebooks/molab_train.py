@@ -516,10 +516,13 @@ def _(CONFIG, REPO_DIR, os, profile, sh):
     import json
     import time
 
+    from fa_ocr_lora.utils.process import is_running
+
     run_dir = REPO_DIR / profile["paths"]["output_dir"]
     console = run_dir / "console.log"
     pid_file = run_dir / "train.pid"
     adapter_dir = run_dir / "adapter_only"
+    summary = run_dir / "training_summary.json"
     print("pid:", pid_file.read_text().strip() if pid_file.exists() else "not started")
     print("console:", console)
 
@@ -528,7 +531,7 @@ def _(CONFIG, REPO_DIR, os, profile, sh):
     # Only lines appended since the previous poll are printed, and when the run
     # ends the cell evaluates automatically (see below) instead of looping on.
     _seen = 0
-    _saw_alive = False
+    _summary_start = summary.stat().st_mtime_ns if summary.exists() else None
     for _ in range(60):
         if console.exists():
             _lines = console.read_text(errors="replace").splitlines()
@@ -547,17 +550,23 @@ def _(CONFIG, REPO_DIR, os, profile, sh):
             capture=True,
         )
         print(time.strftime("%H:%M:%S"), "gpu", (_gpu.stdout or "").strip())
-        _running = False
         if pid_file.exists():
             try:
-                os.kill(int(pid_file.read_text().strip()), 0)  # signal 0 = existence
-                _running = True
-            except ProcessLookupError:
-                _running = False
+                # is_running, not kill -0: the run is orphaned, and a container
+                # that does not reap leaves it as a zombie that answers kill -0
+                # long after it stopped - which is how this loop polled a finished
+                # run for eleven minutes instead of reporting on it.
+                _running = is_running(int(pid_file.read_text().strip()))
             except (ValueError, PermissionError):
-                _running = True
-        _saw_alive = _saw_alive or _running
-        if not _running:
+                _running = True  # unreadable pid file: believe the run is going
+        else:
+            _running = False
+        # training_summary.json is written only once the run and its Drive drain
+        # are done, so a new one ends the loop even if the pid outlives it.
+        _finished = summary.exists() and (
+            _summary_start is None or summary.stat().st_mtime_ns != _summary_start
+        )
+        if not _running or _finished:
             break
         time.sleep(60)
 
@@ -635,7 +644,10 @@ def _(CONFIG, REPO_DIR, os, profile, sh):
             print(f"{_name:<16} {_n!s:>4} {_before.get('cer', 0):>9.4f} {_after.get('cer', 0):>11.4f} {_delta:>+9.4f}")
         print(f"verdict: adapter better on {_better} of {_better + _worse} datasets")
 
-    if not _saw_alive:
+    # Decided on the artifacts rather than on whether this poll saw the pid alive:
+    # the run may have finished before the cell was pressed - after a restart, or
+    # after `stop` cleared the pid file - and there is still an adapter to report on.
+    if not _has_adapter and not console.exists():
         print("train was never seen running - start it with the train cell first")
     elif _crashed or not _has_adapter:
         print("train did NOT finish cleanly - no eval; inspect the console tail above, fix, re-run the train cell")
