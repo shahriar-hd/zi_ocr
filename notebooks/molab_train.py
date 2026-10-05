@@ -419,7 +419,7 @@ def _(
     sh,
     torch,
 ):
-    import json
+    import json as _json
 
     import yaml
 
@@ -436,7 +436,7 @@ def _(
     for _line in letters_manifest.open(encoding="utf-8"):
         if not _line.strip():
             continue
-        image = json.loads(_line).get("image", "")
+        image = _json.loads(_line).get("image", "")
         if image and (letters_manifest.parent / image).is_file():
             letters_pages += 1
     with pixel_csv.open(encoding="utf-8-sig", newline="") as _handle:
@@ -561,83 +561,86 @@ def _(CONFIG, REPO_DIR, os, profile, sh):
             break
         time.sleep(60)
 
-    if not _saw_alive:
-        print("train was never seen running - start it with the train cell first")
-        return
-
     # How the run ended, from the console tail and the artifacts it should leave.
+    # A marimo cell is one top-level block - no early `return` - so every exit
+    # below is an `if`/`elif` branch and the work lives in `_report`.
     _text = console.read_text(errors="replace") if console.exists() else ""
     _crashed = ("Traceback" in _text) or ("training failed" in _text)
     _has_adapter = adapter_dir.is_dir() and any(adapter_dir.iterdir())
-    if _crashed or not _has_adapter:
+
+    def _report():
+        # Evaluate the adapter the same way the standalone cells would, then
+        # report base vs trained side by side.
+        _report_env = {**os.environ, "CONFIG": CONFIG}
+        _base_json = run_dir / "eval_validation.json"
+        _base_backup = run_dir / "eval_validation_base.json"
+        if _base_json.is_file() and not _base_backup.is_file():
+            _base_backup.write_bytes(_base_json.read_bytes())
+            print("baseline metrics preserved at", _base_backup.name)
+
+        print("== eval (trained adapter, validation) ==")
+        if sh("bash", "scripts/train_molab.sh", "eval", cwd=REPO_DIR, env=_report_env, check=False).returncode:
+            print("eval failed - adapter left in place; re-run the eval cell")
+            return
+
+        def _show(label, base_value, trained_value):
+            if isinstance(base_value, float) or isinstance(trained_value, float):
+                _base_text = f"{base_value:.4f}" if isinstance(base_value, float) else base_value
+                _trained_text = f"{trained_value:.4f}" if isinstance(trained_value, float) else trained_value
+                if isinstance(base_value, (int, float)) and isinstance(trained_value, (int, float)) and not isinstance(trained_value, bool):
+                    _delta = f"{trained_value - base_value:+.4f}"
+                else:
+                    _delta = "-"
+            else:
+                _base_text, _trained_text = base_value, trained_value
+                if isinstance(base_value, int) and isinstance(trained_value, int):
+                    _delta = f"{trained_value - base_value:+d}"
+                else:
+                    _delta = "-"
+            print(f"{label:<14} {_base_text!s:>10} {_trained_text!s:>10} {_delta:>10}")
+
+        _trained = json.loads((run_dir / "eval_validation.json").read_text())
+        _base = json.loads(_base_backup.read_text()) if _base_backup.is_file() else {}
+        print(f"{'metric':<14} {'base':>10} {'trained':>10} {'delta':>10}")
+        for _label, _key in (("samples", "samples"), ("CER", "cer"), ("WER", "wer"),
+                             ("digit CER", "digit_cer"), ("digit exact", "digit_exact"),
+                             ("empty preds", "empty_predictions")):
+            _show(_label, _base.get(_key, "-"), _trained.get(_key, "-"))
+        print("field recall (base -> trained):")
+        for _field in ("registration_number", "letter_number", "date", "national_id", "amount"):
+            _recall_base = (_base.get("field_audit", {}) or {}).get("fields", {}).get(_field, {}).get("recall")
+            _recall_trained = (_trained.get("field_audit", {}) or {}).get("fields", {}).get(_field, {}).get("recall")
+            _base_text = f"{_recall_base:.4f}" if isinstance(_recall_base, float) else "-"
+            _trained_text = f"{_recall_trained:.4f}" if isinstance(_recall_trained, float) else "-"
+            print(f"  {_field:<20} {_base_text} -> {_trained_text}")
+
+        print("== compare (base vs adapter, test) ==")
+        if sh("bash", "scripts/train_molab.sh", "compare", "--split", "test", cwd=REPO_DIR, env=_report_env, check=False).returncode:
+            print("compare failed - eval numbers above still stand")
+            return
+        _data = json.loads((run_dir / "compare_test.json").read_text())
+        print(f"{'dataset':<16} {'n':>4} {'base CER':>9} {'adapter CER':>11} {'delta':>9}")
+        _better = _worse = 0
+        for _row in _data.get("comparison", []):
+            _name = _row.get("dataset", "?")
+            _samples = _row.get("samples", {}) or {}
+            _n = _samples.get("adapter", _samples.get("base", "?"))
+            _before, _after = _row.get("base"), _row.get("adapter")
+            if not _before or not _after:
+                print(f"{_name:<16} {str(_n):>4} only one side scored")
+                continue
+            _delta = _after.get("cer", 0) - _before.get("cer", 0)
+            _better += _delta < 0
+            _worse += _delta > 0
+            print(f"{_name:<16} {_n!s:>4} {_before.get('cer', 0):>9.4f} {_after.get('cer', 0):>11.4f} {_delta:>+9.4f}")
+        print(f"verdict: adapter better on {_better} of {_better + _worse} datasets")
+
+    if not _saw_alive:
+        print("train was never seen running - start it with the train cell first")
+    elif _crashed or not _has_adapter:
         print("train did NOT finish cleanly - no eval; inspect the console tail above, fix, re-run the train cell")
-        return
-
-    # The run produced an adapter: evaluate it the same way the standalone cells
-    # would, then report base vs trained side by side.
-    _report_env = {**os.environ, "CONFIG": CONFIG}
-    _base_json = run_dir / "eval_validation.json"
-    _base_backup = run_dir / "eval_validation_base.json"
-    if _base_json.is_file() and not _base_backup.is_file():
-        _base_backup.write_bytes(_base_json.read_bytes())
-        print("baseline metrics preserved at", _base_backup.name)
-
-    print("== eval (trained adapter, validation) ==")
-    if sh("bash", "scripts/train_molab.sh", "eval", cwd=REPO_DIR, env=_report_env, check=False).returncode:
-        print("eval failed - adapter left in place; re-run the eval cell")
-        return
-
-    def _show(label, base_value, trained_value):
-        if isinstance(base_value, float) or isinstance(trained_value, float):
-            _base_text = f"{base_value:.4f}" if isinstance(base_value, float) else base_value
-            _trained_text = f"{trained_value:.4f}" if isinstance(trained_value, float) else trained_value
-            if isinstance(base_value, (int, float)) and isinstance(trained_value, (int, float)) and not isinstance(trained_value, bool):
-                _delta = f"{trained_value - base_value:+.4f}"
-            else:
-                _delta = "-"
-        else:
-            _base_text, _trained_text = base_value, trained_value
-            if isinstance(base_value, int) and isinstance(trained_value, int):
-                _delta = f"{trained_value - base_value:+d}"
-            else:
-                _delta = "-"
-        print(f"{label:<14} {_base_text!s:>10} {_trained_text!s:>10} {_delta:>10}")
-
-    _trained = json.loads((run_dir / "eval_validation.json").read_text())
-    _base = json.loads(_base_backup.read_text()) if _base_backup.is_file() else {}
-    print(f"{'metric':<14} {'base':>10} {'trained':>10} {'delta':>10}")
-    for _label, _key in (("samples", "samples"), ("CER", "cer"), ("WER", "wer"),
-                         ("digit CER", "digit_cer"), ("digit exact", "digit_exact"),
-                         ("empty preds", "empty_predictions")):
-        _show(_label, _base.get(_key, "-"), _trained.get(_key, "-"))
-    print("field recall (base -> trained):")
-    for _field in ("registration_number", "letter_number", "date", "national_id", "amount"):
-        _recall_base = (_base.get("field_audit", {}) or {}).get("fields", {}).get(_field, {}).get("recall")
-        _recall_trained = (_trained.get("field_audit", {}) or {}).get("fields", {}).get(_field, {}).get("recall")
-        _base_text = f"{_recall_base:.4f}" if isinstance(_recall_base, float) else "-"
-        _trained_text = f"{_recall_trained:.4f}" if isinstance(_recall_trained, float) else "-"
-        print(f"  {_field:<20} {_base_text} -> {_trained_text}")
-
-    print("== compare (base vs adapter, test) ==")
-    if sh("bash", "scripts/train_molab.sh", "compare", "--split", "test", cwd=REPO_DIR, env=_report_env, check=False).returncode:
-        print("compare failed - eval numbers above still stand")
-        return
-    _data = json.loads((run_dir / "compare_test.json").read_text())
-    print(f"{'dataset':<16} {'n':>4} {'base CER':>9} {'adapter CER':>11} {'delta':>9}")
-    _better = _worse = 0
-    for _row in _data.get("comparison", []):
-        _name = _row.get("dataset", "?")
-        _samples = _row.get("samples", {}) or {}
-        _n = _samples.get("adapter", _samples.get("base", "?"))
-        _before, _after = _row.get("base"), _row.get("adapter")
-        if not _before or not _after:
-            print(f"{_name:<16} {str(_n):>4} only one side scored")
-            continue
-        _delta = _after.get("cer", 0) - _before.get("cer", 0)
-        _better += _delta < 0
-        _worse += _delta > 0
-        print(f"{_name:<16} {_n!s:>4} {_before.get('cer', 0):>9.4f} {_after.get('cer', 0):>11.4f} {_delta:>+9.4f}")
-    print(f"verdict: adapter better on {_better} of {_better + _worse} datasets")
+    else:
+        _report()
     return
 
 
