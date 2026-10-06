@@ -20,7 +20,9 @@ from fa_ocr_lora.training.metrics import (
     DIGITS,
     MetricAccumulator,
     character_error_rate,
+    digit_runs,
     digits_only,
+    fold_persian,
     normalize_text,
     word_error_rate,
 )
@@ -161,3 +163,113 @@ def test_metrics_serialise_to_json_safe_values():
     # lists or the whole eval report fails to write at the very end of a run.
     assert isinstance(payload["confusions"], list)
     assert all(isinstance(pair, list) for pair, _ in payload["confusions"])
+
+
+def test_fold_unifies_variants_that_render_identically():
+    """ي/ی, ك/ک and the tatweel are the same glyph on the page.
+
+    A model looking at the image has no evidence to choose between the
+    codepoints, so the folded rate must not charge it for the corpus's choice.
+    """
+    assert fold_persian("بايد") == "باید"
+    assert fold_persian("كتاب") == "کتاب"
+    assert fold_persian("کـــتاب") == "کتاب"  # tatweel is a typographic stretch
+    assert fold_persian("مى‌رود") == "می رود"  # alef maksura + ZWNJ
+
+
+def test_fold_keeps_errors_that_are_visible_on_the_page():
+    """Digits, hamza carriers and punctuation are real differences.
+
+    Folding any of these would hide an error the adapter is meant to remove,
+    which is the trap the strict rate exists to avoid.
+    """
+    assert fold_persian("۵") != fold_persian("5")  # numeral system is a target
+    assert fold_persian("٥") != fold_persian("۵")  # Arabic-Indic vs Persian
+    assert fold_persian("أ") != fold_persian("ا")  # the hamza is drawn
+    assert fold_persian("؛") != fold_persian(":")  # distinct marks
+
+
+def test_strict_and_folded_rates_decompose_the_same_record():
+    """A record whose only faults are conventions: strict counts, folded does not.
+
+    Three substitutions - ZWNJ for a space, ي for ی, ك for ک - over a 19
+    character reference. The strict rate must see all three; the folded rate
+    must see none, making the convention share exactly 1.0.
+    """
+    accumulator = MetricAccumulator()
+    accumulator.update("می‌رود بايد كار ۱۲۳", "می رود باید کار ۱۲۳")
+    result = accumulator.result()
+    assert result.cer == 3 / 19
+    assert result.cer_normalized == 0.0
+    assert result.convention_share == 1.0
+
+
+def test_convention_share_is_zero_when_the_error_is_real_misreading():
+    accumulator = MetricAccumulator()
+    accumulator.update("۱۲۳", "۱۲۴")  # a digit misread survives folding
+    result = accumulator.result()
+    assert result.cer == result.cer_normalized == 1 / 3
+    assert result.convention_share == 0.0
+
+
+def test_digit_runs_split_on_every_non_digit():
+    assert digit_runs("شماره ۱۲۳ تاریخ ۱۴۰۴/۰۹/۲۷") == ["۱۲۳", "۱۴۰۴", "۰۹", "۲۷"]
+    assert digit_runs("بدون عدد") == []
+    assert digit_runs("۷") == ["۷"]
+
+
+def test_digit_cer_above_one_is_explained_by_the_character_counts():
+    """A hallucinating model drives digit CER over 100%, and must say so.
+
+    The reference holds four digits and the prediction twelve, so eight
+    insertions over a denominator of four is 2.0 - arithmetically right but
+    unreadable alone. The char counts are what make it interpretable, and the
+    run accuracy stays bounded and reports that the real number was read.
+    """
+    accumulator = MetricAccumulator()
+    accumulator.update("شماره ۱۲۳۴", "شماره ۱۲۳۴ ۵۶۷۸ ۹۰۱۲")
+    result = accumulator.result()
+    assert result.digit_cer == 2.0
+    assert result.digit_ref_chars == 4
+    assert result.digit_hyp_chars == 12
+    assert result.digit_run_accuracy == 1.0
+
+
+def test_digit_runs_align_rather_than_zip():
+    """Dropping the first number must cost one run, not all of them.
+
+    Comparing position-by-position would mark every surviving number wrong
+    because each shifted one slot left, which is how a mostly-correct page
+    scores zero.
+    """
+    accumulator = MetricAccumulator()
+    accumulator.update("۱ و ۲ و ۳", "۲ و ۳")
+    result = accumulator.result()
+    assert result.digit_runs == 3
+    assert result.digit_runs_matched == 2
+
+
+def test_run_accuracy_is_zero_without_a_division_error_on_a_digitless_split():
+    accumulator = MetricAccumulator()
+    accumulator.update("بدون عدد", "بدون عدد")
+    result = accumulator.result()
+    assert result.digit_runs == 0
+    assert result.digit_run_accuracy == 0.0
+
+
+def test_new_fields_reach_the_json_payload():
+    """The notebook reads these keys out of compare_<split>.json."""
+    accumulator = MetricAccumulator()
+    accumulator.update("بايد ۱۲۳", "باید ۱۲۴")
+    payload = accumulator.result().to_dict()
+    assert set(payload) >= {
+        "cer_normalized",
+        "wer_normalized",
+        "convention_share",
+        "digit_runs",
+        "digit_run_accuracy",
+        "digit_ref_chars",
+        "digit_hyp_chars",
+    }
+    assert all(isinstance(value, (int, float)) for value in payload.values()
+               if not isinstance(value, list))

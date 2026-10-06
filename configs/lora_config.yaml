@@ -34,6 +34,11 @@ model:
   # all re-verified against it. Moving to main means moving to transformers 5.x,
   # which is a separate, deliberate migration.
   revision: 2b77538ef936
+  # The original release, not 1.6. Its auto_map publishes only an
+  # AutoModelForCausalLM entry and needs the repository's own modeling file,
+  # so this profile states both halves of that choice rather than inheriting
+  # the 1.6-native defaults. Loading it as image_text_to_text is rejected.
+  auto_class: causal_lm
   trust_remote_code: true
   # sdpa needs no extra wheel and is the fastest attention available here;
   # flash-attention-2 has no prebuilt wheel for this torch/CUDA pair.

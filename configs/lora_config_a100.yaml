@@ -33,6 +33,11 @@ model:
   # exists only in transformers 5.x. Unpin this only as part of a deliberate
   # transformers 5 migration, and on both configs at once.
   revision: 2b77538ef936
+  # The original release, not 1.6. Its auto_map publishes only an
+  # AutoModelForCausalLM entry and needs the repository's own modeling file,
+  # so this profile states both halves of that choice rather than inheriting
+  # the 1.6-native defaults. Loading it as image_text_to_text is rejected.
+  auto_class: causal_lm
   trust_remote_code: true
   # sdpa is kept as the default because it needs no extra wheel. On an A100
   # flash-attention-2 does have prebuilt wheels and is the one substitution here

@@ -21,9 +21,22 @@ other as readily as it confuses ۵ with ۶. Digit-only CER isolates that.
 the diagnostic that tells you what to fix; a CER of 8% does not, but "۴ read as
 ۳ in 210 of 300 samples" does.
 
-Normalisation is deliberately minimal - Unicode NFC and whitespace collapse, and
-nothing else. Folding Arabic ي to Persian ی or ك to ک would hide exactly the
-errors this adapter is meant to remove.
+*Two CERs, not one.* The headline ``cer``/``wer`` normalise as little as
+possible - Unicode NFC and whitespace collapse, nothing else - because folding
+Arabic ي to Persian ی would hide an error class this adapter is meant to remove.
+But a strict rate alone turned out to be unreadable: on the first 1.6 baseline,
+207 of the top 20 confusions were ي/ی, ك/ک and ZWNJ-versus-space, so a CER of
+0.4179 was mostly reporting which Unicode convention the corpus was typed in
+rather than whether the model could read the page.
+
+So :func:`fold_persian` defines the orthographic equivalences a *renderer* cannot
+distinguish - the glyphs are identical on the page, and no amount of looking at
+the image tells the model which codepoint the typist used - and ``cer_normalized``
+/ ``wer_normalized`` report the rate with those folded away. Read together they
+decompose the error: ``cer`` is what the adapter must fix, ``cer_normalized`` is
+what the model genuinely misread, and the gap between them is convention. Digit
+systems are deliberately *not* folded - ۵ against 5 is a real error here, and
+§"Digit accuracy" above exists precisely to count it.
 
 Two different alignments are used on purpose. Error *counts* come from
 :mod:`rapidfuzz`, which computes a true minimal edit distance; the *confusion
@@ -48,10 +61,13 @@ from rapidfuzz.distance import Levenshtein
 
 __all__ = [
     "DIGITS",
+    "PERSIAN_FOLD",
     "EvalMetrics",
     "MetricAccumulator",
     "character_error_rate",
+    "digit_runs",
     "digits_only",
+    "fold_persian",
     "normalize_text",
     "word_error_rate",
 ]
@@ -61,6 +77,44 @@ __all__ = [
 DIGITS: Final[str] = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩0123456789"
 
 _DIGIT_SET: Final[frozenset[str]] = frozenset(DIGITS)
+
+#: Orthographic equivalences that are invisible in a rendered page, mapped to the
+#: Persian-convention codepoint. Every entry here is a pair of codepoints whose
+#: glyphs are identical in print, so a model looking at the image has no evidence
+#: to choose between them and a strict CER is scoring the typist, not the OCR.
+#:
+#: What is deliberately absent matters as much as what is present:
+#:
+#: * **Digits** (۵ / ٥ / 5) render differently and are a stated target - see the
+#:   module docstring - so they are never folded.
+#: * **Hamza carriers** (أ / ا, ئ / ی) are visibly different marks; dropping the
+#:   hamza is a real misread.
+#: * **Punctuation** (؛ / :، ، / .) is visibly different too. The 1.6 baseline's
+#:   ``'؛' -> ':'`` is a genuine error and stays counted.
+PERSIAN_FOLD: Final[dict[str, str]] = {
+    "\u064a": "\u06cc",  # ARABIC YEH -> FARSI YEH
+    "\u0649": "\u06cc",  # ARABIC ALEF MAKSURA -> FARSI YEH
+    "\u06d2": "\u06cc",  # ARABIC YEH BARREE -> FARSI YEH
+    "\u0643": "\u06a9",  # ARABIC KAF -> ARABIC KEHEH
+    "\u06aa": "\u06a9",  # ARABIC SWASH KAF -> ARABIC KEHEH
+    "\u0647\u200d": "\u0647",  # HEH + ZWJ, a rendering-only ligature form
+    "\u200c": " ",  # ZERO WIDTH NON-JOINER: a space the renderer does not draw
+    "\u200b": " ",  # ZERO WIDTH SPACE
+    "\u200d": "",  # ZERO WIDTH JOINER
+    "\ufeff": "",  # BYTE ORDER MARK, when a corpus file leaks one into the text
+    "\u0640": "",  # ARABIC TATWEEL: pure typographic stretch, carries no content
+}
+
+#: Built once; ``str.translate`` wants ordinals, and the multi-character key in
+#: :data:`PERSIAN_FOLD` cannot go through a translation table at all.
+_FOLD_TABLE: Final[dict[int, str]] = {
+    ord(source): target
+    for source, target in PERSIAN_FOLD.items()
+    if len(source) == 1
+}
+_FOLD_SEQUENCES: Final[tuple[tuple[str, str], ...]] = tuple(
+    (source, target) for source, target in PERSIAN_FOLD.items() if len(source) > 1
+)
 
 
 def normalize_text(text: str) -> str:
@@ -81,6 +135,30 @@ def normalize_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFC", text).split())
 
 
+def fold_persian(text: str) -> str:
+    """Collapse orthographic variants that render identically.
+
+    Applies :data:`PERSIAN_FOLD`, then re-collapses whitespace, because folding a
+    zero-width non-joiner to a space can produce a double space where the
+    reference had one. The result is only ever compared against another folded
+    string, so the mapping needs to be consistent rather than canonical.
+
+    This is what separates ``cer`` from ``cer_normalized``: the strict rate is
+    computed on the unfolded text and counts a ي typed where the corpus uses ی,
+    the normalised rate is computed on the output of this function and does not.
+
+    Args:
+        text: Text already through :func:`normalize_text`.
+
+    Returns:
+        The text with Persian/Arabic orthographic variants unified.
+    """
+    folded = text.translate(_FOLD_TABLE)
+    for source, target in _FOLD_SEQUENCES:
+        folded = folded.replace(source, target)
+    return " ".join(folded.split())
+
+
 def digits_only(text: str) -> str:
     """Extract the digit characters of a string, in order.
 
@@ -91,6 +169,39 @@ def digits_only(text: str) -> str:
         The digits, concatenated, preserving numeral system and order.
     """
     return "".join(character for character in text if character in _DIGIT_SET)
+
+
+def digit_runs(text: str) -> list[str]:
+    """Split out the maximal runs of digits, in order.
+
+    The companion to :func:`digits_only`, and the reason both exist: concatenating
+    every digit on a page into one string makes ``digit_cer`` unbounded, because
+    the rate divides by the *reference* length and a model that hallucinates
+    numbers can emit three times as many digits as the page holds. The 1.6
+    baseline's ``digit CER 1.9678`` is that, not a 197% character error rate.
+
+    Runs keep the structure the concatenation throws away: a page has twelve
+    numbers on it, and the useful question - the one CLAUDE.md §5.2 asks about
+    the شماره ثبت - is how many of those twelve came back exactly right.
+
+    Args:
+        text: Any string.
+
+    Returns:
+        Each maximal run of digit characters, in reading order.
+    """
+    runs: list[str] = []
+    current: list[str] = []
+    for character in text:
+        if character in _DIGIT_SET:
+            current.append(character)
+            continue
+        if current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return runs
 
 
 def _edit_distance(reference: list[str], hypothesis: list[str]) -> int:
@@ -173,15 +284,45 @@ def _confusions(reference: str, hypothesis: str) -> Counter[tuple[str, str]]:
     return counts
 
 
+def _aligned_matches(reference: list[str], hypothesis: list[str]) -> int:
+    """Count reference entries the hypothesis reproduces exactly, in order.
+
+    Used for numeric runs. The alignment matters: a page whose first number the
+    model missed still read the other eleven, and zipping the two lists
+    position-by-position would score all twelve wrong. ``SequenceMatcher``'s
+    matching blocks give the in-order common subsequence instead, so a dropped or
+    an inserted number costs exactly itself.
+
+    Non-minimality is harmless here for the same reason it is in
+    :func:`_confusions`: only ``equal`` spans are counted, so an imperfect
+    alignment can undercount a match but can never invent one.
+
+    Args:
+        reference: Ground-truth entries.
+        hypothesis: Predicted entries.
+
+    Returns:
+        How many reference entries are matched, at most ``len(reference)``.
+    """
+    if not reference or not hypothesis:
+        return 0
+    matcher = SequenceMatcher(a=reference, b=hypothesis, autojunk=False)
+    return sum(block.size for block in matcher.get_matching_blocks())
+
+
 @dataclass(frozen=True, slots=True)
 class EvalMetrics:
     """Scored results over one evaluation pass.
 
     Attributes:
         samples: Records scored.
-        cer: Character error rate over all text.
-        wer: Word error rate over all text.
-        digit_cer: Character error rate over digits alone.
+        cer: Character error rate over all text, strictly normalised.
+        wer: Word error rate over all text, strictly normalised.
+        digit_cer: Character error rate over the page's digits concatenated.
+            May exceed 1.0 - the denominator is the reference's digit count, so
+            a model that emits more digits than the page holds scores above
+            100%. ``digit_ref_chars`` and ``digit_hyp_chars`` say whether that
+            is what happened.
         digit_exact: Fraction of records whose digit sequence is exactly right,
             counted only over records whose reference contains a digit.
         digit_samples: Records whose reference contains at least one digit.
@@ -189,6 +330,18 @@ class EvalMetrics:
             separately because they flatter CER when the reference is short and
             would otherwise hide a model that has learned to stay silent.
         confusions: Most frequent ``(expected, predicted)`` character pairs.
+        cer_normalized: Character error rate after :func:`fold_persian`. The gap
+            to ``cer`` is the share of the error that is orthographic convention
+            rather than misreading.
+        wer_normalized: Word error rate after :func:`fold_persian`.
+        digit_runs: Numeric runs across all references - "how many numbers were
+            on these pages".
+        digit_runs_matched: Those runs an aligned hypothesis run reproduced
+            exactly.
+        digit_ref_chars: Digit characters in the references.
+        digit_hyp_chars: Digit characters in the hypotheses. Larger than
+            ``digit_ref_chars`` means the model is inventing numbers, which is
+            what pushes ``digit_cer`` over 1.0.
     """
 
     samples: int
@@ -199,6 +352,31 @@ class EvalMetrics:
     digit_samples: int
     empty_predictions: int
     confusions: tuple[tuple[tuple[str, str], int], ...] = ()
+    cer_normalized: float = 0.0
+    wer_normalized: float = 0.0
+    digit_runs: int = 0
+    digit_runs_matched: int = 0
+    digit_ref_chars: int = 0
+    digit_hyp_chars: int = 0
+
+    @property
+    def digit_run_accuracy(self) -> float:
+        """Fraction of reference numeric runs reproduced exactly.
+
+        Bounded in ``[0, 1]`` by construction, which ``digit_cer`` is not, so
+        this is the digit number to read when the two disagree.
+        """
+        return self.digit_runs_matched / self.digit_runs if self.digit_runs else 0.0
+
+    @property
+    def convention_share(self) -> float:
+        """Share of the strict character error that folding away variants removes.
+
+        ``0.0`` when the two rates agree, approaching ``1.0`` when essentially
+        all of the strict error was ي-versus-ی and friends. Undefined with no
+        error at all, reported as ``0.0``.
+        """
+        return (self.cer - self.cer_normalized) / self.cer if self.cer else 0.0
 
     def to_dict(self) -> dict[str, float | int | list[list[object]]]:
         """Flatten to a JSON-serialisable mapping.
@@ -210,9 +388,17 @@ class EvalMetrics:
             "samples": self.samples,
             "cer": round(self.cer, 5),
             "wer": round(self.wer, 5),
+            "cer_normalized": round(self.cer_normalized, 5),
+            "wer_normalized": round(self.wer_normalized, 5),
+            "convention_share": round(self.convention_share, 5),
             "digit_cer": round(self.digit_cer, 5),
             "digit_exact": round(self.digit_exact, 5),
             "digit_samples": self.digit_samples,
+            "digit_runs": self.digit_runs,
+            "digit_runs_matched": self.digit_runs_matched,
+            "digit_run_accuracy": round(self.digit_run_accuracy, 5),
+            "digit_ref_chars": self.digit_ref_chars,
+            "digit_hyp_chars": self.digit_hyp_chars,
             "empty_predictions": self.empty_predictions,
             "confusions": [[list(pair), count] for pair, count in self.confusions],
         }
@@ -225,11 +411,22 @@ class EvalMetrics:
         """
         lines = [
             f"samples            {self.samples}",
-            f"CER                {self.cer:.4f}",
-            f"WER                {self.wer:.4f}",
+            f"CER                {self.cer:.4f}  (folded {self.cer_normalized:.4f},"
+            f" {self.convention_share:.0%} convention)",
+            f"WER                {self.wer:.4f}  (folded {self.wer_normalized:.4f})",
             f"digit CER          {self.digit_cer:.4f}  ({self.digit_samples} records)",
             f"digit exact match  {self.digit_exact:.4f}",
+            f"digit runs         {self.digit_runs_matched}/{self.digit_runs} exact"
+            f"  ({self.digit_run_accuracy:.4f})",
         ]
+        if self.digit_hyp_chars > self.digit_ref_chars:
+            # The explanation for a digit CER above 1.0, printed only when that
+            # is actually what is happening rather than on every run.
+            lines.append(
+                f"digit chars        {self.digit_ref_chars} expected,"
+                f" {self.digit_hyp_chars} produced"
+                f" ({self.digit_hyp_chars / max(self.digit_ref_chars, 1):.1f}x)"
+            )
         if self.empty_predictions:
             lines.append(f"empty predictions  {self.empty_predictions}")
         if self.confusions:
@@ -239,6 +436,7 @@ class EvalMetrics:
                 for (expected, predicted), count in self.confusions
             )
         return "\n".join(lines)
+
 
 
 @dataclass
@@ -259,10 +457,17 @@ class MetricAccumulator:
     _char_total: int = 0
     _word_errors: int = 0
     _word_total: int = 0
+    _folded_char_errors: int = 0
+    _folded_char_total: int = 0
+    _folded_word_errors: int = 0
+    _folded_word_total: int = 0
     _digit_errors: int = 0
     _digit_total: int = 0
     _digit_samples: int = 0
     _digit_exact: int = 0
+    _digit_runs: int = 0
+    _digit_runs_matched: int = 0
+    _digit_hyp_chars: int = 0
     _empty: int = 0
     _confusions: Counter[tuple[str, str]] = field(default_factory=Counter)
 
@@ -286,13 +491,31 @@ class MetricAccumulator:
         self._word_errors += errors
         self._word_total += total
 
+        # Scored over the same record, not a second pass over the split, so the
+        # strict and folded rates always describe an identical set of samples.
+        folded_ref, folded_hyp = fold_persian(ref), fold_persian(hyp)
+        errors, total = character_error_rate(folded_ref, folded_hyp)
+        self._folded_char_errors += errors
+        self._folded_char_total += total
+        errors, total = word_error_rate(folded_ref, folded_hyp)
+        self._folded_word_errors += errors
+        self._folded_word_total += total
+
         ref_digits, hyp_digits = digits_only(ref), digits_only(hyp)
+        self._digit_hyp_chars += len(hyp_digits)
         if ref_digits:
             self._digit_samples += 1
             self._digit_exact += int(ref_digits == hyp_digits)
             errors, total = character_error_rate(ref_digits, hyp_digits)
             self._digit_errors += errors
             self._digit_total += total
+
+        # Run-level agreement, aligned rather than zipped: a page that drops its
+        # first number must not count every later one as wrong, which is exactly
+        # what comparing position-by-position would do.
+        reference_runs, hypothesis_runs = digit_runs(ref), digit_runs(hyp)
+        self._digit_runs += len(reference_runs)
+        self._digit_runs_matched += _aligned_matches(reference_runs, hypothesis_runs)
 
         self._confusions.update(_confusions(ref, hyp))
 
@@ -308,6 +531,16 @@ class MetricAccumulator:
             samples=self._samples,
             cer=self._char_errors / self._char_total if self._char_total else 0.0,
             wer=self._word_errors / self._word_total if self._word_total else 0.0,
+            cer_normalized=(
+                self._folded_char_errors / self._folded_char_total
+                if self._folded_char_total
+                else 0.0
+            ),
+            wer_normalized=(
+                self._folded_word_errors / self._folded_word_total
+                if self._folded_word_total
+                else 0.0
+            ),
             digit_cer=(
                 self._digit_errors / self._digit_total if self._digit_total else 0.0
             ),
@@ -315,6 +548,11 @@ class MetricAccumulator:
                 self._digit_exact / self._digit_samples if self._digit_samples else 0.0
             ),
             digit_samples=self._digit_samples,
+            digit_runs=self._digit_runs,
+            digit_runs_matched=self._digit_runs_matched,
+            digit_ref_chars=self._digit_total,
+            digit_hyp_chars=self._digit_hyp_chars,
             empty_predictions=self._empty,
             confusions=tuple(self._confusions.most_common(self.confusion_top_k)),
         )
+

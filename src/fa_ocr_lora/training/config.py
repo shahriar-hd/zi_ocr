@@ -322,14 +322,23 @@ class ModelConfig:
     """Which base model to adapt, and in what precision.
 
     Attributes:
-        model_id: HuggingFace repo of the base model.
+        model_id: HuggingFace repo of the base model. Defaults to
+            PaddleOCR-VL-1.6, which is the supported base: it is what the
+            molab profile trains and the only one verified on transformers 5.
         revision: Git revision to pin, so a Hub update cannot silently change
             the weights under a resumed run.
         auto_class: ``AutoModel*`` class that loads the weights; see
-            :data:`AUTO_CLASS_CHOICES`. Must be ``causal_lm`` unless the model is
-            native to transformers, which 1.6 is.
-        trust_remote_code: Required for the original release; its vision tower and
-            decoder are not in ``transformers``.
+            :data:`AUTO_CLASS_CHOICES`. ``image_text_to_text`` by default,
+            because that is how transformers 5 loads 1.6 natively. The older
+            ``causal_lm`` path exists for the original release, whose
+            ``auto_map`` publishes only an ``AutoModelForCausalLM`` entry, and
+            the profiles that still want it now say so explicitly.
+        trust_remote_code: Whether ``from_pretrained`` may execute the Hub
+            repository's own modeling code. ``False`` by default: 1.6 is native
+            to transformers, so reaching for remote code would load something
+            other than what the model card describes. Only the original
+            release needs it, and it is mutually exclusive with
+            ``image_text_to_text`` - see :meth:`parse`.
         attn_implementation: Attention kernel passed to ``from_pretrained``.
         dtype: ``auto`` resolves by compute capability at load time.
         quantization: ``none`` or ``nf4``.
@@ -340,10 +349,10 @@ class ModelConfig:
             no inference caller will ever send.
     """
 
-    model_id: str = "PaddlePaddle/PaddleOCR-VL"
+    model_id: str = "PaddlePaddle/PaddleOCR-VL-1.6"
     revision: str = "main"
-    auto_class: str = "causal_lm"
-    trust_remote_code: bool = True
+    auto_class: str = "image_text_to_text"
+    trust_remote_code: bool = False
     attn_implementation: str = "sdpa"
     dtype: str = "auto"
     quantization: str = "nf4"
@@ -361,7 +370,9 @@ class ModelConfig:
             The validated section.
 
         Raises:
-            ConfigError: On an unknown key or an out-of-range value.
+            ConfigError: On an unknown key, an out-of-range value, or a
+                combination of ``auto_class`` and ``trust_remote_code`` that
+                names two different loading strategies at once.
         """
         context = "model"
         defaults = _defaults(cls)
@@ -369,17 +380,33 @@ class ModelConfig:
         model_id = str(payload.get("model_id", defaults["model_id"])).strip()
         if not model_id:
             raise ConfigError(f"{context}.model_id: must not be empty")
+        auto_class = _as_choice(
+            payload,
+            "auto_class",
+            defaults["auto_class"],
+            context,
+            AUTO_CLASS_CHOICES,
+        )
+        trust_remote_code = _as_bool(
+            payload, "trust_remote_code", defaults["trust_remote_code"], context
+        )
+        # The two fields name one decision between them, and the contradictory
+        # pairing is silent rather than loud: transformers would honour the
+        # remote code and load a class the adapter was never shaped against, so
+        # the weights load, training runs, and the result is quietly wrong.
+        if auto_class == "image_text_to_text" and trust_remote_code:
+            raise ConfigError(
+                f"{context}: auto_class 'image_text_to_text' loads the model "
+                "natively from transformers, so trust_remote_code must be false. "
+                "PaddleOCR-VL-1.6 is native; only the original "
+                "PaddlePaddle/PaddleOCR-VL release needs remote code, and that "
+                "profile must also set auto_class: causal_lm."
+            )
         return cls(
             model_id=model_id,
             revision=str(payload.get("revision", defaults["revision"])).strip() or "main",
-            auto_class=_as_choice(
-                payload,
-                "auto_class",
-                defaults["auto_class"],
-                context,
-                AUTO_CLASS_CHOICES,
-            ),
-            trust_remote_code=_as_bool(payload, "trust_remote_code", True, context),
+            auto_class=auto_class,
+            trust_remote_code=trust_remote_code,
             attn_implementation=str(
                 payload.get("attn_implementation", defaults["attn_implementation"])
             ).strip(),

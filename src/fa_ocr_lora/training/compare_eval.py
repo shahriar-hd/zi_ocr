@@ -332,6 +332,24 @@ def render(
             f" -> adapter CER {adapter_all.digit_cer:.4f}"
             f" exact {adapter_all.digit_exact:.4f}"
         )
+        # Run accuracy is bounded where digit_cer is not, so when the model
+        # invents numbers the two disagree and this is the line to believe.
+        lines.append(
+            f"digit runs  base {base_all.digit_runs_matched}/{base_all.digit_runs}"
+            f" ({base_all.digit_run_accuracy:.4f})"
+            f" -> adapter {adapter_all.digit_runs_matched}/{adapter_all.digit_runs}"
+            f" ({adapter_all.digit_run_accuracy:.4f})"
+        )
+
+    # How much of each variant's error is orthographic convention rather than
+    # misreading. A large base share with a small adapter share is the adapter
+    # having learned the corpus's spelling of ی and ک - real, but not reading.
+    lines.append(
+        f"folded CER  base {base_all.cer_normalized:.4f}"
+        f" ({base_all.convention_share:.0%} of its error was convention)"
+        f" -> adapter {adapter_all.cer_normalized:.4f}"
+        f" ({adapter_all.convention_share:.0%})"
+    )
 
     if not verdict:
         lines.append("verdict     no dataset scored by both variants")
@@ -347,7 +365,23 @@ def render(
         share = delta / base_all.cer if base_all.cer else 0.0
         summary += f"; overall {delta:+.4f} CER ({share:+.0%})"
     lines.append(summary)
+
+    # The distinction that one CER cannot make. An adapter can cut the strict
+    # rate hard by learning to emit ی where the base emitted ي, which is worth
+    # having but is not improved reading; only the folded delta shows the latter.
+    folded_delta = adapter_all.cer_normalized - base_all.cer_normalized
+    if delta < 0 <= folded_delta:
+        lines.append(
+            f"            but folded CER {folded_delta:+.4f}: the gain is"
+            " orthographic convention, not better reading"
+        )
+    elif folded_delta < 0:
+        lines.append(
+            f"            folded CER {folded_delta:+.4f} too, so reading"
+            " genuinely improved"
+        )
     return "\n".join(lines)
+
 
 
 def main(argv: list[str] | None = None) -> int:

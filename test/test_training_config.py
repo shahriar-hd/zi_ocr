@@ -363,17 +363,54 @@ def test_the_a100_profile_actually_removes_the_4gb_concessions():
     assert a100.image.max_pixels >= 1240 * 1754
 
 
-def test_auto_class_defaults_to_the_original_releases_path():
-    """Adding the field must not move a profile that already worked.
+def test_the_default_base_model_is_1_6():
+    """A profile that says nothing gets the supported base, not the retired one.
 
-    The original checkpoint is loaded through its ``auto_map`` entry for
-    ``AutoModelForCausalLM``, which only works with the repository's own remote
-    code, so every profile that does not say otherwise stays on that path.
+    The defaults used to describe the original release, which meant a new config
+    silently inherited ``causal_lm`` plus remote code - a combination only that
+    one checkpoint wants. 1.6 is what is trained and verified on transformers 5,
+    so it is what omission now means.
     """
-    for path in (_A100_CONFIG_PATH, "configs/lora_config.yaml"):
+    config = ModelConfig.parse({})
+    assert config.model_id == "PaddlePaddle/PaddleOCR-VL-1.6"
+    assert config.auto_class == "image_text_to_text"
+    assert config.trust_remote_code is False
+
+
+def test_legacy_profiles_state_the_original_releases_path_explicitly():
+    """The original checkpoint's profiles must not rely on the defaults.
+
+    It is loaded through its ``auto_map`` entry for ``AutoModelForCausalLM``,
+    which only works with the repository's own remote code. Since the defaults
+    now describe 1.6, every profile that still wants that path says so in both
+    fields - and the parser rejects the pairing that names neither cleanly.
+    """
+    for path in (_A100_CONFIG_PATH, _RTX_CONFIG_PATH, "configs/lora_config.yaml"):
         config = load_training_config(path, apply_env=False)
+        assert config.model.model_id == "PaddlePaddle/PaddleOCR-VL"
         assert config.model.auto_class == "causal_lm"
         assert config.model.trust_remote_code is True
+
+
+def test_native_loading_with_remote_code_is_rejected():
+    """The contradictory pair fails at parse time, not silently at load time.
+
+    ``image_text_to_text`` loads the model from transformers; ``trust_remote_code``
+    tells it to execute the Hub repo's modeling file instead. Asking for both
+    gets a class the adapter was never shaped against, and nothing downstream
+    would notice: the weights load, the run trains, the result is wrong.
+    """
+    with pytest.raises(ConfigError, match="trust_remote_code must be false"):
+        ModelConfig.parse(
+            {"auto_class": "image_text_to_text", "trust_remote_code": True}
+        )
+    # The coherent pairings both survive.
+    assert ModelConfig.parse(
+        {"auto_class": "causal_lm", "trust_remote_code": True}
+    ).auto_class == "causal_lm"
+    assert ModelConfig.parse(
+        {"auto_class": "image_text_to_text", "trust_remote_code": False}
+    ).trust_remote_code is False
 
 
 def test_the_1_6_profile_loads_the_native_class():

@@ -47,9 +47,15 @@ def test_the_1_6_profile_loads_as_image_text_to_text():
     assert auto_model_class(config.model) is AutoModelForImageTextToText
 
 
-def test_the_default_is_the_causal_path():
-    """A profile that says nothing keeps loading the way it always has."""
-    assert auto_model_class(ModelConfig.parse({})) is AutoModelForCausalLM
+def test_the_default_is_the_native_path():
+    """Omission means 1.6, which is the base this project actually trains.
+
+    The defaults used to describe the original release, so a config that said
+    nothing got remote code and the causal class. 1.6 is the supported base and
+    loads natively, so that is what omission resolves to now; the profiles that
+    still want the old path state it, and the parser rejects the incoherent mix.
+    """
+    assert auto_model_class(ModelConfig.parse({})) is AutoModelForImageTextToText
 
 
 class _Projections(nn.Module):
