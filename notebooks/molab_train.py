@@ -514,7 +514,17 @@ def _(REPO_DIR, sh, stage_env, token_path):
 @app.cell
 def _(CONFIG, REPO_DIR, os, profile, sh):
     import json
+    import sys as _sys
     import time
+
+    # src/ onto the path before the import, not after. `pip install -e .` ran in
+    # a subprocess, and a PEP 660 editable install is a .pth file that site.py
+    # reads only at interpreter startup - so this already-running kernel never
+    # learned the package exists and the import below raises ModuleNotFoundError.
+    # The stages are unaffected: each is a fresh interpreter and train_molab.sh
+    # exports PYTHONPATH itself.
+    if str(REPO_DIR / "src") not in _sys.path:
+        _sys.path.insert(0, str(REPO_DIR / "src"))
 
     from fa_ocr_lora.utils.process import is_running
 
