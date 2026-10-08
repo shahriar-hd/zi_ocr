@@ -1393,3 +1393,78 @@ because a trashed folder still counts against the account's quota.
 - **The final adapter is mirrored with `publish=False`.** It is the deliverable,
   not a resume point; naming it in `LATEST` would send the next resume at a
   directory with no trainer state.
+
+## Batched evaluation
+
+The full-run test comparison took **≈9.5 hours** for 2 × 5,855 records while
+`nvidia-smi` reported ~3 GB resident and ~2 % utilisation on a 96 GB card. That
+is not a hardware ceiling, it is three things in `eval.score_split`, and the
+replacement in [batch_eval.py](../src/fa_ocr_lora/training/batch_eval.py) answers
+each one.
+
+### Generation was batch 1, and that is the whole gap
+
+Every record went through `generate` on its own (`unsqueeze(0)`). A 1,024-token
+greedy decode is then 1,024 sequential kernel launches, each sized for a single
+row — the card spends its time on launch latency rather than arithmetic, which is
+exactly what 2 % utilisation at 4.9 s/record looks like. Batching does not make
+the kernels faster; it makes each one do 32 rows of work instead of 1.
+
+`eval.batch_size` defaults to **16**, which is deliberately below what 96 GB can
+hold: the memory cost is `batch_size` KV caches of `max_new_tokens`, so the
+product is what binds, and a profile whose `max_new_tokens` is raised must
+re-check the batch rather than inherit it. `--batch-size 1` still routes through
+the original loop, which is how the two can be bisected against each other.
+
+### Left padding is not a preference
+
+Prompts differ in length because the image token count moves with the page, and
+the answer grows to the *right*. Only left padding puts every row's first
+generated token at the same index, which is what makes the single slice
+`generated[:, prompt_width:]` correct for all rows at once. Right padding would
+interleave pad tokens with the answer and there would be no single offset to cut
+at. The attention mask zeroes the pad region; `mm_token_type_ids` pads with 0
+(text), which the model masks before the RoPE pass, so the value cannot matter.
+
+### The CPU was on the critical path
+
+`SampleEncoder.encode` opens the page with Pillow, resizes it, and runs the
+processor, which materialises a float32 patch tensor. All of that happened on the
+main thread *between* `generate` calls, so the GPU idled through it. It now runs
+in a `DataLoader` with `eval.dataloader_workers` worker processes, two batches of
+lookahead each. The GPU waits on a queue instead of on Pillow.
+
+### Length bucketing, and why the predictions file is still in order
+
+Records are sorted longest-first before batching, so a batch pads to its own
+longest row rather than the split's. Longest-first rather than shortest-first for
+the same reason the training sampler does it: the worst batch arrives in the
+first minutes, so an OOM shows up immediately instead of at 03:00. The proxy is
+target length, because the real prompt length is not known until the encoder has
+run and the image budget shrinks as the answer grows — the two move together.
+
+Predictions are collected into a dict keyed by manifest position and written at
+the end, so `eval_predictions.jsonl` is byte-comparable with an unbatched run's
+despite the reordering. Nothing downstream — `compare_eval.read_predictions`
+included — can tell the difference.
+
+### Per-row confidence, or the field audit would have been lost
+
+`ConfidenceRecorder` rejects a batch wider than 1, and correctly so: one `steps`
+list cannot say which row a number came from, and the audit's *weakest-token*
+figure is what tells a reviewer which page to re-check.
+`BatchConfidenceRecorder` keeps one list per row and does its `log_softmax` over
+the whole batch in one pass, which is the operation batching was supposed to
+amortise in the first place.
+
+Rows finish at different steps and `generate` keeps feeding the finished ones, so
+a short row's list has a tail describing tokens that were never in its answer.
+That is left in place rather than trimmed: `span_confidence` is indexed by the
+*trimmed* ids, so the surplus is never reached, and trimming here would need the
+per-row output lengths that only the caller knows.
+
+### What is deliberately unchanged
+
+Same encoder, same template, same greedy decoding, same `num_beams`, same metric
+arithmetic. A batched CER is comparable to a batch-1 CER because only the
+scheduling moved. The one observable difference is throughput.

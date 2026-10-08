@@ -452,6 +452,105 @@ class CheckpointSync:
 
     # ------------------------------------------------------------------ resume
 
+    def fetch_folder(self, name: str, destination: Path) -> Path | None:
+        """Download one named remote folder of this run, whatever it holds.
+
+        :meth:`fetch_resume` exists for the one case the trainer needs - the
+        newest *complete* checkpoint, chosen by the ``LATEST`` marker. This is
+        the general case, and the reason it is separate: an evaluation session
+        wants ``adapter_only``, which no marker names and which is not a
+        checkpoint, so none of the step-number logic applies to it.
+
+        Blocks, like :meth:`fetch_resume`, because the caller cannot load an
+        adapter that is not on disk yet.
+
+        Args:
+            name: Remote folder name under this run's folder.
+            destination: Local directory to write the files into, created if
+                absent. The folder's contents land directly in it, not in a
+                ``name`` subdirectory, so the caller decides the local layout.
+
+        Returns:
+            ``destination`` when at least one file landed or was already
+            current, or ``None`` when Drive has no such folder for this run.
+        """
+        folder_id = self.client.find_folder(name, self._run_folder_id or "")
+        if folder_id is None:
+            LOGGER.info("drive sync: no remote %s for %s", name, self.run_name)
+            return None
+        contents = self.client.list_folder(folder_id)
+        if not contents:
+            LOGGER.warning("drive sync: remote %s is empty", name)
+            return None
+        destination.mkdir(parents=True, exist_ok=True)
+        downloaded = reused = 0
+        for filename, (file_id, size) in sorted(contents.items()):
+            local = destination / filename
+            # Same size-match staleness test the upload side uses, so an
+            # interrupted fetch only re-pulls what is actually missing.
+            if local.exists() and local.stat().st_size == size:
+                reused += 1
+                continue
+            self.client.download(file_id, local)
+            downloaded += 1
+        LOGGER.info(
+            "drive sync: fetched %s (%d downloaded, %d already local)",
+            name,
+            downloaded,
+            reused,
+        )
+        return destination
+
+    def push_directory(self, source: Path, *, remote_name: str | None = None) -> int:
+        """Upload a directory tree into this run's remote folder, blocking.
+
+        For artefacts that are produced *after* training and are small enough
+        that a background thread would be more machinery than it saves - the
+        evaluation report bundle being the case this was written for. The
+        checkpoint path deliberately does not reuse it: a checkpoint is staged
+        by hard-link and uploaded off the training thread so the GPU never waits
+        on the network, and neither property matters once the GPU is idle.
+
+        Nested directories are mirrored, so a bundle with a ``charts/``
+        subdirectory arrives with that subdirectory.
+
+        Args:
+            source: Local directory to upload. Its *contents* go up.
+            remote_name: Remote folder name under the run folder; defaults to
+                ``source.name``.
+
+        Returns:
+            How many files were uploaded.
+
+        Raises:
+            FileNotFoundError: If ``source`` is not a directory. An upload that
+                silently did nothing is the failure this prevents.
+        """
+        if not source.is_dir():
+            raise FileNotFoundError(f"{source} is not a directory")
+        root = remote_name or source.name
+        uploaded = 0
+        for directory, _subdirs, filenames in os.walk(source):
+            local_dir = Path(directory)
+            relative = local_dir.relative_to(source)
+            remote_path = (
+                root if relative == Path(".") else f"{root}/{relative.as_posix()}"
+            )
+            folder_id = self.client.ensure_folder(remote_path, self._run_folder_id or "")
+            existing = self.client.list_folder(folder_id)
+            todo: list[tuple[Path, str | None]] = []
+            for filename in sorted(filenames):
+                path = local_dir / filename
+                current = existing.get(filename)
+                if current is not None and current[1] == path.stat().st_size:
+                    continue
+                todo.append((path, current[0] if current else None))
+            if todo:
+                uploaded += self._upload_many(todo, folder_id)
+        self.stats.files_uploaded += uploaded
+        LOGGER.info("drive sync: pushed %s (%d file(s))", root, uploaded)
+        return uploaded
+
     def fetch_resume(self, destination_root: Path) -> Path | None:
         """Download the newest complete remote checkpoint, if there is one.
 

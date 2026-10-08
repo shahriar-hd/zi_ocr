@@ -18,6 +18,7 @@
 #   train      the run itself (nohup'd, resumable, mirrored to Drive)
 #   eval       trained CER/WER + sensitive-field audit
 #   compare    base vs adapter on one split, broken down per dataset
+#   report     render a finished comparison as CSV/Markdown/charts (no model)
 #   status     pid, last lines of the console, GPU, free disk
 #   stop       kill the run - checkpoints already in Drive stay valid
 #   all        check -> manifest -> smoke -> probe -> train
@@ -25,6 +26,8 @@
 # Extra arguments are forwarded to the stage's CLI:
 #   PROBE_STEPS=50 scripts/train_molab.sh probe
 #   scripts/train_molab.sh train --epochs 2
+#   scripts/train_molab.sh compare --split test --batch-size 32
+#   scripts/train_molab.sh report  --split test
 #
 # Environment:
 #   CONFIG      training YAML   (default: configs/lora_config_rtx6000pro_16.yaml)
@@ -285,6 +288,13 @@ stage_baseline() {
   $PY -m fa_ocr_lora.training.eval --config "$CONFIG" --no-adapter --max-samples 100 "$@"
 }
 
+stage_report() {
+  banner "report bundle (CSV + Markdown + charts)"
+  # Loads no model: it reads the comparison the previous stage wrote. Safe to
+  # re-run, and cheap enough to re-run after editing a label.
+  $PY -m fa_ocr_lora.training.eval_report --config "$CONFIG" "$@"
+}
+
 stage_train() {
   banner "train"
   local log_dir
@@ -415,6 +425,7 @@ case "${1:-}" in
   train)    shift; stage_train "$@" ;;
   eval)     shift; stage_eval "$@" ;;
   compare)  shift; stage_compare "$@" ;;
+  report)   shift; stage_report "$@" ;;
   status)   shift; stage_status "$@" ;;
   stop)     shift; stage_stop "$@" ;;
   all)

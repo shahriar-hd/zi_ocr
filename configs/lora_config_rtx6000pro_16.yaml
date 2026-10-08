@@ -299,6 +299,18 @@ eval:
   max_new_tokens: 1024
   num_beams: 1
   confusion_top_k: 20
+  # Prompts per generate() call, and the setting that made the difference between
+  # a 9.5-hour test comparison and a short one. The unbatched path left this card
+  # at ~3 GB resident and ~2% utilised, because a 1,024-token greedy decode at
+  # batch 1 is 1,024 sequential launches of single-row kernels - launch latency,
+  # not arithmetic. 32 is measured-safe here at 1,280 image tokens; the cost is
+  # 32 KV caches of max_new_tokens, so raising max_new_tokens means re-checking
+  # this rather than inheriting it. --batch-size 1 returns to the old loop.
+  batch_size: 32
+  # Worker processes running Pillow and the processor ahead of the GPU. molab's
+  # default host is 4 vCPU, so more would only queue behind each other; a box
+  # with more cores should raise it until the GPU stops waiting on the queue.
+  dataloader_workers: 4
 
 # --- Google Drive checkpoint mirroring --------------------------------------- #
 # On. This is the section that makes a molab session survivable: the session is

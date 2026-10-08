@@ -280,6 +280,17 @@ eval:
   # Records scored by eval.py. null means the whole validation split.
   max_samples: 300
   max_new_tokens: 1024
+  # Batch 1, overriding the shared default of 16, and for the same reason
+  # per_device_batch_size is 1: this card has ~2 GB of spendable VRAM and a
+  # batched greedy decode holds one KV cache of max_new_tokens PER ROW. Two rows
+  # would not fit, so there is nothing to amortise here and the unbatched loop in
+  # eval.py is what runs. The datacentre profiles raise it - see
+  # configs/lora_config_rtx6000pro_16.yaml, where it is the difference between a
+  # 9.5-hour test comparison and a short one.
+  batch_size: 1
+  # Moot at batch_size 1 (the unbatched loop encodes inline), but stated so that
+  # raising the batch on a freed-up card does not also need this line found.
+  dataloader_workers: 2
   # Greedy: an OCR target has one correct answer, and sampling would make the
   # CER depend on the seed. It is also the only setting under which per-field
   # confidence can be recorded, since only there is the emitted token the argmax

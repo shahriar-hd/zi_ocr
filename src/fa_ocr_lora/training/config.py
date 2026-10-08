@@ -1284,6 +1284,18 @@ class EvalConfig:
             is reported as uncertain.
         max_findings: Individual faults retained in the audit report. Those beyond
             it are counted, never silently dropped.
+        batch_size: Prompts per ``generate`` call. ``1`` is the original
+            one-record-at-a-time path; anything above it left-pads the prompts and
+            decodes them together, which is what turns a 2% utilised 96 GB card
+            into a busy one. A measured test pass went from 4.9 s/record at 1 to
+            well under a second at 16-32. Raise it until VRAM or the input
+            pipeline binds; the cost is bounded by ``batch_size`` KV caches of
+            ``max_new_tokens``, so it scales with that product rather than with
+            the split size.
+        dataloader_workers: Worker processes encoding prompts ahead of the GPU.
+            Distinct from ``runtime.dataloader_workers``, which sizes the training
+            loader: evaluation runs alone, so it can have the whole host. ``0``
+            encodes inline, which is the right setting only for a debugger.
     """
 
     max_samples: int | None = 300
@@ -1294,6 +1306,8 @@ class EvalConfig:
     field_config_path: str | None = None
     confidence_floor: float = 0.5
     max_findings: int = 200
+    batch_size: int = 16
+    dataloader_workers: int = 4
 
     @classmethod
     def parse(cls, payload: Mapping[str, Any]) -> EvalConfig:
@@ -1369,6 +1383,22 @@ class EvalConfig:
                 context,
                 minimum=0,
                 maximum=100_000,
+            ),
+            batch_size=_as_int(
+                payload,
+                "batch_size",
+                defaults["batch_size"],
+                context,
+                minimum=1,
+                maximum=512,
+            ),
+            dataloader_workers=_as_int(
+                payload,
+                "dataloader_workers",
+                defaults["dataloader_workers"],
+                context,
+                minimum=0,
+                maximum=64,
             ),
         )
 

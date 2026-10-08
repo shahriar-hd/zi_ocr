@@ -39,7 +39,7 @@ from ..config.base import ConfigError
 from ..dataset.common.io_utils import resolve_repo_path, write_json
 from . import vram
 from .config import TrainingConfig, load_training_config
-from .eval import EvalOutcome, score_split
+from .eval import EvalOutcome, run_score_split
 from .metrics import EvalMetrics, MetricAccumulator
 from .modeling import load_eval_model
 from .sources import LETTER_CROP, LETTER_PAGE, PIXEL_PAGE
@@ -110,6 +110,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Report JSON destination; defaults to <output_dir>/compare_<split>.json.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Prompts per generate() call, applied to both variants; overrides "
+            "eval.batch_size. 1 scores one record at a time."
+        ),
+    )
+    parser.add_argument(
+        "--eval-workers",
+        type=int,
+        default=None,
+        help=(
+            "Worker processes encoding prompts ahead of the GPU; overrides "
+            "eval.dataloader_workers."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -255,7 +273,7 @@ def score_variant(
     loaded = load_eval_model(config, adapter_dir=adapter_dir)
     try:
         LOGGER.info("%s", loaded.describe())
-        return score_split(
+        return run_score_split(
             config,
             loaded,
             split=split,
@@ -404,6 +422,24 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, FileNotFoundError) as exc:
         LOGGER.error("configuration error: %s", exc)
         return 1
+    overrides: dict[str, object] = {}
+    if args.batch_size is not None:
+        overrides["batch_size"] = args.batch_size
+    if args.eval_workers is not None:
+        overrides["dataloader_workers"] = args.eval_workers
+    if overrides:
+        # Round-tripped through the loader rather than mutated in place, so a bad
+        # flag is rejected by the same validation the YAML goes through - and both
+        # variants are scored under one identical config, which is the whole
+        # premise of the comparison.
+        payload = config.to_dict()
+        payload.pop("source_path", None)
+        payload["eval"].update(overrides)
+        try:
+            config = TrainingConfig.from_dict(payload, source_path=config.source_path)
+        except ConfigError as exc:
+            LOGGER.error("invalid override: %s", exc)
+            return 1
 
     if not config.paths.manifest_path.is_file():
         LOGGER.error("no manifest at %s", config.paths.manifest_path)

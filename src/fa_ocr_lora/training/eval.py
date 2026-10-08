@@ -10,11 +10,15 @@ same prompt. A trained CER means nothing on its own; it means something against
 that number. The pair is what tells you whether 5 hours of training bought
 anything.
 
-**Score records, not batches.** Generation is one record at a time. Batched greedy
-decode would need left padding and a per-row length bookkeeping that is easy to get
-subtly wrong, and the 4 GB budget cannot hold several 1,024-token KV caches anyway.
-At roughly 3-10 s per page this makes a 300-record pass a coffee break, which is why
-``eval.max_samples`` defaults well below the full split.
+**Records are scored in batches.** :func:`score_split` keeps the one-record-at-a-time
+loop, because it is the simplest thing that can be checked by eye and the 4 GB
+development card cannot hold several 1,024-token KV caches. It is no longer the
+default: ``eval.batch_size`` above 1 routes :func:`main` through
+:func:`fa_ocr_lora.training.batch_eval.score_split_batched`, which left-pads the
+prompts and decodes them together. On a 96 GB card that is the difference between
+4.9 s per record and a fraction of a second, and the arithmetic is identical -
+only the scheduling changed. ``--batch-size 1`` returns to this module's loop,
+which is how a disagreement between the two gets bisected.
 
 Examples:
     Baseline, before training::
@@ -25,11 +29,11 @@ Examples:
 
         python -m fa_ocr_lora.training.eval
 
-    Score a specific checkpoint on the held-out test split::
+    Score a specific checkpoint on the held-out test split, 32 rows at a time::
 
         python -m fa_ocr_lora.training.eval \\
             --adapter-dir data/training/local_run/checkpoints/checkpoint-800 \\
-            --split test
+            --split test --batch-size 32
 """
 
 from __future__ import annotations
@@ -62,7 +66,7 @@ from .manifest import load_manifest, parse_crop_box
 from .metrics import EvalMetrics, MetricAccumulator
 from .modeling import EvalModel, load_eval_model
 
-__all__ = ["EvalOutcome", "main", "parse_args", "score_split"]
+__all__ = ["EvalOutcome", "main", "parse_args", "run_score_split", "score_split"]
 
 LOGGER = logging.getLogger("fa_ocr_lora.eval")
 
@@ -134,6 +138,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Records to score; overrides eval.max_samples. 0 means all of them.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Prompts per generate() call; overrides eval.batch_size. 1 uses the "
+            "unbatched loop in this module."
+        ),
+    )
+    parser.add_argument(
+        "--eval-workers",
+        type=int,
+        default=None,
+        help=(
+            "Worker processes encoding prompts ahead of the GPU; overrides "
+            "eval.dataloader_workers. Ignored when --batch-size is 1."
+        ),
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -388,6 +410,58 @@ def score_split(
     )
 
 
+def run_score_split(
+    config: TrainingConfig,
+    loaded: EvalModel,
+    *,
+    split: str = "validation",
+    max_samples: int | None = None,
+    predictions_path: Path | None = None,
+    verbose: bool = False,
+) -> EvalOutcome:
+    """Score a split, batching when ``eval.batch_size`` allows it.
+
+    The single entry point every caller should use - :mod:`.eval`,
+    :mod:`.compare_eval` and the notebooks all go through here, so the batched
+    and unbatched paths can never diverge in which one a given config selects.
+
+    Imported lazily because :mod:`.batch_eval` pulls in ``torch.utils.data``,
+    which a caller that only wants :class:`EvalOutcome` has no reason to pay for.
+
+    Args:
+        config: Loaded training configuration.
+        loaded: Model and processor from
+            :func:`~fa_ocr_lora.training.modeling.load_eval_model`.
+        split: Manifest split to score.
+        max_samples: Records to score; ``None`` uses ``eval.max_samples``.
+        predictions_path: Where to write per-record predictions, or ``None``.
+        verbose: Log every prediction as it is produced.
+
+    Returns:
+        The metrics and, unless ``eval.field_audit`` is off, the field audit.
+    """
+    if config.eval.batch_size <= 1:
+        LOGGER.info("unbatched scoring: eval.batch_size is 1")
+        return score_split(
+            config,
+            loaded,
+            split=split,
+            max_samples=max_samples,
+            predictions_path=predictions_path,
+            verbose=verbose,
+        )
+    from .batch_eval import score_split_batched
+
+    return score_split_batched(
+        config,
+        loaded,
+        split=split,
+        max_samples=max_samples,
+        predictions_path=predictions_path,
+        verbose=verbose,
+    )
+
+
 def _resolve_adapter(config: TrainingConfig, args: argparse.Namespace) -> Path | None:
     """Decide which adapter, if any, to score.
 
@@ -428,6 +502,10 @@ def main(argv: list[str] | None = None) -> int:
     overrides: dict[str, object] = {}
     if args.max_new_tokens is not None:
         overrides["max_new_tokens"] = args.max_new_tokens
+    if args.batch_size is not None:
+        overrides["batch_size"] = args.batch_size
+    if args.eval_workers is not None:
+        overrides["dataloader_workers"] = args.eval_workers
     if args.no_field_audit:
         overrides["field_audit"] = False
     if args.field_config is not None:
@@ -471,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        outcome = score_split(
+        outcome = run_score_split(
             config,
             loaded,
             split=args.split,
@@ -482,8 +560,10 @@ def main(argv: list[str] | None = None) -> int:
     except torch.OutOfMemoryError as exc:
         LOGGER.error("out of memory during generation: %s", exc)
         LOGGER.error(
-            "lower --max-new-tokens (currently %d) or image.max_pixels; a long "
-            "greedy decode holds a KV cache proportional to both",
+            "lower eval.batch_size (currently %d), --max-new-tokens (currently "
+            "%d) or image.max_pixels; a batched greedy decode holds one KV cache "
+            "per row, proportional to both",
+            config.eval.batch_size,
             config.eval.max_new_tokens,
         )
         return 1

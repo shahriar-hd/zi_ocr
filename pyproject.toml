@@ -67,6 +67,12 @@ local-train = [
 # CUDA-specific and a bf16 run needs none of it: `quantization: none` in the YAML
 # skips the import entirely.
 quant = ["bitsandbytes>=0.43"]
+# Charts for the evaluation report bundle (training/eval_report.py). Separate and
+# optional on purpose: the CSVs and the Markdown tables are the artefact and are
+# written with the standard library alone, so a box with no matplotlib still
+# produces a complete report - it just produces it without the PNGs. The import
+# lives inside write_charts() for the same reason.
+report = ["matplotlib>=3.8"]
 # Google Drive access, used by two callers: scripts/upload_to_drive.py (the Colab
 # dataset handoff) and training/checkpoint_sync.py (mirroring checkpoints off a
 # rented GPU whose disk dies with the instance). Not optional for an A100 run -
@@ -103,6 +109,10 @@ fa-ocr-synth = "fa_ocr_lora.dataset.synth.pipeline:main"
 fa-ocr-manifest = "fa_ocr_lora.training.prepare_manifest:main"
 fa-ocr-train = "fa_ocr_lora.training.train_lora:main"
 fa-ocr-eval = "fa_ocr_lora.training.eval:main"
+# Base against adapter over identical records, broken down per dataset.
+fa-ocr-compare = "fa_ocr_lora.training.compare_eval:main"
+# Renders a finished comparison as CSV, Markdown and charts. Loads no model.
+fa-ocr-report = "fa_ocr_lora.training.eval_report:main"
 # Costs a run out before renting the machine to do it. Loads no model.
 fa-ocr-simulate = "fa_ocr_lora.training.simulate:main"
 

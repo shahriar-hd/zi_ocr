@@ -36,7 +36,9 @@ from transformers import LogitsProcessor, LogitsProcessorList
 from .confidence import TokenConfidence
 
 __all__ = [
+    "BatchConfidenceRecorder",
     "ConfidenceRecorder",
+    "batch_recorder_for",
     "processor_list",
     "recorder_for",
 ]
@@ -121,7 +123,115 @@ def recorder_for(num_beams: int, do_sample: bool = False) -> ConfidenceRecorder 
     return ConfidenceRecorder()
 
 
-def processor_list(recorder: ConfidenceRecorder | None) -> LogitsProcessorList | None:
+@dataclass
+class BatchConfidenceRecorder(LogitsProcessor):
+    """Records per-row certainty at every greedy step of a batched decode.
+
+    The batch-size-1 restriction on :class:`ConfidenceRecorder` exists because a
+    single ``steps`` list cannot say which row a number came from. This class
+    keeps one list per row instead, so batched evaluation gets the same
+    weakest-token confidence the field audit needs - which is the whole reason
+    the audit can name *which page to re-check*.
+
+    Rows finish at different steps. ``generate`` keeps feeding finished rows (it
+    emits padding past their EOS), so the tail of a short row's list describes
+    tokens that were never part of its answer. That is harmless and deliberate:
+    :func:`~fa_ocr_lora.validation.confidence.span_confidence` is indexed by the
+    *trimmed* token ids, so the surplus entries are never reached. Trimming here
+    instead would need the per-row output lengths that only the caller knows.
+
+    Attributes:
+        rows: One list of per-step statistics per batch row, in row order.
+    """
+
+    rows: list[list[TokenConfidence]] = field(default_factory=list)
+
+    def reset(self, batch_size: int) -> None:
+        """Start recording a new batch.
+
+        Args:
+            batch_size: Rows the next ``generate`` call will carry.
+        """
+        self.rows = [[] for _ in range(batch_size)]
+
+    def steps_for(self, row: int) -> tuple[TokenConfidence, ...]:
+        """Recorded steps for one row of the current batch.
+
+        Args:
+            row: Row index within the batch.
+
+        Returns:
+            The per-step statistics, in generation order.
+        """
+        return tuple(self.rows[row])
+
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        """Record one step for every row and pass the scores through unmodified.
+
+        Args:
+            input_ids: The sequences so far. Unused; present for the interface.
+            scores: Final score vectors for this step, shape ``(B, vocab)``.
+
+        Returns:
+            ``scores``, unmodified.
+
+        Raises:
+            ValueError: If the batch width does not match :meth:`reset`, which
+                would silently misattribute every number to the wrong record.
+        """
+        width = int(scores.shape[0])
+        if width != len(self.rows):
+            raise ValueError(
+                f"BatchConfidenceRecorder was reset for {len(self.rows)} row(s) "
+                f"but generation produced {width}; call reset(batch_size) before "
+                "each generate()"
+            )
+        # One fused pass over the whole batch rather than a Python loop over
+        # rows: the log_softmax is the expensive part and it vectorises, which
+        # is the point of batching in the first place. float32 for the same
+        # reason as the single-row path - bf16 cannot resolve `margin`.
+        logprobs = torch.log_softmax(scores.float(), dim=-1)
+        top = torch.topk(logprobs, k=2, dim=-1)
+        entropy = -(logprobs.exp() * logprobs).nansum(dim=-1)
+        # One host transfer for the batch, not four per row.
+        best_ids = top.indices[:, 0].tolist()
+        best = top.values[:, 0].tolist()
+        second = top.values[:, 1].tolist()
+        entropies = entropy.tolist()
+        for row in range(width):
+            self.rows[row].append(
+                TokenConfidence(
+                    token_id=int(best_ids[row]),
+                    logprob=float(best[row]),
+                    entropy=float(entropies[row]),
+                    margin=float(best[row] - second[row]),
+                )
+            )
+        return scores
+
+
+def batch_recorder_for(
+    num_beams: int, do_sample: bool = False
+) -> BatchConfidenceRecorder | None:
+    """Build a batched recorder, under the same soundness rule as the single one.
+
+    Args:
+        num_beams: Beam count from the eval configuration.
+        do_sample: Whether generation samples rather than taking the argmax.
+
+    Returns:
+        A recorder for greedy decoding, or ``None`` for any other strategy.
+    """
+    if num_beams != 1 or do_sample:
+        return None
+    return BatchConfidenceRecorder()
+
+
+def processor_list(
+    recorder: ConfidenceRecorder | BatchConfidenceRecorder | None,
+) -> LogitsProcessorList | None:
     """Wrap a recorder for ``generate(logits_processor=...)``.
 
     Args:
