@@ -97,25 +97,140 @@ print(f"split {SPLIT} | batch {BATCH_SIZE} | workers {EVAL_WORKERS} | data {DATA
 
 # %% [markdown]
 # The three secrets, asserted before anything slow runs.
+#
+# **Every value is stripped.** A secret pasted into the Secrets panel very often
+# arrives with a trailing newline or space, and a token with a newline in it is
+# not a token: it breaks the credential line in half and GitHub answers
+# "Invalid username or token", which reads like an expired token and is not one.
+# The shape report below is what tells the two apart without printing a secret.
 
 # %%
-missing = [k for k in ("GH_TOKEN", "HF_TOKEN", "DRIVE_TOKEN_B64") if not os.environ.get(k)]
+_WANTED = ("GH_TOKEN", "HF_TOKEN", "DRIVE_TOKEN_B64")
+missing = [k for k in _WANTED if not os.environ.get(k)]
 assert not missing, f"add these in the Secrets panel (Ctrl/Cmd+J): {missing}"
-secrets = {k: os.environ[k] for k in ("GH_TOKEN", "HF_TOKEN", "DRIVE_TOKEN_B64")}
-print("secrets present:", ", ".join(secrets))
+secrets = {k: os.environ[k].strip() for k in _WANTED}
+empty = [k for k, v in secrets.items() if not v]
+assert not empty, f"these secrets are whitespace only: {empty}"
+for _key, _value in secrets.items():
+    _raw = os.environ[_key]
+    _note = " (stripped whitespace)" if _raw != _value else ""
+    # Length and prefix only. Enough to recognise a truncated paste or the wrong
+    # kind of token, never enough to use.
+    print(f"{_key:18} {len(_value):>5} chars, starts {_value[:4]!r}{_note}")
+    if any(c.isspace() for c in _value):
+        print(f"  WARNING: {_key} contains whitespace *inside* it - the paste is mangled")
 
 # %% [markdown]
-# Clone the repository, or report the commit already checked out.
+# ### Is the GitHub token actually usable?
+#
+# `zilber_ocr` is a **private** repository, so the clone needs a working token
+# and a failure there is the first thing that can end this notebook. Asking the
+# API first turns four different problems into four different sentences:
+#
+# | Result | Meaning |
+# | --- | --- |
+# | `401` | the token is invalid, expired or revoked — make a new one |
+# | `200` on `/user`, `404` on the repo | the token works but cannot see this repo (a fine-grained PAT with the repo not selected, or no `repo` scope) |
+# | `200` on both | the token is fine; any clone failure after this is plumbing, not auth |
+#
+# A classic PAT needs the **`repo`** scope. A fine-grained PAT needs
+# **Contents: Read** and `shahriar-hd/zilber_ocr` in its selected repositories.
 
 # %%
+import json as _json_probe
+import urllib.error
+import urllib.request
+
+OWNER_REPO = "shahriar-hd/zilber_ocr"
+
+
+def _github(path: str, token: str) -> tuple[int, dict]:
+    """GET one GitHub API path with a bearer token, returning status and body."""
+    request = urllib.request.Request(
+        f"https://api.github.com/{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "zilber-ocr-eval-notebook",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, _json_probe.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = _json_probe.loads(exc.read() or b"{}")
+        except ValueError:
+            body = {}
+        return exc.code, body
+
+
+_status, _body = _github("user", secrets["GH_TOKEN"])
+if _status == 401:
+    raise SystemExit(
+        "GH_TOKEN is rejected by GitHub (401 "
+        f"{_body.get('message', '')!r}).\n"
+        "The token is invalid, expired or revoked - this is NOT a code problem, "
+        "and re-pasting the same value will not fix it.\n"
+        "  1. https://github.com/settings/tokens -> generate a new token\n"
+        "     classic: tick the 'repo' scope\n"
+        "     fine-grained: Contents: Read, and add shahriar-hd/zilber_ocr to "
+        "'Only select repositories'\n"
+        "  2. Replace GH_TOKEN in the molab Secrets panel (Ctrl/Cmd+J)\n"
+        "  3. Re-run this cell"
+    )
+assert _status == 200, f"unexpected GitHub response {_status}: {_body}"
+print(f"token owner  {_body.get('login')} (/user -> 200)")
+
+_repo_status, _repo_body = _github(f"repos/{OWNER_REPO}", secrets["GH_TOKEN"])
+if _repo_status == 404:
+    raise SystemExit(
+        f"The token authenticates as {_body.get('login')} but cannot see "
+        f"{OWNER_REPO} (404).\n"
+        "The token is valid; it just lacks access to this private repository.\n"
+        "  classic PAT      -> tick the 'repo' scope\n"
+        "  fine-grained PAT -> Contents: Read, and add the repo under "
+        "'Only select repositories'\n"
+        "  organisation repo-> an admin may need to approve the token"
+    )
+assert _repo_status == 200, f"unexpected repo response {_repo_status}: {_repo_body}"
+print(f"repo access  {_repo_body.get('full_name')} "
+      f"(private={_repo_body.get('private')}, /repos -> 200)")
+print("GH_TOKEN is usable - a clone failure after this is plumbing, not auth")
+
+# %% [markdown]
+# Clone the repository, or fast-forward the clone that is already here.
+#
+# **The token goes through the environment, not a file and not `argv`.** A
+# `credential.helper` that is a shell snippet reading `$GH_TOKEN` keeps the
+# secret out of `ps` (which shows the snippet, not the value) and out of
+# `~/.git-credentials` — which matters here because molab's `$HOME` is not
+# reliably writable, and a helper that cannot write its store fails in a way
+# that looks exactly like a bad token.
+
+# %%
+# Prints the two lines git's credential protocol wants, reading the secret from
+# the environment of the git process itself.
+GIT_CREDENTIAL_HELPER = (
+    '!f() { printf "username=x-access-token\\npassword=%s\\n" "$GH_TOKEN"; }; f'
+)
+git_env = {**os.environ, "GH_TOKEN": secrets["GH_TOKEN"], "GIT_TERMINAL_PROMPT": "0"}
+
 if (REPO_DIR / ".git").is_dir():
-    print("already cloned")
+    print("already cloned - fetching")
+    sh(
+        "git", "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
+        "-C", REPO, "fetch", "--depth", "1", "origin", "main",
+        env=git_env, check=False,
+    )
+    sh("git", "-C", REPO, "reset", "--hard", "FETCH_HEAD", env=git_env, check=False)
 else:
-    cred = Path.home() / ".git-credentials"
-    cred.write_text(f"https://x-access-token:{secrets['GH_TOKEN']}@github.com\n", encoding="utf-8")
-    cred.chmod(0o600)
-    sh("git", "config", "--global", "credential.helper", "store")
-    sh("git", "clone", "--depth", "1", REPO_URL, REPO)
+    sh(
+        "git", "-c", f"credential.helper={GIT_CREDENTIAL_HELPER}",
+        "clone", "--depth", "1", REPO_URL, REPO,
+        env=git_env,
+    )
 git_head = sh("git", "-C", REPO, "rev-parse", "--short", "HEAD", capture=True).stdout.strip()
 print("commit:", git_head)
 
