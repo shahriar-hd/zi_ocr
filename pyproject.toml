@@ -115,6 +115,8 @@ fa-ocr-compare = "fa_ocr_lora.training.compare_eval:main"
 fa-ocr-report = "fa_ocr_lora.training.eval_report:main"
 # Costs a run out before renting the machine to do it. Loads no model.
 fa-ocr-simulate = "fa_ocr_lora.training.simulate:main"
+# Local VLM app: browse images, run PaddleOCR-VL-1.6 + LoRA, custom prompt.
+fa-ocr-app = "fa_ocr_lora.app.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
