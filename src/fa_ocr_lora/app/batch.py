@@ -88,12 +88,13 @@ def run_batch(
             continue
         budget = min(loader.config.max_pixels, loader.model_max_pixels)
         floor = max(loader.config.min_pixels, loader.model_min_pixels)
+        floor = min(floor, budget)
         text, error, used = "", None, budget
         for attempt in range(OOM_RETRIES + 1):
             try:
                 if attempt > 0:
                     ready = _reload_at_budget(path, budget)
-                text = run_prompt(loader, ready, prompt, budget)
+                text = run_prompt(loader, ready, prompt, budget, min_budget=floor)
                 used, error = budget, None
                 break
             except torch.OutOfMemoryError:

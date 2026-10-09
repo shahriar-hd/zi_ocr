@@ -67,7 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4,
                         help="Prefetch threads decoding ahead of the GPU.")
     parser.add_argument("--output", type=Path, default=None,
-                        help="Write the full JSON bundle here.")
+                        help=".json writes the full bundle; any other suffix writes "
+                        "plain text plus a .json sidecar.")
     parser.add_argument("--json", action="store_true",
                         help="Print the full JSON bundle to stdout.")
     parser.add_argument("--no-progress", action="store_true",

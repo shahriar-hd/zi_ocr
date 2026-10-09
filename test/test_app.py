@@ -1,6 +1,7 @@
 """Tests for the local VLM app's offline paths (no model weights needed)."""
 
 import sys
+from contextlib import nullcontext as _NullContext
 from pathlib import Path
 
 sys.path.insert(0, "src")
@@ -61,3 +62,105 @@ def test_build_app_config_no_adapter():
     config = build_app_config(args)
     assert config.adapter_dir is None
     assert config.prompt == "Hi"
+
+
+def test_run_prompt_sends_both_pixel_edges():
+    """Regression: 1.6 requires shortest_edge AND longest_edge (ValueError)."""
+    import sys
+    import types as _types
+
+    from fa_ocr_lora.app.runner import run_prompt
+
+    seen: dict = {}
+    fake_torch = _types.ModuleType("torch")
+    fake_torch.inference_mode = lambda: _NullContext()  # type: ignore[attr-defined]
+    sys.modules.setdefault("torch", fake_torch)
+
+    class _FakeInputs(dict):
+        def to(self, device):
+            return self
+
+    class _FakeProcessor:
+        def apply_chat_template(self, messages, **kwargs):
+            seen.update(kwargs.get("images_kwargs", {}).get("size", {}))
+            assert messages[0]["content"][1] == {"type": "text", "text": "OCR:"}
+            return _FakeInputs({"input_ids": _FakeIds()})
+
+        def decode(self, completion, skip_special_tokens=True):
+            assert skip_special_tokens
+            return "  متن  "
+
+    class _FakeIds:
+        shape = (1, 10)
+
+    class _FakeModel:
+        def generate(self, **kwargs):
+            assert kwargs["max_new_tokens"] == 8
+            assert kwargs["do_sample"] is False
+
+            class _Out:
+                def __getitem__(self, index):
+                    assert index == 0
+                    return list(range(14))
+
+            return _Out()
+
+    class _FakeLoader:
+        import types as _t
+
+        processor = _FakeProcessor()
+        model = _FakeModel()
+        config = _t.SimpleNamespace(max_new_tokens=8, prompt="OCR:")
+        model_min_pixels = 147384
+        device = "cpu"
+
+    from PIL import Image
+
+    image = Image.new("RGB", (64, 64))
+    assert run_prompt(_FakeLoader(), image, "OCR:", 1003520) == "متن"
+    assert seen == {"shortest_edge": 147384, "longest_edge": 1003520}
+
+
+def test_run_prompt_clamps_floor_below_retry_budget():
+    """An OOM-halved budget below the floor must still form a valid window."""
+    import sys
+    import types
+
+    from fa_ocr_lora.app.runner import run_prompt
+
+    seen: dict = {}
+    fake_torch = types.ModuleType("torch")
+    fake_torch.inference_mode = lambda: _NullContext()  # type: ignore[attr-defined]
+    sys.modules.setdefault("torch", fake_torch)
+
+    class _FakeInputs(dict):
+        def to(self, device):
+            return self
+
+    class _FakeProcessor:
+        def apply_chat_template(self, messages, **kwargs):
+            seen.update(kwargs.get("images_kwargs", {}).get("size", {}))
+            return _FakeInputs({"input_ids": types.SimpleNamespace(shape=(1, 4))})
+
+        def decode(self, completion, skip_special_tokens=True):
+            return "x"
+
+    class _FakeModel:
+        def generate(self, **kwargs):
+            class _Out:
+                def __getitem__(self, index):
+                    return [0] * 6
+
+            return _Out()
+
+    loader = types.SimpleNamespace(
+        processor=_FakeProcessor(), model=_FakeModel(),
+        config=types.SimpleNamespace(max_new_tokens=8),
+        model_min_pixels=147384, device="cpu",
+    )
+    from PIL import Image
+
+    run_prompt(loader, Image.new("RGB", (32, 32)), "p", 100, min_budget=147384)
+    # budget=100 is below one 28x28 token, so longest clamps to 784 (28*28)
+    # and shortest clamps under it: the window stays valid, never inverted.
+    assert seen["shortest_edge"] <= seen["longest_edge"] == 784

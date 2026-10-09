@@ -65,6 +65,9 @@ class AppConfig:
     dtype: str = "auto"
     device: str = "cuda"
     workers: int = 4
+    # Floor default (147384) comes from the training YAML; at load time the
+    # loader prefers the processor's own shortest_edge (112896 at the pinned
+    # revision) via model_min_pixels. --min-pixels overrides the YAML value.
 
 
 @dataclass(slots=True)

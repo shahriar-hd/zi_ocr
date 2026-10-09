@@ -119,9 +119,15 @@ def load_app_model(config: AppConfig) -> LoadedApp:
         LOGGER.info("applied adapter from %s", config.adapter_dir)
     model.eval()
     image_processor = processor.image_processor
-    model_min = int(getattr(image_processor, "min_pixels", config.min_pixels))
+    # The 1.6 processor exposes its window as size={shortest_edge,
+    # longest_edge} (112896/1003520 on this revision) - there are no
+    # min_pixels/max_pixels attributes, so getattr defaults here must read
+    # size, not attribute names that do not exist (which silently pinned the
+    # floor to the YAML default instead of the model's real window).
+    size = dict(getattr(image_processor, "size", {}) or {})
+    model_min = int(size.get("shortest_edge", config.min_pixels))
     fallback = max(config.max_pixels, config.min_pixels + 1)
-    model_max = int(getattr(image_processor, "max_pixels", fallback))
+    model_max = int(size.get("longest_edge", fallback))
     if torch.cuda.is_available():
         weight_mib = torch.cuda.memory_allocated() / 2**20
     else:

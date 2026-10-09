@@ -15,25 +15,36 @@ LOGGER = logging.getLogger("fa_ocr_lora.app")
 from .loader import load_app_model  # noqa: E402  (re-export for package root)
 
 
-def run_prompt(loader: LoadedApp, image: Any, prompt: str, budget: int) -> str:
+def run_prompt(
+    loader: LoadedApp,
+    image: Any,
+    prompt: str,
+    budget: int,
+    *,
+    min_budget: int | None = None,
+) -> str:
     """Run one image + user prompt through the loaded model.
 
     Args:
         loader: Loaded model bundle.
         image: Ready PIL image (or a path, loaded on demand).
         prompt: User prompt text for the ``text`` turn after the image.
-        budget: Pixel budget for this attempt (longest-edge clamp per call).
+        budget: Pixel budget for this attempt, sent as ``longest_edge``.
+        min_budget: Floor sent as ``shortest_edge``; defaults to the
+            processor's own floor clamped below ``budget`` so the resize
+            always has a valid ``[shortest, longest]`` window.
 
     Returns:
         The decoded generation, stripped.
     """
-    import torch
     from PIL import Image
 
     if isinstance(image, (str, Path)):
         with Image.open(image) as handle:
             image = handle.convert("RGB")
-    longest = max(int(budget**0.5 * 1.5), 28)
+    longest = max(int(budget), 28 * 28)
+    floor = loader.model_min_pixels if min_budget is None else min_budget
+    shortest = max(28 * 28, min(int(floor), longest))
     messages = [
         {"role": "user", "content": [
             {"type": "image", "image": image},
@@ -46,7 +57,7 @@ def run_prompt(loader: LoadedApp, image: Any, prompt: str, budget: int) -> str:
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        images_kwargs={"size": {"longest_edge": longest}},
+        images_kwargs={"size": {"shortest_edge": shortest, "longest_edge": longest}},
     )
     device = loader.device
     try:
@@ -54,6 +65,8 @@ def run_prompt(loader: LoadedApp, image: Any, prompt: str, budget: int) -> str:
     except AttributeError:
         inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
     prompt_len = inputs["input_ids"].shape[-1]
+    import torch  # noqa: PLC0415 - heavy dep, only needed for real inference
+
     with torch.inference_mode():
         generated = loader.model.generate(
             **inputs,

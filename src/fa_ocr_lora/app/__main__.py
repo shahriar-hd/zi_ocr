@@ -104,10 +104,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.output is not None:
         out = args.output.expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        LOGGER.info("json -> %s", args.output)
+        if out.suffix.lower() == ".json":
+            out.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            LOGGER.info("json -> %s", args.output)
+        else:
+            # A text suffix (.md/.txt/...) gets the human-readable
+            # transcription, not the JSON bundle: Markdown renderers choke
+            # on a JSON blob, and the bundle is still one --json away.
+            # The sidecar keeps machine-readable provenance beside it.
+            parts: list[str] = []
+            for result in results:
+                if len(results) > 1:
+                    parts.append(f"# {result.image.name}\n")
+                if result.error:
+                    parts.append(f"[FAILED: {result.error}]")
+                else:
+                    parts.append(result.text)
+            out.write_text("\n\n".join(parts).strip() + "\n", encoding="utf-8")
+            sidecar = out.with_suffix(out.suffix + ".json")
+            sidecar.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            LOGGER.info("text -> %s (+ %s)", args.output, sidecar.name)
     if failures:
         detail = ", ".join(f"{n}={c}" for n, c in sorted(failures.items()))
         LOGGER.error("%d of %d image(s) failed: %s", sum(failures.values()),
