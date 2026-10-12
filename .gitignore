@@ -74,3 +74,8 @@ data/weights/
 # Agents
 .agents/
 .claude/
+.freebuff/
+.opencode/
+
+# Checkpoints
+checkpoints/

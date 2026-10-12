@@ -1,0 +1,576 @@
+# Persian diverse OCR dataset - the one file that holds every knob.
+#
+# Read .claude/dataset.md first; this file is its parameterisation. The guiding
+# rule there is the guiding rule here: *diversity is the product*. A number in
+# this file should be changed when it would add a kind of variation the model
+# has not seen, not to make the corpus bigger.
+#
+# Precedence, same as synth_config.yaml:
+#
+#     CLI flag  >  environment  >  this file  >  dataclass default
+#
+# Loading is strict. An unknown key is a startup error, not a warning, because
+# a typo that silently keeps a default is how a 150k-sample run ends up with
+# the wrong digit-script distribution and nobody notices until evaluation.
+
+run_name: fa_diverse_v1
+
+# Master seed. Every per-sample draw derives from f"{seed}:{purpose}:{index}",
+# so the corpus is reproducible from (this file, seed) alone. Change it to get
+# a genuinely different corpus; keep it to extend the same one.
+seed: 20261010
+
+paths:
+  # The laptop stage and the molab stage share this tree. The laptop fills
+  # lexicon/ planning/ generation/ textqc/; molab fills layouts/ render/ qc/
+  # packaging/ after pulling the text artifacts down from Drive.
+  work_dir: data/diverse
+  reports_dir: reports/diverse
+  # The redistributable OFL font pool built by
+  # scripts/download_diverse_fonts.py. Deliberately NOT ~/.local/share/fonts:
+  # that directory holds the proprietary B-series and IRANSansX faces the
+  # letters dataset used, and those may not be shipped in a published corpus.
+  # Override per machine with FA_DIVERSE_FONTS_DIR.
+  fonts_dir: data/diverse/fonts
+  # Downloaded dumps land here. Large (hundreds of MB) and gitignored.
+  cache_dir: data/diverse/cache
+
+# --------------------------------------------------------------------------- #
+# Stage 00 - lexicon
+# --------------------------------------------------------------------------- #
+#
+# The lexicon's job is NOT to supply words the LLM would write anyway.
+#
+# Left to itself an instruction-tuned model writes the high-frequency core of
+# Persian: a few thousand words that cover most of its output. Those words are
+# already in every sample for free, so spending a prompt slot on one buys no
+# vocabulary the model has not already seen. What the LLM will *never* reach for
+# unprompted is the long tail - archaic and classical words, dialect forms,
+# domain terminology, and the Academy's modern coinages. That tail is the whole
+# reason this stage exists, which is why `exclude_top_frequency_rank` throws the
+# common core away and `band_weights` puts three quarters of the mass on the two
+# rarest bands.
+lexicon:
+  # Only sources whose licence permits redistribution of a headword list.
+  # Dehkhoda and Moein are deliberately absent: both are copyrighted works,
+  # the online editions' terms forbid bulk scraping, and their *definitions*
+  # are certainly not redistributable. The three below reach the same register
+  # of rare and specialised vocabulary legally.
+  sources:
+    - name: lilak
+      kind: lilak_lexicon
+      url: https://raw.githubusercontent.com/b00f/lilak/master/src/data/lexicon
+      licence: Apache-2.0
+      licence_note: >
+        Lilak Persian spell-checking dictionary, Copyright 2015 Mostafa
+        Sedaghat Joo, Apache License 2.0. ~94k headwords with part-of-speech
+        tags. Permissive, so it imposes no share-alike obligation.
+      attribution: https://github.com/b00f/lilak
+    - name: fa_wiktionary
+      kind: wiktionary_dump
+      url: https://dumps.wikimedia.org/fawiktionary/latest/fawiktionary-latest-pages-articles.xml.bz2
+      licence: CC BY-SA 4.0
+      licence_note: >
+        Persian Wiktionary, text licensed CC BY-SA 4.0. Only headwords, part of
+        speech and topical/era category labels are extracted; no definition text
+        is redistributed. This is the only source that labels a word as archaic,
+        dialectal, literary or Academy-approved, which is what the era axis
+        needs: its واژه‌های مصوب فرهنگستان category alone carries ~17,800
+        modern coinages an LLM never writes unprompted.
+      attribution: https://fa.wiktionary.org
+    # DELIBERATELY NOT USED: fawiki-latest-all-titles-in-ns0.gz
+    #
+    # Persian Wikipedia article titles were tried and removed. Of 324,015
+    # single-token Persian titles, ~205,000 were words no other source knew,
+    # and inspection showed them to be overwhelmingly proper nouns -
+    # transliterated place and person names (ونترتور = Winterthur,
+    # هوهنوارت = Hohenwart, سرگیوس = Sergius) rather than vocabulary. They
+    # cannot be told apart from genuine technical terms without parsing each
+    # article's categories, they flooded the `technical` era with 68% of the
+    # lexicon, and injecting them into a prompt asks the model to write Persian
+    # prose around the name of a Swiss village. Lilak and Wiktionary together
+    # already give ~130k genuine dictionary headwords with real metadata.
+  frequency:
+    # Frequencies are computed from Persian Wikipedia article text rather than
+    # downloaded, so the bands match the tokenisation used here instead of
+    # someone else's.
+    #
+    # This is the first chunk of the article dump (~370 MB bz2), not the whole
+    # 1.4 GB file, and the reader stops the HTTP stream as soon as
+    # `max_documents` articles have been tokenised - bz2 decompresses
+    # incrementally, so a partial download is a complete answer. Wikimedia
+    # publishes no `abstract` dump for fawiki, which is why the full article
+    # text is used.
+    url: https://dumps.wikimedia.org/fawiki/latest/fawiki-latest-pages-articles1.xml-p1p1500000.bz2
+    licence: CC BY-SA 4.0
+    # Articles to tokenise. 400k gives stable counts down to ~5 occurrences,
+    # which is where the rare/very_rare boundary sits.
+    max_documents: 400000
+  # Minimum and maximum headword length in characters. Below 2 is noise
+  # (stray letters, abbreviations); above 24 is almost always a parse failure.
+  length: {min: 2, max: 24}
+  # Band cut-offs as percentiles of the frequency distribution, descending.
+  # A word absent from the frequency corpus is very_rare by definition.
+  band_percentiles:
+    very_common: 0.80
+    common: 0.55
+    uncommon: 0.30
+    rare: 0.08
+  # Words among the N most frequent in the corpus are dropped from the
+  # sampling pool outright. They still appear in lexicon.parquet (the
+  # frequency table is needed to assign bands) but are never injected into a
+  # prompt, because the LLM writes them unprompted. Raise it to push the
+  # corpus further into the tail; lower it if the generated text starts
+  # reading like a glossary.
+  exclude_top_frequency_rank: 5000
+  min_uses_per_word: 2
+  max_uses_per_word: 30
+
+# --------------------------------------------------------------------------- #
+# Stage 01 - plan
+# --------------------------------------------------------------------------- #
+plan:
+  total_samples: 150        # pilot. Raise to 10000, then higher, after review.
+  words_per_prompt: {min: 3, max: 12}
+  rare_words_per_100: {min: 3, max: 8}
+  # Chance a drawn lexicon word's domain deliberately mismatches the genre, to
+  # force the model to bridge (a botany term in a sports column). Too high and
+  # the text stops being natural; too low and every domain word appears only in
+  # its own genre, which is itself a template.
+  off_domain_probability: 0.15
+  # Probability a drawn word comes from each band. NOT the bands' corpus
+  # frequencies - deliberately inverted, because the rare tail is the product.
+  # very_common is zero: those words arrive free in every sample.
+  band_weights:
+    very_common: 0.00
+    common: 0.02
+    uncommon: 0.13
+    rare: 0.40
+    very_rare: 0.45
+  # Era/register stratification, independent of frequency. A word can be rare
+  # *and* modern (an Academy coinage) or rare *and* archaic (a Dehkhoda-era
+  # literary word); both must appear, and only Wiktionary's category labels can
+  # tell them apart.
+  #
+  # These weights are bounded by arithmetic, not taste. Stage 00 on the live
+  # dumps yields this injectable pool:
+  #
+  #     archaic 2,216 | literary 916 | dialectal 1,236
+  #     technical 3,139 | neologism 9,226 | unlabelled 107,494
+  #
+  # With max_uses_per_word = 30 an era's capacity is pool x 30 word-slots. A
+  # 150k-sample run at ~7 words per prompt needs ~1.05M slots, so literary can
+  # carry at most 916*30/1.05M = 2.6% of them however much one would like more
+  # archaic poetry. The weights below sit just under each ceiling.
+  #
+  # `neologism` gets the largest labelled share because it is both the biggest
+  # labelled group and the most valuable: ~9,200 Academy-approved coinages that
+  # no LLM writes unprompted.
+  #
+  # The sampler re-checks this at runtime and clamps any weight that exceeds
+  # its era's capacity, redistributing to eras with headroom and logging the
+  # change - so raising total_samples cannot silently break the stratification.
+  era_weights:
+    archaic: 0.06             # کهن - classical and obsolete
+    literary: 0.025           # ادبی - poetic register, Shahnameh glosses
+    dialectal: 0.03           # گویشی - regional forms
+    technical: 0.085          # domain terminology across all fields
+    neologism: 0.25           # فرهنگستان coinages
+    unlabelled: 0.55          # Lilak's bulk: real words, no era metadata
+  # Target share of samples per visual category. Checked to sum to 1.0.
+  # These drive the plan so the text is written *for* its eventual format: a
+  # chat screenshot needs different text from a legal clause.
+  category_weights:
+    page: 0.25
+    paragraph: 0.15
+    line: 0.15
+    poetry: 0.08
+    web: 0.10
+    chat: 0.08
+    banner: 0.07
+    story: 0.04
+    table_form: 0.05
+    mixed: 0.03
+  # Content features, each drawn independently per sample. Every one of these
+  # is a thing the previous dataset never contained.
+  feature_probabilities:
+    numbers: 0.45
+    latin_terms: 0.18
+    quotations: 0.15
+    parentheticals: 0.20
+    bullet_list: 0.14
+    table: 0.08
+    headings: 0.22
+    footnotes: 0.06
+    diacritics: 0.07
+    zwnj_heavy: 0.25
+    emoji: 0.04          # chat category only; clamped elsewhere
+
+# --------------------------------------------------------------------------- #
+# Stage 02 - generation
+# --------------------------------------------------------------------------- #
+generation:
+  base_url: https://integrate.api.nvidia.com/v1
+  # Holds one key or several, comma- or whitespace-separated. Numbered variants
+  # NVIDIA_API_KEY_1 .. _32 are also collected. One worker thread per key, each
+  # paced independently, so a throttled key sleeps alone while the others keep
+  # generating.
+  api_key_env: NVIDIA_API_KEY
+  # At least two profiles, because one generator's style and quirks leak into
+  # the data and become the thing the model learns. `profile` is recorded per
+  # sample so a held-out-generator test split can be built (splits.holdout_generator).
+  #
+  # These four models were not chosen from the endpoint's catalogue; they are
+  # what survived measurement. Of 63 chat models listed, only 13 were callable
+  # on this account, and of those only some write usable Persian. Scored over
+  # four varied prompts (Persian-letter ratio / requested-rare-word hit rate /
+  # median latency):
+  #
+  #   nemotron-3-super-120b-a12b     98.6% / 100% /  4.6s   <- best overall
+  #   nemotron-3-ultra-550b-a55b     98.4% /  88% /  6.2s
+  #   kimi-k3 (non-Nemotron)        100.0% /  88% / 15.8s
+  #   nemotron-3.5-lightning-30b     76.6% / 100% /  2.5s   REJECTED
+  #   nemotron-3-nano-omni-reasoning  100% / 100% /  2.3s   REJECTED
+  #   gpt-oss-20b                     100% / 100% / 31.5s   REJECTED
+  #
+  # Rejections, with reasons, because "fastest" was the wrong metric:
+  #  - lightning-30b leaked Cyrillic and English into Persian prose
+  #    ("систеمتان sourced knowledge"), mangled the rare words it was given
+  #    (گرمامرگی -> گرامرگی) and overshot an 80-word target by 10x.
+  #  - nano-omni-reasoning returned empty or ~96-character answers on half the
+  #    prompts; it spends its budget on reasoning tokens.
+  #  - gpt-oss-20b failed half the calls and is slower than kimi-k3 anyway.
+  #  - glm-5.3 and glm-5.3-flash returned empty content on every attempt.
+  #
+  # kimi-k3 carries the smallest weight and is kept purely for generator
+  # diversity: it is the only non-Nemotron that writes clean Persian, so it is
+  # also the natural holdout for test_unseen_generator.
+  profiles:
+    - name: nemotron_super_warm
+      model: nvidia/nemotron-3-super-120b-a12b
+      temperature: 0.90
+      top_p: 0.95
+      weight: 0.34
+    - name: nemotron_super_cool
+      model: nvidia/nemotron-3-super-120b-a12b
+      temperature: 0.45
+      top_p: 0.70
+      weight: 0.20
+    - name: nemotron_ultra_warm
+      model: nvidia/nemotron-3-ultra-550b-a55b
+      temperature: 0.85
+      top_p: 0.95
+      weight: 0.34
+    - name: kimi_warm
+      model: moonshotai/kimi-k3
+      temperature: 0.90
+      top_p: 0.95
+      weight: 0.12
+  max_tokens: 4096
+  # Requests per minute per API key.
+  rpm: 40
+  max_retries: 6
+  timeout_s: 180.0
+  # On-disk response cache keyed by prompt_hash + profile + seed. A re-run
+  # after a text-QC change costs nothing in API calls.
+  cache_enabled: true
+
+# --------------------------------------------------------------------------- #
+# Stage 03 - text QC and the text policy
+# --------------------------------------------------------------------------- #
+text_policy:
+  # Digit script is a controlled variable, never an accident. `mixed` means the
+  # sample deliberately carries more than one script and says so in metadata.
+  digit_script_probs:
+    persian: 0.55
+    latin: 0.25
+    arabic_indic: 0.05
+    mixed: 0.15
+  # Fraction of samples rendered with tashkeel preserved, and with Arabic
+  # (rather than Persian) letter forms. Both are labelled in the manifest.
+  diacritics_fraction: 0.07
+  arabic_forms_fraction: 0.05
+  keep_zwnj: true
+  # Fraction of samples that deliberately drop ZWNJ, imitating the large amount
+  # of real Persian text typed without it.
+  drop_zwnj_fraction: 0.12
+
+text_qc:
+  persian_ratio_min: 0.80
+  # Relaxed floor for samples whose plan asked for Latin terms or mixed script.
+  persian_ratio_min_mixed: 0.45
+  # Reject when the output length misses the target by more than this factor
+  # in either direction. Generous, because "short paragraph" is a soft target.
+  length_tolerance: 0.55
+  # Share of the requested lexicon words that must actually appear (after the
+  # light stemming in text_policy.stems). Below this the sample is dropped.
+  lexicon_hit_rate_min: 0.5
+  # Repetition guards. `max_line_repeat` catches the model looping a line;
+  # `max_ngram_ratio` catches subtler degeneration.
+  max_line_repeat: 3
+  ngram_size: 8
+  max_ngram_ratio: 0.18
+  # MinHash near-duplicate detection. Jaccard above this on 5-gram shingles is
+  # a duplicate. Stricter within a genre, where the model repeats itself most.
+  dedupe_threshold: 0.80
+  dedupe_threshold_same_genre: 0.70
+  minhash_permutations: 128
+  shingle_size: 5
+  # Stop and report instead of silently continuing past a broken prompt.
+  max_rejection_rate: 0.20
+
+# --------------------------------------------------------------------------- #
+# Stage 04/05 - layout and render
+# --------------------------------------------------------------------------- #
+render:
+  # Chromium through Playwright for everything. The raqm/Pillow path in
+  # .claude/dataset.md was dropped: Pillow here is not built with libraqm, so
+  # it renders disconnected Persian letters, and a silently-wrong shaping
+  # engine is worse than one engine. Verified by test_render_shaping.
+  engine: chromium
+  dpi_choices:                 # relative weights, not percentages
+    96: 0.10                   # screenshot-native
+    150: 0.22
+    200: 0.18
+    300: 0.40
+    400: 0.10
+  # Fraction rendered clean, with no degradation at all, so the model also
+  # sees pristine text.
+  clean_fraction: 0.25
+  max_page_time_ms: 30000
+  # Parallel browser contexts. One browser process, N contexts; raise on a
+  # machine with more cores and RAM.
+  workers: 4
+  jpeg_quality: {min: 55, max: 95}
+  derive_crops:
+    line: true
+    paragraph: true
+    # Single-word crops carry little signal per unit of compute, so a small
+    # fraction only.
+    word_fraction: 0.02
+    # Random padding around a derived crop, as a fraction of the box's height.
+    padding: {min: 0.04, max: 0.22}
+  fonts:
+    # Families held out of train entirely, for the test_unseen_fonts split.
+    # Chosen by the loader as the last N of the sorted family list, so the
+    # choice is stable across runs.
+    holdout: 3
+    # A family must cover this fraction of a sample's characters or the sample
+    # picks another family. Below 1.0 would let a tofu box through, and a tofu
+    # box means the label does not match the pixels.
+    coverage_min: 1.0
+
+degradation:
+  # Probability the sample gets any degradation at all is 1 - clean_fraction.
+  # These are the per-effect probabilities within a degraded sample.
+  probabilities:
+    paper_texture: 0.55
+    stains: 0.22
+    folds: 0.18
+    ink_bleed: 0.30
+    uneven_toner: 0.25
+    scanner_noise: 0.45
+    skew: 0.50
+    perspective: 0.28
+    vignette: 0.35
+    shadow: 0.25
+    blur: 0.30
+    low_light: 0.18
+    glare: 0.12
+    jpeg: 0.55
+    rescale: 0.30
+    moire: 0.08           # screen photos only
+    occlusion: 0.10
+    highlighter: 0.08
+    clutter: 0.12
+  strength:
+    skew_deg: {min: -3.5, max: 3.5}
+    perspective: {min: 0.0, max: 0.06}
+    blur_radius: {min: 0.3, max: 1.8}
+    noise_sigma: {min: 1.0, max: 9.0}
+    vignette: {min: 0.05, max: 0.35}
+    rescale: {min: 0.45, max: 0.95}
+
+  # ------------------------------------------------------------------------- #
+  # Verso show-through: the ghost of the page's other side.
+  # ------------------------------------------------------------------------- #
+  #
+  # Hold a real printed sheet up and you see the back side faintly through the
+  # paper: mirrored, blurred, lower in contrast, and tinted by the paper's own
+  # colour rather than by the ink's. Every scan of a duplex document carries it.
+  #
+  # The letters pipeline approximated this by mirroring *the same page*, which
+  # is wrong in a way that matters: a model can learn to read the ghost as a
+  # mirrored copy of what it is already reading, so the effect teaches it
+  # nothing. Here the ghost is **a different sample's text**, drawn from the
+  # corpus and rendered in its own font and layout. The model must learn that
+  # faint mirrored strokes are *not* content, which is the actual skill.
+  #
+  # The ghost is never annotated. Its text is recorded in the metadata as
+  # `aug.show_through.source_id` so the pairing is auditable, but it contributes
+  # no box and no label - it is noise with provenance.
+  show_through:
+    probability: 0.22
+    # Ghost ink opacity. Above ~0.22 the ghost competes with the real text and
+    # a human starts misreading the page, which makes the label arguable.
+    alpha: {min: 0.05, max: 0.18}
+    # Gaussian blur applied to the ghost, in pixels at the sample's DPI.
+    # Paper scatters light, so the ghost is always softer than the recto.
+    blur_px: {min: 1.2, max: 4.5}
+    # Hue rotation applied to the ghost relative to the recto ink, in degrees.
+    # Show-through picks up the paper's colour, so a warm cream sheet pushes
+    # the ghost yellow-brown rather than leaving it neutral grey.
+    hue_shift_deg: {min: -28.0, max: 28.0}
+    # Extra desaturation of the ghost. 1.0 is fully grey.
+    desaturate: {min: 0.35, max: 0.85}
+    # Scale jitter: the two sides of a sheet are rarely in perfect register.
+    scale: {min: 0.97, max: 1.03}
+    # Offset of the ghost from perfect mirror alignment, as a fraction of page
+    # width/height. Real duplex printing is off by a millimetre or two.
+    offset: {min: -0.02, max: 0.02}
+    # Rotation jitter of the ghost, degrees.
+    rotate_deg: {min: -1.5, max: 1.5}
+    # Mirror the ghost horizontally. True is physically correct for
+    # show-through; the small false fraction imitates the other real case,
+    # the previous page of a stack being visible through a thin sheet.
+    mirror_probability: 0.85
+
+  # ------------------------------------------------------------------------- #
+  # Paper tint and background wash behind the text.
+  # ------------------------------------------------------------------------- #
+  #
+  # Real paper is not #FFFFFF. It is cream, grey, pink, recycled-buff; it
+  # yellows with age from the edges inward; and printed forms carry coloured
+  # panels and watermarks behind the text. A model trained only on white
+  # backgrounds loses accuracy the moment contrast drops, which is most real
+  # scans.
+  paper:
+    # Base sheet colours, weighted. Each is a plausible stock.
+    tints:
+      "#ffffff": 0.18        # bright white office stock
+      "#fdfbf6": 0.20        # standard warm white
+      "#f7f3e8": 0.14        # cream / laid
+      "#f3efe4": 0.10        # aged cream
+      "#eee9dc": 0.08        # older, browner
+      "#f5f5f2": 0.08        # cool grey-white
+      "#eef2f5": 0.06        # faint blue tint
+      "#fdf3f0": 0.05        # faint pink
+      "#f0f4ec": 0.05        # faint green (ledger stock)
+      "#e8e2d0": 0.04        # recycled buff
+      "#e6e8ea": 0.02        # grey recycled
+    # Age yellowing, strongest at the edges. 0 disables.
+    yellowing:
+      probability: 0.30
+      strength: {min: 0.04, max: 0.26}
+    # A coloured wash or panel behind the text block, as on a form, a
+    # certificate or a highlighted callout. Separate from `tints` because it
+    # covers only part of the page and sits *above* the paper but *below* the
+    # ink.
+    wash:
+      probability: 0.18
+      alpha: {min: 0.04, max: 0.20}
+      hues: [0, 35, 48, 95, 150, 200, 215, 265, 330]
+      # Shape of the wash: a full-bleed flood, a band behind the heading, a
+      # rounded panel around the body, or a soft radial bloom.
+      shapes: {flood: 0.30, band: 0.25, panel: 0.30, bloom: 0.15}
+    # A faint repeated watermark word or ornament behind the text, as on
+    # letterhead, certificates and controlled documents. Not annotated.
+    watermark:
+      probability: 0.10
+      alpha: {min: 0.03, max: 0.12}
+      rotate_deg: {min: -40.0, max: 40.0}
+      scale: {min: 0.25, max: 0.75}
+
+# --------------------------------------------------------------------------- #
+# Stage 06 - image QC
+# --------------------------------------------------------------------------- #
+image_qc:
+  # Minimum rendered x-height in pixels. Below this the text is not legible and
+  # the sample teaches the model to hallucinate.
+  min_x_height_px: 8
+  # Samples whose layout intended low resolution are exempt and labelled.
+  min_x_height_px_low_res: 5
+  # Michelson contrast floor after degradation.
+  min_contrast: 0.12
+  # Perceptual-hash Hamming distance below which two images are duplicates.
+  phash_max_distance: 4
+  # Fraction of accepted samples run through an independent OCR as a pipeline
+  # sanity check - mirrored text, wrong reading order. Not a quality target.
+  sanity_ocr_fraction: 0.01
+  max_rejection_rate: 0.20
+  contact_sheet:
+    per_category: 12
+    thumbnail_px: 320
+
+# --------------------------------------------------------------------------- #
+# Stage 07 - packaging and splits
+# --------------------------------------------------------------------------- #
+splits:
+  ratios: {train: 0.94, validation: 0.02, test: 0.04}
+  # Group-aware: a page and every crop derived from it share a group_id, and so
+  # do all samples from the same plan. A group never straddles two splits.
+  group_by: group_id
+  split_salt: ""
+  # The two hard tests that measure what the previous dataset could not.
+  # Samples matching a holdout are moved out of train entirely.
+  holdout_templates_per_category: 1
+  # Optional third hard test: text from a generation profile unused in train.
+  # kimi_warm is the natural choice - it is the only non-Nemotron profile, so
+  # holding it out measures generalisation across model families rather than
+  # across two temperatures of the same model.
+  holdout_generator: kimi_warm
+
+packaging:
+  output_dir: data/diverse/hf
+  shard_samples: 500
+  min_shard_samples: 200
+  min_shard_bytes: 268435456       # 256 MiB
+  max_shard_bytes: 1073741824      # 1 GiB
+  compression: zstd
+  # Two views per category, mirroring the administrative-letter dataset.
+  views: [full, ocr_text_only]
+  # The text corpus ships as its own config; it is cheap and useful for
+  # language-model pretraining.
+  include_text_corpus: true
+
+# --------------------------------------------------------------------------- #
+# Stage 08 - upload
+# --------------------------------------------------------------------------- #
+upload:
+  # Fill this in, or set FA_DIVERSE_HF_REPO. Stays private until the contact
+  # sheets and the dataset card have been reviewed.
+  repo_id: ""
+  private: true
+  workers: 3
+  delete_after_upload: false
+  dataset_name: Persian Diverse OCR
+  # The weakest-licensed ingredient decides this. Persian Wiktionary and
+  # Wikipedia are CC BY-SA 4.0, which is share-alike, so the dataset cannot be
+  # relicensed more permissively than CC BY-SA 4.0.
+  license: cc-by-sa-4.0
+  commit_message: "Add Persian diverse OCR shards"
+
+# --------------------------------------------------------------------------- #
+# Google Drive backup
+# --------------------------------------------------------------------------- #
+drive:
+  enabled: true
+  # Everything lands under this folder, beside the existing fa-ocr-lora tree.
+  folder: fa-diverse-ocr
+  folder_id: ""
+  # What gets mirrored. Raw rendered PNGs are deliberately excluded: they are
+  # reproducible from (text, seed, config) and would cost 50-200 GB of upload
+  # from the molab runtime. The LLM text is not reproducible - it cost money -
+  # so it is mirrored first and always.
+  mirror:
+    lexicon: true
+    plans: true
+    texts: true
+    texts_clean: true
+    shards: true
+    images: false
+    reports: true
+  workers: 4
+  # Text artifacts are many small files; they are tarred in batches of this
+  # many samples before upload, because Drive's per-file overhead dominates.
+  tar_batch: 2000
