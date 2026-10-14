@@ -881,6 +881,10 @@ class PlanConfig:
     Attributes:
         total_samples: How many plans to draw.
         words_per_prompt: Lexicon words injected per request.
+        max_very_rare_per_prompt: Hard cap on ``very_rare`` words in one
+            request. Handed a prompt of nothing but words it has never seen, a
+            model falls back on tokens from other scripts; a couple of very
+            rare words among commoner ones gives it something to write around.
         rare_words_per_100: Cap on rare words per 100 output words, so the
             text reads as prose rather than as a glossary.
         off_domain_probability: Chance a word's domain mismatches the genre.
@@ -892,6 +896,7 @@ class PlanConfig:
 
     total_samples: int
     words_per_prompt: IntRange
+    max_very_rare_per_prompt: int
     rare_words_per_100: IntRange
     off_domain_probability: float
     band_weights: dict[str, float]
@@ -919,6 +924,7 @@ class PlanConfig:
             (
                 "total_samples",
                 "words_per_prompt",
+                "max_very_rare_per_prompt",
                 "rare_words_per_100",
                 "off_domain_probability",
                 "band_weights",
@@ -935,7 +941,12 @@ class PlanConfig:
                 section.get("total_samples"), "plan.total_samples", 150
             ),
             words_per_prompt=IntRange.parse(
-                section.get("words_per_prompt"), "plan.words_per_prompt", IntRange(3, 12)
+                section.get("words_per_prompt"), "plan.words_per_prompt", IntRange(2, 6)
+            ),
+            max_very_rare_per_prompt=_positive_int(
+                section.get("max_very_rare_per_prompt"),
+                "plan.max_very_rare_per_prompt",
+                2,
             ),
             rare_words_per_100=IntRange.parse(
                 section.get("rare_words_per_100"),
@@ -1075,6 +1086,9 @@ class GenerationConfig:
         profiles: At least two sampling profiles.
         max_tokens: Per-request output ceiling.
         rpm: Requests per minute per key.
+        workers_per_key: Concurrent requests sharing one key. The per-key
+            pacer holds the combined rate to ``rpm`` regardless, so this fills
+            the rate budget during slow replies rather than exceeding it.
         max_retries: Attempts before a sample is recorded as failed.
         timeout_s: Per-request socket timeout.
         cache_enabled: Whether responses are cached on disk by prompt hash.
@@ -1085,6 +1099,7 @@ class GenerationConfig:
     profiles: tuple[GenerationProfile, ...]
     max_tokens: int
     rpm: int
+    workers_per_key: int
     max_retries: int
     timeout_s: float
     cache_enabled: bool
@@ -1124,6 +1139,7 @@ class GenerationConfig:
                 "profiles",
                 "max_tokens",
                 "rpm",
+                "workers_per_key",
                 "max_retries",
                 "timeout_s",
                 "cache_enabled",
@@ -1149,6 +1165,9 @@ class GenerationConfig:
                 section.get("max_tokens"), "generation.max_tokens", 4096
             ),
             rpm=_positive_int(section.get("rpm"), "generation.rpm", 40),
+            workers_per_key=_positive_int(
+                section.get("workers_per_key"), "generation.workers_per_key", 1
+            ),
             max_retries=_positive_int(
                 section.get("max_retries"), "generation.max_retries", 6
             ),

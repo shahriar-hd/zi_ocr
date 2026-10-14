@@ -43,6 +43,7 @@ from ..config import GenerationProfile
 
 __all__ = [
     "Completion",
+    "FatalRequestError",
     "GenerationError",
     "KeyWorker",
     "ResponseCache",
@@ -56,17 +57,32 @@ LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 MAX_NUMBERED_KEYS: Final[int] = 32
 
 #: HTTP statuses worth retrying. 429 is rate limiting; 5xx is the endpoint
-#: having a bad minute. A 400 or 404 is a request this code got wrong and
-#: retrying it just wastes the quota.
-RETRY_STATUS: Final[frozenset[int]] = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+#: having a bad minute; 403 is included because this gateway returns a bare
+#: HTML "403 Forbidden" when it is throttling a burst - that clears on its own
+#: and must be waited out, not treated as fatal.
+RETRY_STATUS: Final[frozenset[int]] = frozenset(
+    {403, 408, 409, 425, 429, 500, 502, 503, 504}
+)
 
 #: Statuses that mean "this key is out of budget", as opposed to "slow down".
-#: These get the long cooldown, because retrying in four seconds is pointless.
-QUOTA_STATUS: Final[frozenset[int]] = frozenset({402, 403})
+#: 403 is deliberately NOT here: a bare gateway 403 is a transient burst block,
+#: and treating it as an exhausted quota retired every key on the first
+#: over-eager run and stalled the whole pipeline for 15 minutes. A true quota
+#: 403 carries a JSON body with one of _QUOTA_HINTS, which _is_quota checks.
+QUOTA_STATUS: Final[frozenset[int]] = frozenset({402})
+
+#: A bare gateway block (HTML "403 Forbidden" with no JSON body). The account
+#: returns this when too many requests arrive at once, and it persists for a
+#: few minutes if provoked, so it earns a longer back-off than an ordinary
+#: 429.
+_GATEWAY_BLOCK: Final[str] = "403 Forbidden"
 
 #: Base and cap of the exponential backoff, in seconds.
 BACKOFF_BASE: Final[float] = 4.0
 BACKOFF_CAP: Final[float] = 120.0
+
+#: Longer base backoff for a gateway block, which needs minutes not seconds.
+GATEWAY_BACKOFF_BASE: Final[float] = 20.0
 
 #: Cooldown applied to a key that reports an exhausted quota. Long, because the
 #: alternative is burning the run's wall-clock on a key that cannot serve it.
@@ -85,6 +101,18 @@ _QUOTA_HINTS: Final[tuple[str, ...]] = (
 
 class GenerationError(RuntimeError):
     """Raised when a sample could not be generated after every attempt."""
+
+
+class FatalRequestError(GenerationError):
+    """Raised when the request itself is invalid, so no key will serve it.
+
+    Separate from :class:`GenerationError` because the two demand opposite
+    responses. A transport failure or a throttle is *this key's* problem and
+    the sample should be handed to another key; a 400 is the request's problem
+    and will be rejected identically by every key, so retrying it three times
+    only delays the error. Kimi K3 refusing any ``top_p`` other than 0.95 is
+    exactly this case.
+    """
 
 
 def load_api_keys(env_var: str, keys_file: Path | None = None) -> list[str]:
@@ -340,6 +368,7 @@ class KeyWorker:
         "_config",
         "_min_interval",
         "_next_slot",
+        "_pace_lock",
     )
 
     def __init__(self, key: str, *, base_url: str, timeout: float, rpm: int) -> None:
@@ -372,6 +401,10 @@ class KeyWorker:
         )
         self._min_interval = 60.0 / rpm if rpm > 0 else 0.0
         self._next_slot = 0.0
+        # Guards the slot reservation so several threads may share one key
+        # without exceeding its rate: workers_per_key > 1 fills the rate budget
+        # during slow replies, and this lock keeps the combined rate at rpm.
+        self._pace_lock = threading.Lock()
 
     @property
     def cooling(self) -> bool:
@@ -379,16 +412,21 @@ class KeyWorker:
         return time.monotonic() < self.cooldown_until
 
     def _pace(self) -> None:
-        """Sleep until this key is allowed to issue its next request."""
-        now = time.monotonic()
-        if self.cooldown_until > now:
-            time.sleep(self.cooldown_until - now)
-        if self._min_interval <= 0.0:
-            return
-        wait = self._next_slot - time.monotonic()
+        """Sleep until this key is allowed to issue its next request.
+
+        The slot is *reserved* under the lock and the sleep happens outside it,
+        so N threads sharing a key take N consecutive slots spaced by
+        ``_min_interval`` rather than all waking at once - the combined rate
+        stays at ``rpm`` however many threads share the key.
+        """
+        with self._pace_lock:
+            now = time.monotonic()
+            start = max(now, self._next_slot, self.cooldown_until)
+            wait = start - now
+            # The next thread's slot is one interval after this one's.
+            self._next_slot = start + self._min_interval
         if wait > 0.0:
             time.sleep(wait)
-        self._next_slot = time.monotonic() + self._min_interval
 
     def complete(
         self,
@@ -450,17 +488,20 @@ class KeyWorker:
                     )
                     raise GenerationError(f"key {self.label} is out of quota") from error
                 if status is not None and status not in RETRY_STATUS:
-                    raise GenerationError(
+                    raise FatalRequestError(
                         f"API rejected the request ({status}): {message}"
                     ) from error
-                delay = _retry_after_seconds(error) or min(
-                    BACKOFF_CAP, BACKOFF_BASE * 2**attempt
-                )
+                gateway = _GATEWAY_BLOCK in message
+                base = GATEWAY_BACKOFF_BASE if gateway else BACKOFF_BASE
+                delay = _retry_after_seconds(error) or min(BACKOFF_CAP, base * 2**attempt)
                 delay += rng.uniform(0.0, 1.5)
                 self.throttled += 1
-                last_error = (
-                    f"transport error ({status or 'connection'}): {message[:160]}"
+                kind = (
+                    "gateway block"
+                    if gateway
+                    else f"transport error ({status or 'connection'})"
                 )
+                last_error = f"{kind}: {message[:120]}"
                 LOGGER.warning(
                     "key %s: %s -- waiting %.1fs", self.label, last_error, delay
                 )

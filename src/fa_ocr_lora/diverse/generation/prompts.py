@@ -53,9 +53,14 @@ SYSTEM_PROMPT: Final[str] = (
 #: for "a bulleted list" writes one and a model handed a JSON schema writes
 #: JSON.
 _FEATURE_TEXT: Final[Mapping[str, str]] = {
+    # Phone-like numbers are deliberately absent. The spec listed them, but a
+    # ten- or eleven-digit string shaped like an Iranian mobile number is a
+    # liability in a published corpus even when invented - and the first live
+    # run produced exactly one (۰۹۱۲۳۴۵۶۷۸۹), which stage 03's PII filter
+    # rejected. A date or an amount trains digit recognition identically.
     "numbers": (
-        "چند عدد واقعی‌نما در متن بیاور: تاریخ، مبلغ، درصد، اندازه یا شماره. "
-        "همه اعداد باید ساختگی باشند"
+        "چند عدد واقعی‌نما در متن بیاور: تاریخ، مبلغ، درصد، اندازه یا شماره صفحه. "
+        "همه اعداد باید ساختگی باشند. شماره تلفن و کد ملی ننویس"
     ),
     "latin_terms": (
         "چند اصطلاح انگلیسی یا لاتین را در جای طبیعی خود در متن فارسی به کار ببر"
@@ -219,6 +224,16 @@ def build_prompt(plan: Plan) -> str:
             "طبیعی و در معنای درست خودش بیاور:"
         )
         lines.append("، ".join(plan.words))
+        # The escape hatch for an unknown word. Without it the model either
+        # guesses a meaning and glosses it in English, or garbles the spelling
+        # - both of which make the sample unusable, because the label is the
+        # word that was asked for.
+        lines.append(
+            "املای این واژه‌ها را عیناً همان‌طور که نوشته شده‌اند بنویس و حتی یک "
+            "حرف آن را تغییر نده. اگر معنای واژه‌ای را نمی‌دانی، آن را در جمله‌ای "
+            "کلی و بی‌خطر به کار ببر، اما هرگز آن را با واژه دیگری عوض نکن و "
+            "معنایش را حدس نزن."
+        )
         if plan.off_domain:
             lines.append(
                 "بعضی از این واژه‌ها به موضوع متن نزدیک نیستند؛ با خلاقیت "

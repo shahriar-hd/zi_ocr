@@ -37,6 +37,7 @@ from ..config import DiverseConfig, load_diverse_config
 from ..planning.sampler import Plan, read_plans
 from .client import (
     Completion,
+    FatalRequestError,
     GenerationError,
     KeyWorker,
     ResponseCache,
@@ -215,11 +216,12 @@ def generate_texts(
         len(pending),
     )
     LOGGER.info(
-        "%d API key(s) [%s], %d profile(s), %d rpm/key",
+        "%d API key(s) [%s], %d profile(s), %d rpm/key, %d worker(s)/key",
         len(api_keys),
         ", ".join(mask_key(key) for key in api_keys),
         len(profiles),
         config.generation.rpm,
+        config.generation.workers_per_key,
     )
     if not pending:
         return counters
@@ -242,8 +244,21 @@ def generate_texts(
         work.put(plan)
 
     stop = threading.Event()
-    retired: list[str] = []
+    #: Keys retired because their quota is exhausted. A set of labels, not a
+    #: list, because several threads share one key and would each try to retire
+    #: it; the run ends only when every distinct key is in here.
+    retired: set[str] = set()
     retire_lock = threading.Lock()
+    #: How many times each plan has been handed back to the queue. A failing
+    #: sample must be retried on another key - the first key may simply be
+    #: throttled - but it must not be retried forever: a sample that fails on
+    #: every key (a model that returns empty for that prompt, say) would
+    #: otherwise bounce between workers and the run would never finish. The
+    #: first version of this loop had exactly that bug and hung with three
+    #: samples outstanding.
+    requeues: Counter[str] = Counter()
+    requeue_lock = threading.Lock()
+    max_requeues = max(2, len(api_keys))
     log_every = max(1, len(pending) // 40)
     started = time.monotonic()
 
@@ -285,12 +300,19 @@ def generate_texts(
                         max_retries=config.generation.max_retries,
                         rng=rng,
                     )
+                except FatalRequestError as error:
+                    # The request is invalid, so no other key will serve it.
+                    # Requeueing would only repeat the same 400 once per key.
+                    counters.record_failure()
+                    LOGGER.error("%s: %s", plan.plan_id, error)
+                    continue
                 except GenerationError as error:
-                    # Put the sample back: another key can still serve it.
-                    work.put(plan)
                     if worker.cooling:
+                        # The key is out of quota, not the sample's fault:
+                        # hand it back unconditionally and retire this key.
+                        work.put(plan)
                         with retire_lock:
-                            retired.append(worker.label)
+                            retired.add(worker.label)
                             alive = len(workers) - len(retired)
                         LOGGER.warning(
                             "key %s retired (%d key(s) still working)",
@@ -301,10 +323,28 @@ def generate_texts(
                             LOGGER.error("every key is in cooldown; stopping")
                             stop.set()
                         return
-                    LOGGER.warning("%s: %s", plan.plan_id, error)
-                    # The sample went back on the queue, so do not count it as
-                    # failed yet; it is only failed if the queue drains with it
-                    # still unserved, which the final tally catches.
+                    with requeue_lock:
+                        requeues[plan.plan_id] += 1
+                        attempts = requeues[plan.plan_id]
+                    if attempts < max_requeues:
+                        # Another key may do better; this one may just be
+                        # having a bad minute.
+                        work.put(plan)
+                        LOGGER.warning(
+                            "%s: %s -- requeued (%d/%d)",
+                            plan.plan_id,
+                            error,
+                            attempts,
+                            max_requeues,
+                        )
+                    else:
+                        counters.record_failure()
+                        LOGGER.error(
+                            "%s: %s -- giving up after %d key(s)",
+                            plan.plan_id,
+                            error,
+                            attempts,
+                        )
                     continue
                 except Exception:  # noqa: BLE001 - a thread must not die silently
                     LOGGER.exception(
@@ -329,12 +369,21 @@ def generate_texts(
                     counters.failed,
                 )
 
-    LOGGER.info("Starting %d worker thread(s), one per key", len(workers))
+    LOGGER.info(
+        "Starting %d worker thread(s): %d key(s) x %d/key",
+        len(workers) * config.generation.workers_per_key,
+        len(workers),
+        config.generation.workers_per_key,
+    )
     threads = [
         threading.Thread(
-            target=run_key, args=(worker,), name=f"key-{worker.label}", daemon=True
+            target=run_key,
+            args=(worker,),
+            name=f"key-{worker.label}-{slot}",
+            daemon=True,
         )
         for worker in workers
+        for slot in range(config.generation.workers_per_key)
     ]
     for thread in threads:
         thread.start()

@@ -490,19 +490,37 @@ class PlanSampler:
 
         chosen: list[LexiconEntry] = []
         seen: set[str] = set()
-        for _ in range(count * 3):
+        very_rare_used = 0
+        very_rare_cap = plan_config.max_very_rare_per_prompt
+        for _ in range(count * 6):
             if len(chosen) >= count:
                 break
             era = weighted_choice(era_pool, rng)
             band = weighted_choice(band_pool, rng) if band_pool else "rare"
+            # Cap the very rarest words per prompt. A request made entirely of
+            # words the model has never seen degenerates into other scripts
+            # and Latin transliteration; a couple among commoner words gives it
+            # an anchor to write around. Over-quota draws ask for `rare`
+            # instead, which keeps corpus-level rarity without breaking the
+            # sample.
+            if band == "very_rare" and very_rare_used >= very_rare_cap:
+                band = "rare"
             domain = None
             if off_domain and self._by_domain:
                 domain = rng.choice(sorted(self._by_domain))
             entry = self._draw_word(rng, era=era, band=band, domain=domain)
             if entry is None or entry.word_id in seen:
                 continue
+            # Enforced on the entry, not on the requested band: _draw_word
+            # falls back through broader tiers when a band is thin, and those
+            # tiers are not band-filtered, so a `rare` request can legitimately
+            # return a very_rare word.
+            if entry.freq_band == "very_rare" and very_rare_used >= very_rare_cap:
+                continue
             seen.add(entry.word_id)
             chosen.append(entry)
+            if entry.freq_band == "very_rare":
+                very_rare_used += 1
 
         for entry in chosen:
             self.uses[entry.word_id] += 1
