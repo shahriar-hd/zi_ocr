@@ -217,7 +217,10 @@ _ARABIC_TO_PERSIAN: Final[Mapping[str, str]] = {
     "\u06bb": "\u0646",
     "\u06bc": "\u0646",
     "\u06be": "\u0647",
-    "\u0624": "\u0648\u0654",  # WAW WITH HAMZA stays visible as waw + hamza
+    # ``ؤ`` (U+0624) is deliberately NOT folded. An earlier version mapped it to
+    # waw plus a combining hamza, which strip_diacritics then removed - turning
+    # مؤسسه into موسسه and corrupting the label of every word spelled with it.
+    # It is standard Persian orthography with its own glyph, so it is content.
 }
 
 #: Characters whose Unicode name starts with one of these is Persian/Arabic
