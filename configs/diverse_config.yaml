@@ -312,22 +312,23 @@ generation:
   #
   # Measured, not guessed. At 40 the account returned a steady stream of 429s
   # across all three keys and throughput collapsed as the backoff took over.
-  # 15 keeps each key inside its limit.
-  rpm: 15
+  # 20 with workers_per_key 4 sustained ~11 samples/min over a 4-minute probe
+  # with zero throttle events and zero gateway blocks.
+  rpm: 20
   # Concurrent requests sharing one API key.
   #
   # The throughput bottleneck is latency, not the rate limit: a full-page
   # generation takes 20-40s, so one serial request per key reaches only ~2/min
-  # per key and leaves most of the 15 rpm budget unused. A little overlap fills
-  # that budget - the per-key pacer still holds the combined rate to `rpm`.
+  # per key and leaves most of the rpm budget unused. Overlapping requests fill
+  # that budget - the per-key pacer reserves slots under a lock, so the
+  # combined rate stays at `rpm` however many threads share the key.
   #
-  # Kept small on purpose. This endpoint's gateway returns a bare HTML "403
-  # Forbidden" and then blocks the account for minutes when too many requests
-  # arrive at once: 5 x 3 = 15 concurrent got the whole account banned on the
-  # first try. 2 x 3 = 6 concurrent is the cautious setting; raise it only if a
-  # test run stays clean, and watch for "gateway block" warnings, which mean
-  # back off.
-  workers_per_key: 2
+  # 4 x 3 keys = 12 concurrent, measured at 11.2 samples/min with no gateway
+  # complaints. Do not raise this casually: an early run with a racy pacer
+  # fired 15 requests simultaneously and earned an account-level gateway ban
+  # (bare HTML "403 Forbidden") that outlasted five minutes of waiting. If
+  # "gateway block" appears in the log, lower it.
+  workers_per_key: 4
   max_retries: 6
   timeout_s: 180.0
   # On-disk response cache keyed by prompt_hash + profile + seed. A re-run
