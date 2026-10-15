@@ -88,6 +88,36 @@ _STYLE_BY_CATEGORY: Final[dict[str, dict[str, float]]] = {
 #: dark modes; paper does not.
 _DARK_PROBABILITY: Final[dict[str, float]] = {"chat": 0.38, "web": 0.14, "line": 0.10}
 
+#: Stage 03 fields the manifest needs. Copied verbatim into the spec rather
+#: than re-derived, because stage 05 writes the manifest's source record and
+#: has no other access to the text's provenance.
+_META_KEYS: Final[tuple[str, ...]] = (
+    "genre",
+    "register",
+    "persona",
+    "length_target",
+    "output_form",
+    "features",
+    "digit_script",
+    "digit_density",
+    "has_zwnj",
+    "has_diacritics",
+    "arabic_forms",
+    "lexicon_word_ids",
+    "lexicon_words",
+    "domain_tags",
+    "word_eras",
+    "word_bands",
+    "rare_word_count",
+    "lexicon_hit_rate",
+    "llm_model",
+    "profile",
+    "temperature",
+    "prompt_hash",
+    "persian_ratio",
+    "index",
+)
+
 #: Share of samples rendered with the held-out font families. Small, because
 #: these samples leave the train split entirely - they exist only so
 #: ``test_unseen_fonts`` has something to measure. Too large and the corpus
@@ -99,8 +129,12 @@ def holdout_templates(config: DiverseConfig) -> frozenset[str]:
     """Choose the templates reserved for ``test_unseen_templates``.
 
     Decided by hashing the template id rather than by shuffling, so the same
-    templates are held out on every machine and in every run. A holdout that
+    templates are held out on every machine and in every run - a holdout that
     moved between runs would make the hard test incomparable with itself.
+
+    The count is a total, not per category. One template per category is 10 of
+    41, which routed 22.8% of the corpus into a hard test and took that much
+    layout variety out of training; four templates is about 3%.
 
     Args:
         config: The active configuration.
@@ -108,22 +142,35 @@ def holdout_templates(config: DiverseConfig) -> frozenset[str]:
     Returns:
         The reserved template ids.
     """
-    per_category = config.splits.holdout_templates_per_category
-    if per_category <= 0:
+    wanted = config.splits.holdout_templates
+    if wanted <= 0:
         return frozenset()
-    reserved: set[str] = set()
+
+    # Every template except the last of any category: a category whose only
+    # template were held out would leave train nothing to render.
+    eligible: list[str] = []
     for ids in TEMPLATE_IDS.values():
-        if len(ids) <= 1:
-            # A category with one template cannot hold it out: train would
-            # have nothing left to render.
+        if len(ids) > 1:
+            eligible.extend(ids)
+
+    ranked = sorted(
+        eligible,
+        key=lambda name: hashlib.blake2b(
+            f"{config.splits.split_salt}:{name}".encode(), digest_size=8
+        ).hexdigest(),
+    )
+    owner = {name: category for category, ids in TEMPLATE_IDS.items() for name in ids}
+    taken: Counter[str] = Counter()
+    reserved: list[str] = []
+    for name in ranked:
+        if len(reserved) >= wanted:
+            break
+        category = owner[name]
+        # Never take every template a category has, however the hashes fall.
+        if taken[category] + 1 >= len(TEMPLATE_IDS[category]):
             continue
-        ranked = sorted(
-            ids,
-            key=lambda name: hashlib.blake2b(
-                f"{config.splits.split_salt}:{name}".encode(), digest_size=8
-            ).hexdigest(),
-        )
-        reserved.update(ranked[: min(per_category, len(ids) - 1)])
+        reserved.append(name)
+        taken[category] += 1
     return frozenset(reserved)
 
 
@@ -249,6 +296,7 @@ def build_spec(
         dark_mode=dark,
         aug=aug,
         text_render=text,
+        meta={key: record[key] for key in _META_KEYS if key in record},
         seed=config.seed,
     )
 

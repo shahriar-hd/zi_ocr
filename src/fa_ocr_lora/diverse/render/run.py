@@ -209,6 +209,8 @@ def _write_sample(
     target = image_path(config, spec.sample_id, suffix)
     write_bytes(target, payload)
     record = annotation.as_dict()
+    # The text's provenance first, so a later key cannot shadow the geometry.
+    record.update(dict(spec.meta))
     record.update(
         {
             "image_path": str(target.relative_to(config.paths.work_dir)),
@@ -362,6 +364,7 @@ def render_batch(
         aug = dict(degraded.aug)
         aug.update(
             {
+                "clean": spec.clean,
                 "overflowed": result.overflowed,
                 "holdout_template": bool(spec.aug.get("holdout_template")),
                 "holdout_font": bool(spec.aug.get("holdout_font")),
@@ -388,6 +391,7 @@ def render_batch(
                 target = image_path(config, crop.sample_id, suffix)
                 write_bytes(target, crop.payload)
                 record = crop.annotation.as_dict()
+                record.update(dict(spec.meta))
                 # `overflowed` deliberately does not propagate. A crop is cut
                 # from pixels that are inside the canvas by construction, so a
                 # line taken from the visible part of an overflowing page is a

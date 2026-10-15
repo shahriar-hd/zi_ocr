@@ -581,12 +581,20 @@ splits:
   split_salt: ""
   # The two hard tests that measure what the previous dataset could not.
   # Samples matching a holdout are moved out of train entirely.
-  holdout_templates_per_category: 1
+  # Total templates reserved for test_unseen_templates, across all categories.
+  # One per category was 10 of 41 templates and routed 22% of the corpus into
+  # a hard test; four is about 3%, which is plenty to measure with.
+  holdout_templates: 4
   # Optional third hard test: text from a generation profile unused in train.
   # kimi_warm is the natural choice - it is the only non-Nemotron profile, so
   # holding it out measures generalisation across model families rather than
   # across two temperatures of the same model.
   holdout_generator: kimi_warm
+  # Ceiling on each test_unseen_* split. Crops amplify - one held-out page
+  # carries ~25 of them - so a 12%-weighted generator produced a 21% test
+  # split. Groups past this are dropped, not moved to train: their font,
+  # template or generator is meant to be unseen.
+  max_holdout_samples: 2000
 
 packaging:
   output_dir: data/diverse/hf

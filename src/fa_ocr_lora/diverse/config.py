@@ -1980,17 +1980,28 @@ class SplitsConfig:
         ratios: Train/validation/test shares.
         group_by: Manifest column tying a page to its crops and siblings.
         split_salt: Changes the deal without changing the ratios.
-        holdout_templates_per_category: Templates reserved for
-            ``test_unseen_templates``.
+        holdout_templates: Total templates reserved for
+            ``test_unseen_templates``, across all categories. A *total* rather
+            than a per-category count because the per-category version was
+            unpredictable: one template per category is 10 of 41 templates,
+            which routed 22% of the corpus into a hard test and took that much
+            layout variety out of training. Four templates is about 3%.
         holdout_generator: Generation profile reserved for
             ``test_unseen_generator``; ``""`` disables that split.
+        max_holdout_samples: Ceiling on each ``test_unseen_*`` split. Groups
+            beyond it are dropped rather than moved to train, because a sample
+            whose font, template or generator is meant to be unseen cannot be
+            trained on. A ceiling is needed because crops amplify: one held-out
+            page drags roughly twenty-five line and paragraph crops with it, so
+            a 12%-weighted generator produced a 21% test split.
     """
 
     ratios: dict[str, float]
     group_by: str
     split_salt: str
-    holdout_templates_per_category: int
+    holdout_templates: int
     holdout_generator: str
+    max_holdout_samples: int
 
     @classmethod
     def from_dict(cls, payload: Any) -> SplitsConfig:
@@ -2012,15 +2023,16 @@ class SplitsConfig:
                 "ratios",
                 "group_by",
                 "split_salt",
-                "holdout_templates_per_category",
+                "holdout_templates",
                 "holdout_generator",
+                "max_holdout_samples",
             ),
         )
-        holdout = section.get("holdout_templates_per_category", 1)
+        holdout = section.get("holdout_templates", 4)
         if isinstance(holdout, bool) or not isinstance(holdout, int) or holdout < 0:
             raise ConfigError(
-                "splits.holdout_templates_per_category: expected a non-negative "
-                f"whole number, got {holdout!r}"
+                "splits.holdout_templates: expected a non-negative whole number, "
+                f"got {holdout!r}"
             )
         return cls(
             ratios=_weights(
@@ -2033,9 +2045,12 @@ class SplitsConfig:
             ),
             group_by=_text(section.get("group_by"), "splits.group_by", "group_id"),
             split_salt=_text(section.get("split_salt"), "splits.split_salt", ""),
-            holdout_templates_per_category=holdout,
+            holdout_templates=holdout,
             holdout_generator=_text(
                 section.get("holdout_generator"), "splits.holdout_generator", ""
+            ),
+            max_holdout_samples=_positive_int(
+                section.get("max_holdout_samples"), "splits.max_holdout_samples", 2000
             ),
         )
 

@@ -277,6 +277,11 @@ class RenderSpec:
             interpreted by :mod:`fa_ocr_lora.diverse.render.degrade`.
         text_render: The exact label, carried through so stage 05 can verify
             the harvest reproduces it.
+        meta: The stage 03 record's metadata - genre, register, persona, digit
+            script, lexicon words, generating model. Carried verbatim because
+            the manifest needs it and stage 05 is the last place that sees both
+            the text's provenance and the rendered pixels. Fifteen manifest
+            columns shipped empty before this field existed.
         seed: Per-sample seed, so rendering is reproducible in isolation.
     """
 
@@ -295,6 +300,7 @@ class RenderSpec:
     dark_mode: bool
     aug: Mapping[str, Any]
     text_render: str
+    meta: Mapping[str, Any]
     seed: int
 
     @property
@@ -325,6 +331,7 @@ class RenderSpec:
             "dark_mode": self.dark_mode,
             "aug": dict(self.aug),
             "text_render": self.text_render,
+            "meta": dict(self.meta),
             "seed": self.seed,
         }
 
@@ -355,5 +362,6 @@ class RenderSpec:
             dark_mode=bool(payload.get("dark_mode", False)),
             aug=dict(payload.get("aug", {})),
             text_render=str(payload["text_render"]),
+            meta=dict(payload.get("meta", {})),
             seed=int(payload["seed"]),
         )
