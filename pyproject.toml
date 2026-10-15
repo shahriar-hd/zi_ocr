@@ -208,6 +208,9 @@ ignore = [
 # describe the framework's protocol rather than the cell's value. The signatures
 # are the tool's output, not code written here.
 "notebooks/molab_train.py" = ["ANN202"]
+# notebooks/molab_diverse_render.py is the same: a marimo notebook whose cell
+# signatures are written by the framework.
+"notebooks/molab_diverse_render.py" = ["ANN202"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
