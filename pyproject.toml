@@ -172,6 +172,12 @@ ignore = [
 # noise without adding information.
 "test/*" = ["D100", "D101", "D102", "D103", "ANN"]
 "scripts/*" = ["D100", "D103"]
+# src/fa_ocr_lora/diverse/layouts/templates.py builds HTML in f-strings. A
+# style rule or an attribute list split across lines to satisfy a column limit
+# is harder to read and easier to break than the same fragment left whole -
+# the reader needs to see `style="..."` as one thing. E501 only; every other
+# rule still applies, and the surrounding Python stays at 90 columns.
+"src/fa_ocr_lora/diverse/layouts/templates.py" = ["E501"]
 # notebooks/*.py are jupytext "percent format" sources: one linear script whose
 # `# %%` blocks become notebook cells (see scripts/build_training_notebook.py).
 # The exemptions below are notebook idiom, not slack:

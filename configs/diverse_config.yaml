@@ -269,36 +269,44 @@ generation:
   # weights lives in reports/diverse/model_ranking.json; regenerate it with
   # scripts/evaluate_diverse_models.py before any scale-up.
   #
-  # Measured clean-rate (fraction that survives stage 03) over the ranking set:
+  # The weights below come from a 150-sample production run scored by stage 03,
+  # which is better evidence than any prompt-set probe. Rejection rate by
+  # profile, with sample sizes:
   #
-  #   nemotron-3-ultra-550b   100% / 83%   fast (4.7s)   <- lead, and Nemotron
-  #   gemma-4-31b-it          100%         fast (5.5s)   <- diversity, clean
-  #   kimi-k3                 100%         slow (16s)    <- holdout generator
-  #   nemotron-3-super-120b    50%         leaks 7 scripts   REMOVED
+  #   gemma_warm            (gemma-4-31b,     t=0.70)   36 samples    0.0%
+  #   kimi_warm             (kimi-k3,         t=0.70)   11 samples    0.0%
+  #   nemotron_ultra_cool   (nemotron-ultra,  t=0.40)   25 samples   16.0%
+  #   nemotron_ultra_warm   (nemotron-ultra,  t=0.65)   78 samples   30.8%
   #
-  # nemotron-3-super was in the first draft and is gone: at a 50-74% rejection
-  # rate it burned half the API budget on samples stage 03 discarded. ultra is
-  # also Nemotron, so the "Nemotron is better for my case" preference holds
-  # while the waste does not. Two ultra temperatures give sampling variety; a
-  # second model family (gemma) and a third (kimi) give generator variety,
-  # which is the point - one generator's style becomes the thing the model
-  # learns.
+  # Two things follow. Temperature dominates: the same Nemotron model rejects
+  # at 31% warm and 16% cool, so the warm profile drops to 0.50. And model
+  # family dominates more: gemma and kimi leaked no foreign script at all,
+  # while Nemotron still does. Nemotron keeps ~42% of the volume because it is
+  # the preferred and fastest family, but it no longer carries the run.
+  #
+  # Expected blended rejection: roughly 7%, against 18.7% measured before this
+  # retune and 52.7% before the temperature and word-count fixes.
   profiles:
-    - name: nemotron_ultra_warm
-      model: nvidia/nemotron-3-ultra-550b-a55b
-      temperature: 0.65
-      top_p: 0.90
-      weight: 0.44
-    - name: nemotron_ultra_cool
-      model: nvidia/nemotron-3-ultra-550b-a55b
-      temperature: 0.40
-      top_p: 0.70
-      weight: 0.20
     - name: gemma_warm
       model: google/gemma-4-31b-it
-      temperature: 0.70
+      temperature: 0.75
       top_p: 0.92
-      weight: 0.24
+      weight: 0.30
+    - name: gemma_cool
+      model: google/gemma-4-31b-it
+      temperature: 0.45
+      top_p: 0.80
+      weight: 0.16
+    - name: nemotron_ultra_warm
+      model: nvidia/nemotron-3-ultra-550b-a55b
+      temperature: 0.50
+      top_p: 0.88
+      weight: 0.30
+    - name: nemotron_ultra_cool
+      model: nvidia/nemotron-3-ultra-550b-a55b
+      temperature: 0.35
+      top_p: 0.70
+      weight: 0.12
     - name: kimi_warm
       model: moonshotai/kimi-k3
       temperature: 0.70
