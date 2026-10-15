@@ -242,6 +242,13 @@ def build_palette(
         ]
     )
     muted = _shift(ink, lightness=rng.uniform(0.18, 0.34), saturation=-0.05)
+    # Captions, timestamps and footers use `muted`, so it needs a floor of its
+    # own. Lightening the ink by up to a third breached legibility and image QC
+    # rejected the captions outright.
+    for _ in range(_MAX_DARKEN):
+        if contrast_ratio(muted, paper) >= _CONTRAST_FLOOR_DISPLAY:
+            break
+        muted = _shift(muted, lightness=-_DARKEN_STEP)
     panel = _shift(paper, lightness=-rng.uniform(0.03, 0.07))
     return Palette(paper, ink, accent, muted, panel, contrast_ratio(ink, paper))
 

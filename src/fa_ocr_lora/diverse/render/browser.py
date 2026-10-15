@@ -128,27 +128,54 @@ def _to_annotation(
     """
 
     def polygon(box: Mapping[str, float]) -> tuple[tuple[float, float], ...]:
-        """Scale one harvested box into a device-pixel rectangle."""
+        """Scale one harvested box into a device-pixel rectangle.
+
+        Both edges are clamped, not only the lower one. An overflowing
+        template - a fixed-height page whose content is taller than its
+        canvas - reports lines below the visible area, and clamping just the
+        bottom edge leaves a box whose top is inside and bottom outside, which
+        trips the schema's canvas invariant and loses the whole sample.
+        """
         return rectangle(
-            max(0.0, float(box["x0"]) * scale),
-            max(0.0, float(box["y0"]) * scale),
-            min(float(width), float(box["x1"]) * scale),
-            min(float(height), float(box["y1"]) * scale),
+            min(max(0.0, float(box["x0"]) * scale), float(width)),
+            min(max(0.0, float(box["y0"]) * scale), float(height)),
+            min(max(0.0, float(box["x1"]) * scale), float(width)),
+            min(max(0.0, float(box["y1"]) * scale), float(height)),
+        )
+
+    def visible(box: Mapping[str, float]) -> bool:
+        """Report whether a harvested box has any area inside the canvas.
+
+        A line entirely past an overflowing page's fold is not in the image, so
+        a label claiming it would describe text the pixels do not show. Such
+        lines are dropped here; the sample is still flagged ``overflowed`` and
+        image QC rejects it.
+        """
+        return (
+            float(box["y0"]) * scale < height - 0.5
+            and float(box["x0"]) * scale < width - 0.5
+            and float(box["y1"]) * scale > 0.5
+            and float(box["x1"]) * scale > 0.5
         )
 
     lines: list[Line] = []
-    for order, record in enumerate(harvest.get("lines", ())):
+    for record in harvest.get("lines", ()):
+        if not visible(record["box"]):
+            continue
         words: tuple[Word, ...] = ()
         if want_words:
             words = tuple(
                 Word(text=str(item["text"]), polygon=polygon(item["box"]))
                 for item in record.get("words", ())
+                if visible(item["box"])
             )
         lines.append(
             Line(
                 text=str(record["text"]),
                 polygon=polygon(record["box"]),
-                reading_order=order,
+                # Renumbered over the surviving lines, so reading order remains
+                # a contiguous permutation after any were dropped.
+                reading_order=len(lines),
                 direction=str(record.get("direction", "rtl")),
                 block_index=int(record.get("block_index", -1)),
                 words=words,
@@ -156,7 +183,9 @@ def _to_annotation(
         )
 
     blocks: list[Block] = []
-    for order, record in enumerate(harvest.get("blocks", ())):
+    for record in harvest.get("blocks", ()):
+        if not visible(record["box"]):
+            continue
         try:
             block_type = BlockType(str(record.get("type", "other")))
         except ValueError:
@@ -165,7 +194,7 @@ def _to_annotation(
             Block(
                 block_type=block_type,
                 polygon=polygon(record["box"]),
-                reading_order=order,
+                reading_order=len(blocks),
                 line_indices=tuple(
                     int(value) for value in record.get("line_indices", ())
                 ),

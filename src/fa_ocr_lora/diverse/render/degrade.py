@@ -611,7 +611,11 @@ def _light_field(
 
 
 def _add_noise(
-    image: Any, config: DegradationConfig, rng: random.Random, chosen: set[str]
+    image: Any,
+    config: DegradationConfig,
+    rng: random.Random,
+    chosen: set[str],
+    ink_budget: float = 1.0,
 ) -> tuple[Any, dict[str, Any]]:
     """Add sensor noise, specks and optional blur.
 
@@ -620,6 +624,9 @@ def _add_noise(
         config: Degradation settings.
         rng: The sample's seeded RNG.
         chosen: Effects selected for this sample.
+        ink_budget: How much ink the type can afford to lose, 0 to 1. Scales
+            the blur radius, since a 1px stroke does not survive what a 3px
+            stroke shrugs off.
 
     Returns:
         ``(image, record)``.
@@ -628,7 +635,7 @@ def _add_noise(
     record: dict[str, Any] = {}
 
     if "blur" in chosen:
-        radius = config.strength["blur_radius"].draw(rng)
+        radius = config.strength["blur_radius"].draw(rng) * ink_budget
         image = image.filter(ImageFilter.GaussianBlur(radius))
         record["blur_radius"] = round(radius, 3)
 
@@ -715,7 +722,11 @@ def _add_noise(
 
 
 def _resample(
-    image: Any, config: DegradationConfig, rng: random.Random, chosen: set[str]
+    image: Any,
+    config: DegradationConfig,
+    rng: random.Random,
+    chosen: set[str],
+    ink_budget: float = 1.0,
 ) -> tuple[Any, dict[str, Any]]:
     """Downscale and re-upscale, imitating a low-resolution capture.
 
@@ -724,6 +735,9 @@ def _resample(
         config: Degradation settings.
         rng: The sample's seeded RNG.
         chosen: Effects selected for this sample.
+        ink_budget: How much ink the type can afford to lose, 0 to 1. Raises
+            the downscale floor for small type, which is the effect that
+            destroys thin strokes most.
 
     Returns:
         ``(image, record)``. The canvas size is unchanged, so annotations stay
@@ -732,7 +746,14 @@ def _resample(
     Image, _, _, _, _ = _require_pillow()
     if "rescale" not in chosen:
         return image, {}
+    # Downscaling is the harshest effect on thin strokes, so the floor rises
+    # as the type gets smaller: at low ink budget the page is barely resampled.
+    floor = config.strength["rescale"].minimum
     factor = config.strength["rescale"].draw(rng)
+    factor = (
+        floor + (factor - floor) * ink_budget + (1.0 - ink_budget) * (1.0 - floor) * 0.6
+    )
+    factor = min(0.99, max(floor, factor))
     width, height = image.size
     small = (max(16, int(width * factor)), max(16, int(height * factor)))
     image = image.resize(small, Image.Resampling.BILINEAR).resize(
@@ -791,6 +812,7 @@ def apply_degradation(
     verso_png: bytes | None = None,
     verso_id: str = "",
     keep_background: bool = True,
+    text_height_px: float = 32.0,
 ) -> DegradeResult:
     """Degrade one rendered page.
 
@@ -807,6 +829,12 @@ def apply_degradation(
         keep_background: Whether the page already carries its own background.
             Templates paint their own, so the paper layer is multiplied in
             rather than composited behind.
+        text_height_px: Height of the smallest rendered line. The effects that
+            eat ink - blur, ink bleed and downscaling - are scaled by it,
+            because a 1px stroke at 11px type does not survive what a 3px
+            stroke at 30px type shrugs off. Without this, 64 samples came back
+            from image QC as illegible pale text, which is a wrong label rather
+            than hard training data.
 
     Returns:
         The degraded image and its record.
@@ -833,6 +861,13 @@ def apply_degradation(
         for name, probability in config.probabilities.items()
         if rng.random() < probability
     }
+    # How much ink this sample can afford to lose. 1.0 at 32px type and above;
+    # small type gets proportionally gentler treatment, and very small type is
+    # exempted from the destructive effects entirely.
+    ink_budget = min(1.0, max(0.0, (text_height_px - 9.0) / 23.0))
+    if ink_budget < 0.35:
+        chosen -= {"blur", "rescale", "ink_bleed", "moire"}
+    aug["ink_budget"] = round(ink_budget, 3)
     aug["effects"] = sorted(chosen)
 
     # --- behind the ink: paper, wash, watermark, show-through -------------
@@ -850,8 +885,8 @@ def apply_degradation(
     # --- the ink itself ---------------------------------------------------
     if "ink_bleed" in chosen:
         _, _, _, ImageFilter, _ = _require_pillow()
-        bleed = image.filter(ImageFilter.GaussianBlur(rng.uniform(0.6, 1.8)))
-        image = Image.blend(image, bleed, rng.uniform(0.15, 0.45))
+        bleed = image.filter(ImageFilter.GaussianBlur(rng.uniform(0.6, 1.8) * ink_budget))
+        image = Image.blend(image, bleed, rng.uniform(0.15, 0.45) * ink_budget)
         aug["ink_bleed"] = True
 
     if "uneven_toner" in chosen:
@@ -895,9 +930,9 @@ def apply_degradation(
         aug["light"] = record
 
     # --- noise and resolution --------------------------------------------
-    image, record = _add_noise(image, config, rng, chosen)
+    image, record = _add_noise(image, config, rng, chosen, ink_budget)
     aug.update(record)
-    image, record = _resample(image, config, rng, chosen)
+    image, record = _resample(image, config, rng, chosen, ink_budget)
     aug.update(record)
 
     # --- encode -----------------------------------------------------------

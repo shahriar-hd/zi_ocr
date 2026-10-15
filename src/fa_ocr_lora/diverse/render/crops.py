@@ -46,6 +46,11 @@ _MIN_SIDE: Final[int] = 16
 #: Smallest line height, in pixels, for a line crop to be emitted at all.
 _MIN_LINE_HEIGHT: Final[float] = 10.0
 
+#: Letters or digits a crop's text must contain. An empty or single-dash table
+#: cell produces a crop with almost no ink - image QC measured zero contrast on
+#: 52 of them - and it teaches nothing even when it renders.
+_MIN_CROP_CHARACTERS: Final[int] = 2
+
 
 @dataclass(frozen=True, slots=True)
 class Crop:
@@ -222,7 +227,7 @@ def derive_crops(
         if right - left < _MIN_SIDE or bottom - top < _MIN_SIDE:
             return
         text = "\n".join(line.text for line in lines).strip()
-        if not text:
+        if sum(1 for character in text if character.isalnum()) < _MIN_CROP_CHARACTERS:
             return
         image = page.crop(box)
         sample_id = f"{annotation.sample_id}_{suffix}"

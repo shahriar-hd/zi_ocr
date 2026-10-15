@@ -376,6 +376,61 @@ def build_document(
 # --------------------------------------------------------------------------- #
 
 
+def _fit_font_px(
+    text: str,
+    width: int,
+    height: int,
+    margin: int,
+    line_height: float,
+    *,
+    low: float,
+    high: float,
+    columns: int = 1,
+) -> tuple[float, bool]:
+    """Choose a body size that fits the text in the canvas, or give up on it.
+
+    A fixed-height page with more text than it can hold clips the overflow.
+    The pixels then show less than `text_render` claims, which image QC
+    correctly rejects - one story page came back with 9% of its label visible.
+    Guessing a font size per template and hoping was the cause.
+
+    The estimate is crude on purpose. Persian at size `s` averages about
+    `0.52 * s` per character of advance, so a column of width `w` holds
+    `w / (0.52 * s)` characters per line, and `n` characters need
+    `n * 0.52 * s / w` lines of `s * line_height` each. Setting that equal to
+    the available height and solving for `s` gives the largest size that can
+    fit. It is approximate, so the result is scaled down slightly and the
+    caller still lets image QC have the final say.
+
+    Args:
+        text: The text to be laid out.
+        width: Canvas width in CSS pixels.
+        height: Canvas height in CSS pixels.
+        margin: Padding inside the canvas.
+        line_height: Unitless line height.
+        low: Smallest acceptable body size.
+        high: Largest body size, i.e. the size wanted when the text is short.
+        columns: Text columns, which multiply the usable width.
+
+    Returns:
+        ``(font_px, fits)``. When ``fits`` is ``False`` even ``low`` is too
+        large, and the caller should let the canvas grow to the content rather
+        than clip it.
+    """
+    usable_width = max(40, (width - 2 * margin)) * max(1, columns)
+    usable_height = max(40, height - 2 * margin)
+    characters = max(1, len(text))
+    # Allow for paragraph breaks, each of which wastes part of a line.
+    characters += 60 * text.count("\n\n")
+    ideal = ((usable_width * usable_height) / (0.52 * line_height * characters)) ** 0.5
+    ideal *= 0.94  # the estimate ignores widows and heading sizes
+    if ideal >= high:
+        return high, True
+    if ideal <= low:
+        return low, False
+    return ideal, True
+
+
 def _page_size(rng: random.Random) -> tuple[int, int, int]:
     """Choose a paper size in CSS pixels at 96 dpi.
 
@@ -420,13 +475,22 @@ def _page_prose(
 ) -> tuple[str, int, int]:
     """Plain prose on a page, the commonest printed form."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(14.5, 18.5),
-        line_height=rng.uniform(1.6, 2.0),
+    line_height = rng.uniform(1.6, 2.0)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=14.5,
+        high=18.5,
+        columns=1,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     justify = "justify" if rng.random() < 0.6 else "right"
     body = f'<div style="text-align:{justify}">{_render_paragraphs(text)}</div>'
     return _wrap(body, css, width=width, height=height, pad=margin), width, height
@@ -469,13 +533,22 @@ def _page_headed_article(
 ) -> tuple[str, int, int]:
     """A headline, a rule, then prose."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(14.0, 17.0),
-        line_height=rng.uniform(1.6, 1.9),
+    line_height = rng.uniform(1.6, 1.9)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=13.0,
+        high=16.0,
+        columns=2,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     paragraphs = _paragraphs(text)
     heading = paragraphs[0][:70] if paragraphs else ""
     rest = "\n\n".join(paragraphs[1:]) if len(paragraphs) > 1 else ""
@@ -502,13 +575,22 @@ def _page_textbook(
 ) -> tuple[str, int, int]:
     """A textbook page: heading, body, a sidebar and a footnote."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(13.5, 16.5),
-        line_height=rng.uniform(1.6, 1.9),
+    line_height = rng.uniform(1.6, 1.9)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=14.0,
+        high=17.0,
+        columns=1,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     paragraphs = _paragraphs(text)
     heading = paragraphs[0][:60] if paragraphs else ""
     rest = "\n\n".join(paragraphs[1:])
@@ -544,13 +626,22 @@ def _page_report(
 ) -> tuple[str, int, int]:
     """A report page, with a table when the text supplies one."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(13.0, 16.0),
-        line_height=rng.uniform(1.5, 1.8),
+    line_height = rng.uniform(1.5, 1.8)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=13.5,
+        high=16.5,
+        columns=1,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     inner = (
         _table_markup(text, palette, rng) if _is_table(text) else _render_paragraphs(text)
     )
@@ -579,13 +670,22 @@ def _page_newspaper(
 ) -> tuple[str, int, int]:
     """A dense three-column newspaper page with a masthead."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(11.5, 13.5),
-        line_height=rng.uniform(1.4, 1.65),
+    line_height = rng.uniform(1.4, 1.65)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=13.0,
+        high=16.0,
+        columns=1,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     columns = rng.choice([2, 3])
     css += f"#flow{{column-count:{columns};column-gap:{rng.randint(16, 28)}px;column-fill:auto}}"
     masthead = (
@@ -1144,9 +1244,13 @@ def _chat_bubbles(
             f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}", digits
         )
         name = (
-            f'<div{_ann("chat_meta")} style="font-size:0.74em;color:{palette.muted};'
-            f'margin-bottom:2px">{escape(speaker.strip())}</div>'
-            if speaker.strip() and not mine
+            f'<div{_ann("chat_meta")} style="font-size:0.74em;opacity:0.75;'
+            f'margin-bottom:2px">{escape(speaker.strip())}:</div>'
+            # Always drawn when the text supplies a speaker. Showing it only on
+            # incoming bubbles left the name in `text_render` but not on the
+            # page, so the label claimed words no box covered - image QC caught
+            # ten of these on the first run.
+            if speaker.strip()
             else ""
         )
         out.append(
@@ -1396,13 +1500,22 @@ def _story_chapter(
 ) -> tuple[str, int, int]:
     """A book page opening a chapter."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(15.0, 18.0),
-        line_height=rng.uniform(1.75, 2.1),
+    line_height = rng.uniform(1.75, 2.1)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=11.5,
+        high=13.5,
+        columns=2,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     number = to_digit_script(str(rng.randint(1, 24)), digits)
     head = (
         f'<div{_ann("heading")} style="text-align:center;font-family:\'{display}\';'
@@ -1424,13 +1537,22 @@ def _story_dropcap(
 ) -> tuple[str, int, int]:
     """A book page whose first paragraph opens with a drop cap."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(15.0, 18.0),
-        line_height=rng.uniform(1.75, 2.1),
+    line_height = rng.uniform(1.75, 2.1)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=15.0,
+        high=18.0,
+        columns=1,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     css += (
         f"#first::first-letter{{float:right;font-size:3.1em;line-height:0.86;"
         f"margin-left:8px;color:{palette.accent};font-family:'{display}'}}"
@@ -1456,13 +1578,22 @@ def _story_plain(
 ) -> tuple[str, int, int]:
     """A plain book page with a page number."""
     width, height, margin = _page_size(rng)
-    css = _base_css(
-        palette,
-        font_css,
-        family,
-        size_px=rng.uniform(15.0, 18.5),
-        line_height=rng.uniform(1.8, 2.1),
+    line_height = rng.uniform(1.8, 2.1)
+    size_px, fits = _fit_font_px(
+        text,
+        width,
+        height,
+        margin,
+        line_height,
+        low=15.0,
+        high=18.0,
+        columns=1,
     )
+    if not fits:
+        # More text than this sheet can hold. Let the canvas grow
+        # rather than clip: a tall page is honest, a clipped label is not.
+        height = 0
+    css = _base_css(palette, font_css, family, size_px=size_px, line_height=line_height)
     page_no = (
         f'<div{_ann("page_number")} style="position:absolute;bottom:{margin // 2}px;'
         f'width:100%;text-align:center;color:{palette.muted};font-size:0.84em">'
